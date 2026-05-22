@@ -1,10 +1,6 @@
 dataset:
   name: rosbank
 
-  # Колонки после prepare_rosbank.py
-  # mcc_code_desc = "MCC описание [тип операции]"  — основная категориальная
-  # trx_cat_ru и currency_name сохраняются loader'ом автоматически (не в rename-map,
-  # но и не удаляются), и используются rosbank-специфичными агрегаторами.
   columns:
     customer_id: customer_id
     datetime:    tr_datetime
@@ -18,33 +14,35 @@ dataset:
 
   category_label: "категории операций"
   num_labels: 2
-  # roc_auc_ovr_macro рекомендуется для несбалансированной бинарной классификации
-  metric: roc_auc_ovr_macro
+  metric: accuracy
 
+  # train/val строятся из авторского labeled train subset;
+  # test — авторский test subset. Если в нем нет target_flag, label = -1 и метрики на test не считаются.
   splits:
     train: data/rosbank/train.csv
     val:   data/rosbank/val.csv
     test:  data/rosbank/test.csv
 
 llm:
-  api_base_url: "${API_BASE_URL}"
-  api_key:      "${API_KEY}"
-  default_model: "Qwen/Qwen3-235B-A22B-Instruct-2507"
-  max_concurrent: 16
-  batch_size: 32
-  temperature: 1.0
+  # OpenRouter is OpenAI-compatible. Export OPENROUTER_API_KEY before running.
+  api_base_url: "https://inference.airi.net:46783/v1"
+  api_key:      "KEY"
+  default_model: "Openai/Gpt-oss-120b"
+  max_concurrent: 8
+  batch_size: 16
+  temperature: 0.8
   top_p: 0.9
 
 prompts:
-  base_dir: "."
-  system:        prompts_rosbank_explanation_generation_system_prompt.txt
-  user:          prompts_rosbank_explanation_generation_user_prompt.txt
-  claims_system: prompts_rosbank_claims_extraction_system_prompt.txt
-  claims_user:   prompts_rosbank_claims_extraction_user_prompt.txt
+  base_dir: "prompts/rosbank"
+  system:        explanation_generation/system_prompt.txt
+  user:          explanation_generation/user_prompt.txt
+  claims_system: claims_extraction/system_prompt.txt
+  claims_user:   claims_extraction/user_prompt.txt
 
 lora:
   model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-  max_length: 1024
+  max_length: 1536
   lora_rank: 8
   lora_alpha: 8
   lora_dropout: 0.05
@@ -55,13 +53,16 @@ lora:
   load_in_4bit: true
 
 pipeline:
-  n_explanation_samples: 8
-  n_claims_samples: 10
-  distance_threshold: 0.01
-  class_diff_threshold: 0.02
-  pca_components: 50
-  perplexity: 15
+  # Для быстрого первого прогона можно переопределить CLI: --max-clients-per-split 200
+  n_explanation_samples: 3
+  n_claims_samples: 3
+  few_shot_per_class: 2
   embedding_model: "paraphrase-multilingual-MiniLM-L12-v2"
+
+  # train-only supervised filtering for CoT clusters
+  class_diff_threshold: 0.02
+  min_cluster_size: 2
+  max_assign_distance: 0.45
 
 optuna:
   n_trials: 30

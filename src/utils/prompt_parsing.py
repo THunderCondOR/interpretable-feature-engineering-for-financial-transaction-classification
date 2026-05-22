@@ -1,47 +1,66 @@
-"""
-src/utils/prompt_parsing.py
+"""Helpers for extracting structured output from LLM responses."""
 
-Helpers for extracting structured output from LLM responses.
-"""
+from __future__ import annotations
 
 import json
 import re
+import unicodedata
 
 
 def extract_json_list(s: str) -> list:
-    """
-    Extract the last JSON array from a string and return it as a Python list.
-    Returns [] if no valid array is found.
-    """
-    # Find all [...] blocks (non-greedy, then greedy for nested)
+    """Extract the last valid JSON array from a string."""
+    if not s:
+        return []
     matches = re.findall(r"\[.*?\]", s, re.DOTALL)
-    if not matches:
-        # Try greedy match for large arrays
-        match = re.search(r"\[.*\]", s, re.DOTALL)
-        if match:
-            matches = [match.group()]
-
+    greedy = re.search(r"\[.*\]", s, re.DOTALL)
+    if greedy:
+        matches.append(greedy.group())
     for candidate in reversed(matches):
         try:
             result = json.loads(candidate)
             if isinstance(result, list):
                 return result
         except json.JSONDecodeError:
-            # Try truncating to the last closing bracket
-            for i in range(len(candidate), 0, -1):
-                try:
-                    result = json.loads(candidate[:i])
-                    if isinstance(result, list):
-                        return result
-                except Exception:
-                    continue
+            continue
     return []
 
 
 def extract_boxed_answer(s: str) -> str | None:
-    """
-    Extract the last \\boxed{...} value from a string.
-    Returns None if not found.
-    """
-    matches = re.findall(r"\\boxed\{(.*?)\}", s)
+    """Extract the last \\boxed{...} value from a string."""
+    if not s:
+        return None
+    matches = re.findall(r"\\boxed\{(.*?)\}", s, flags=re.DOTALL)
     return matches[-1].strip() if matches else None
+
+
+def normalize_text_label(value: str | None, label_names: dict | None = None) -> int | None:
+    """
+    Normalize LLM textual answers to label ids.
+
+    Built-in Rosbank mapping:
+      0: active / активный клиент / loyal
+      1: churn / отток / ушедший
+    Also uses config label_names if supplied.
+    """
+    if value is None:
+        return None
+    text = unicodedata.normalize("NFKC", str(value)).strip().lower()
+    text = text.replace("ё", "е")
+    text = re.sub(r"[\s_\-]+", " ", text)
+    text = text.strip(" .,:;!?'\"`|[](){}")
+
+    if label_names:
+        for k, v in label_names.items():
+            if text == str(k).lower() or text == str(v).lower().replace("ё", "е"):
+                return int(k)
+
+    if text in {"0", "active", "active client", "loyal", "loyal client", "активный", "активный клиент", "лояльный", "лояльный клиент"}:
+        return 0
+    if text in {"1", "churn", "churned", "churn client", "отток", "ушедший", "ушедший клиент", "клиент в оттоке"}:
+        return 1
+
+    if "отток" in text or "churn" in text or "ушед" in text:
+        return 1
+    if "актив" in text or "лоял" in text or "active" in text or "loyal" in text:
+        return 0
+    return None

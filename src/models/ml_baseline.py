@@ -1,368 +1,298 @@
 """
 src/models/ml_baseline.py
 
-Обучает XGBoost и Decision Tree на трёх наборах фич:
-    cot         — кластерные векторы из атомарных фактов
-    handcrafted — числовые агрегаты из транзакций
-    concat      — конкатенация обоих наборов
+Trains XGBoost and DecisionTree on:
+- CoT cluster features,
+- handcrafted transaction aggregates,
+- concatenation of both.
 
-Результаты сохраняются в results/{dataset}/ml_metrics.json.
-
-Запуск через run_pipeline.py:
-    python run_pipeline.py --config configs/gender.yaml --steps ml
+Fixes compared to the initial refactor:
+- CoT and handcrafted features are aligned by customer_id, never by row order.
+- Rosbank metrics include ROC-AUC, balanced accuracy and macro-F1.
+- Split-specific CoT feature files are supported:
+    cot_features_train.parquet, cot_features_val.parquet, cot_features_test.parquet
 """
 
+from __future__ import annotations
+
 import json
-import numpy as np
-import pandas as pd
 from pathlib import Path
 
-from sklearn.tree import DecisionTreeClassifier, export_text
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import cross_val_score
-from xgboost import XGBClassifier
+import numpy as np
 import optuna
-optuna.logging.set_verbosity(optuna.logging.WARNING)
+import pandas as pd
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score, matthews_corrcoef, confusion_matrix
+from sklearn.model_selection import cross_val_score
+from sklearn.tree import DecisionTreeClassifier, export_text
+from xgboost import XGBClassifier
 
 from src.data.loader import load_dataset, add_features
 
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# ---------------------------------------------------------------------------
-# Handcrafted features — generic (gender / age)
-# ---------------------------------------------------------------------------
+
+def _safe_name(s: str) -> str:
+    return str(s).replace(" ", "_").replace("/", "_").replace(",", "")[:80]
+
+
+def _share(part: float, whole: float) -> float:
+    return float(part) / float(whole) if whole else 0.0
+
 
 def build_handcrafted_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
-    """
-    Строит числовой вектор признаков на клиента из транзакций.
-    Для датасетов где amount может быть как положительным (доход), так и отрицательным (расход).
-    """
     records = []
-
-    for cid in df["customer_id"].unique():
-        c     = df[df["customer_id"] == cid]
+    for cid, c in df.groupby("customer_id", sort=False):
         label = int(c["label"].iloc[0])
-
-        n_txn  = len(c)
-        n_days = max(c["tr_datetime"].dt.date.nunique(), 1) \
-            if c["tr_datetime"].notna().any() else 1
+        n_txn = len(c)
+        n_days = max(c["tr_datetime"].dt.date.nunique(), 1) if c["tr_datetime"].notna().any() else 1
         pos = c[c["amount"] > 0]["amount"]
         neg = c[c["amount"] < 0]["amount"]
-
         base = {
-            "n_txn":         n_txn,
-            "active_days":   n_days,
-            "txn_per_day":   round(n_txn / n_days, 3),
-            "total_income":  float(pos.sum()) if len(pos) else 0,
-            "total_expense": float(neg.sum()) if len(neg) else 0,
-            "avg_income":    float(pos.mean()) if len(pos) else 0,
-            "avg_expense":   float(neg.mean()) if len(neg) else 0,
-            "share_income":  len(pos) / n_txn if n_txn else 0,
-            "share_expense": len(neg) / n_txn if n_txn else 0,
+            "customer_id": int(cid), "label": label,
+            "n_txn": n_txn, "active_days": n_days, "txn_per_day": n_txn / n_days,
+            "total_income": float(pos.sum()) if len(pos) else 0.0,
+            "total_expense": float(neg.sum()) if len(neg) else 0.0,
+            "avg_income": float(pos.mean()) if len(pos) else 0.0,
+            "avg_expense": float(neg.mean()) if len(neg) else 0.0,
+            "share_income": len(pos) / n_txn if n_txn else 0.0,
+            "share_expense": len(neg) / n_txn if n_txn else 0.0,
         }
-
-        if "period_of_day" in c.columns:
-            for period in ["утро", "день", "вечер", "ночь"]:
+        for period in ["утро", "день", "вечер", "ночь"]:
+            if "period_of_day" in c.columns:
                 base[f"share_{period}"] = (c["period_of_day"] == period).mean()
         if "is_weekend" in c.columns:
             base["share_weekend"] = c["is_weekend"].mean()
-
-        cat_count  = c.groupby("mcc_code_desc")["amount"].count().to_dict()
-        cat_amount = c.groupby("mcc_code_desc")["amount"].sum().to_dict()
-        for cat, cnt in cat_count.items():
-            safe = cat.replace(" ", "_").replace("/", "_").replace(",", "")[:40]
+        for cat, cnt in c.groupby("mcc_code_desc")["amount"].count().to_dict().items():
+            safe = _safe_name(cat)
             base[f"cnt_{safe}"] = cnt
-            base[f"sum_{safe}"] = cat_amount.get(cat, 0)
-
-        base["customer_id"] = int(cid)
-        base["label"]       = label
         records.append(base)
-
     return pd.DataFrame(records).fillna(0)
 
 
-# ---------------------------------------------------------------------------
-# Handcrafted features — Rosbank-specific
-# ---------------------------------------------------------------------------
-
 def build_handcrafted_features_rosbank(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Строит числовой вектор churn-специфичных признаков на клиента.
-    amount в rosbank всегда > 0, поэтому income/expense split бессмысленен.
-    """
     records = []
-
-    for cid in df["customer_id"].unique():
-        c     = df[df["customer_id"] == cid]
+    for cid, c in df.groupby("customer_id", sort=False):
         label = int(c["label"].iloc[0])
         n_txn = len(c)
-
-        n_days   = max(c["tr_datetime"].dt.date.nunique(), 1) \
-            if c["tr_datetime"].notna().any() else 1
-        n_months = max(c["tr_datetime"].dt.to_period("M").nunique(), 1) \
-            if c["tr_datetime"].notna().any() else 1
-
+        n_days = max(c["tr_datetime"].dt.date.nunique(), 1) if c["tr_datetime"].notna().any() else 1
+        n_months = max(c["tr_datetime"].dt.to_period("M").nunique(), 1) if c["tr_datetime"].notna().any() else 1
         base = {
-            "n_txn":          n_txn,
-            "active_days":    n_days,
-            "active_months":  n_months,
-            "txn_per_day":    round(n_txn / n_days, 3),
-            "txn_per_month":  round(n_txn / n_months, 3),
-            "total_amount":   float(c["amount"].sum()),
-            "avg_amount":     float(c["amount"].mean()),
-            "median_amount":  float(c["amount"].median()),
-            "max_amount":     float(c["amount"].max()),
-            "std_amount":     float(c["amount"].std()) if n_txn > 1 else 0,
+            "customer_id": int(cid), "label": label,
+            "n_txn": n_txn, "active_days": n_days, "active_months": n_months,
+            "txn_per_day": n_txn / n_days, "txn_per_month": n_txn / n_months,
+            "total_amount": float(c["amount"].sum()),
+            "avg_amount": float(c["amount"].mean()) if n_txn else 0.0,
+            "median_amount": float(c["amount"].median()) if n_txn else 0.0,
+            "max_amount": float(c["amount"].max()) if n_txn else 0.0,
+            "std_amount": float(c["amount"].std()) if n_txn > 1 else 0.0,
+            "n_unique_mcc": c["mcc_code_desc"].nunique(),
+            "mcc_diversity": c["mcc_code_desc"].nunique() / max(n_txn, 1),
         }
-
         if "trx_cat_ru" in c.columns:
-            trx_counts = c["trx_cat_ru"].value_counts()
-            atm_total  = sum(v for k, v in trx_counts.items() if "снятие" in k)
-            base["share_pos"]     = trx_counts.get("оплата картой", 0) / n_txn
-            base["share_atm"]     = atm_total / n_txn
-            base["share_deposit"] = trx_counts.get("пополнение счёта", 0) / n_txn
-            base["share_c2c_out"] = trx_counts.get("перевод на карту", 0) / n_txn
-            base["share_c2c_in"]  = trx_counts.get("входящий перевод с карты", 0) / n_txn
-            base["has_c2c_out"]   = int(base["share_c2c_out"] > 0)
-            base["has_deposit"]   = int(base["share_deposit"] > 0)
-
+            trx = c["trx_cat_ru"].value_counts()
+            atm_total = sum(v for k, v in trx.items() if "снятие" in str(k).lower())
+            base.update({
+                "share_pos": _share(trx.get("оплата картой", 0), n_txn),
+                "share_atm": _share(atm_total, n_txn),
+                "share_deposit": _share(trx.get("пополнение счета", 0), n_txn),
+                "share_c2c_out": _share(trx.get("перевод на карту", 0), n_txn),
+                "share_c2c_in": _share(trx.get("входящий перевод с карты", 0), n_txn),
+            })
         if "currency_name" in c.columns:
-            base["n_currencies"]     = c["currency_name"].nunique()
-            base["share_rub"]        = (c["currency_name"] == "Рубль").mean()
+            base["n_currencies"] = c["currency_name"].nunique()
+            base["share_rub"] = (c["currency_name"] == "Рубль").mean()
             base["has_foreign_curr"] = int(c["currency_name"].nunique() > 1)
-
-        base["n_unique_mcc"]  = c["mcc_code_desc"].nunique()
-        base["mcc_diversity"] = round(c["mcc_code_desc"].nunique() / n_txn, 4)
-
-        if c["tr_datetime"].notna().any():
-            base["share_weekend"] = c["is_weekend"].mean() \
-                if "is_weekend" in c.columns else 0
+        if "is_weekend" in c.columns:
+            base["share_weekend"] = c["is_weekend"].mean()
+        if "period_of_day" in c.columns:
             for period in ["утро", "день", "вечер", "ночь"]:
-                base[f"share_{period}"] = (c["period_of_day"] == period).mean() \
-                    if "period_of_day" in c.columns else 0
-
-            # Recency: среднее число транзакций в последней четверти периода
-            # vs первой четверти (по времени, не по count)
-            if n_txn >= 4 and c["tr_datetime"].notna().any():
-                c_sorted  = c.sort_values("tr_datetime")
-                t_min = c_sorted["tr_datetime"].min()
-                t_max = c_sorted["tr_datetime"].max()
-                duration  = (t_max - t_min).total_seconds()
-                if duration > 0:
-                    cutoff_recent = t_max  - pd.Timedelta(seconds=duration * 0.25)
-                    cutoff_old    = t_min  + pd.Timedelta(seconds=duration * 0.25)
-                    n_recent = (c_sorted["tr_datetime"] >= cutoff_recent).sum()
-                    n_old    = (c_sorted["tr_datetime"] <= cutoff_old).sum()
-                    base["recency_ratio"] = round(n_recent / max(n_old, 1), 3)
-                else:
-                    base["recency_ratio"] = 1.0
-            else:
-                base["recency_ratio"] = 1.0
-
-        cat_count  = c.groupby("mcc_code_desc")["amount"].count().to_dict()
+                base[f"share_{period}"] = (c["period_of_day"] == period).mean()
+        if c["tr_datetime"].notna().any() and n_txn >= 4:
+            c_sorted = c.sort_values("tr_datetime")
+            t_min, t_max = c_sorted["tr_datetime"].min(), c_sorted["tr_datetime"].max()
+            duration = (t_max - t_min).total_seconds()
+            if duration > 0:
+                mid = t_min + pd.Timedelta(seconds=duration / 2)
+                q1 = t_min + pd.Timedelta(seconds=duration * 0.25)
+                q3 = t_max - pd.Timedelta(seconds=duration * 0.25)
+                first = (c_sorted["tr_datetime"] <= mid).sum()
+                second = (c_sorted["tr_datetime"] > mid).sum()
+                early = (c_sorted["tr_datetime"] <= q1).sum()
+                recent = (c_sorted["tr_datetime"] >= q3).sum()
+                base["second_to_first_txn_ratio"] = second / max(first, 1)
+                base["recent_to_early_txn_ratio"] = recent / max(early, 1)
+        cat_count = c.groupby("mcc_code_desc")["amount"].count().to_dict()
         cat_amount = c.groupby("mcc_code_desc")["amount"].sum().to_dict()
         for cat, cnt in cat_count.items():
-            safe = cat.replace(" ", "_").replace("/", "_").replace(",", "")[:40]
+            safe = _safe_name(cat)
             base[f"cnt_{safe}"] = cnt
             base[f"sum_{safe}"] = cat_amount.get(cat, 0)
-
-        base["customer_id"] = int(cid)
-        base["label"]       = label
         records.append(base)
-
     return pd.DataFrame(records).fillna(0)
 
 
 def _get_handcrafted_builder(config: dict):
-    """Диспетчер: вернуть нужную функцию построения handcrafted фич."""
     if config["dataset"]["name"] == "rosbank":
         return lambda df, _cfg: build_handcrafted_features_rosbank(df)
     return build_handcrafted_features
 
 
-# ---------------------------------------------------------------------------
-# Optuna hyperparameter search
-# ---------------------------------------------------------------------------
+def _eval(model, X, y) -> dict:
+    y = np.asarray(y, dtype=int)
+    preds = model.predict(X)
+    res = {
+        "n": int(len(y)),
+        "accuracy": round(float(accuracy_score(y, preds)), 4),
+        "balanced_accuracy": round(float(balanced_accuracy_score(y, preds)), 4),
+        "f1_macro": round(float(f1_score(y, preds, average="macro", zero_division=0)), 4),
+        "f1_weighted": round(float(f1_score(y, preds, average="weighted", zero_division=0)), 4),
+        "mcc": round(float(matthews_corrcoef(y, preds)), 4),
+        "confusion_matrix": confusion_matrix(y, preds).tolist(),
+    }
+    if hasattr(model, "predict_proba") and len(np.unique(y)) == 2:
+        try:
+            res["roc_auc"] = round(float(roc_auc_score(y, model.predict_proba(X)[:, 1])), 4)
+        except Exception as exc:
+            res["roc_auc_error"] = str(exc)
+    return res
 
-def _tune_xgboost(X_train, y_train, n_trials: int = 30, n_classes: int = 2):
-    objective_fn = "binary:logistic" if n_classes == 2 else "multi:softprob"
 
-    def objective(trial):
+def _primary_metric(config: dict) -> str:
+    metric = config["dataset"].get("metric", "accuracy")
+    if metric in {"roc_auc", "roc_auc_ovr_macro"}:
+        return "roc_auc"
+    return metric
+
+
+def _score_for_cv(config: dict) -> str:
+    metric = _primary_metric(config)
+    return "roc_auc" if metric == "roc_auc" and config["dataset"]["num_labels"] == 2 else "accuracy"
+
+
+def _tune_xgboost(X_train, y_train, config: dict, n_trials: int = 30):
+    n_classes = config["dataset"]["num_labels"]
+    objective = "binary:logistic" if n_classes == 2 else "multi:softprob"
+    scoring = _score_for_cv(config)
+
+    def objective_fn(trial):
         params = {
-            "n_estimators":     trial.suggest_int("n_estimators", 50, 500),
-            "max_depth":        trial.suggest_int("max_depth", 3, 8),
-            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-            "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
+            "n_estimators": trial.suggest_int("n_estimators", 50, 500),
+            "max_depth": trial.suggest_int("max_depth", 3, 8),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
             "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
-            "reg_alpha":        trial.suggest_float("reg_alpha", 1e-4, 1.0, log=True),
-            "reg_lambda":       trial.suggest_float("reg_lambda", 1e-4, 1.0, log=True),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 1.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 1.0, log=True),
         }
-        model = XGBClassifier(
-            **params,
-            objective=objective_fn,
-            num_class=n_classes if n_classes > 2 else None,
-            random_state=42, n_jobs=4, verbosity=0,
-            eval_metric="logloss",
-        )
-        scores = cross_val_score(model, X_train, y_train, cv=3,
-                                 scoring="accuracy", n_jobs=-1)
-        return scores.mean()
+        model = XGBClassifier(**params, objective=objective, random_state=42, n_jobs=4, verbosity=0, eval_metric="logloss")
+        return cross_val_score(model, X_train, y_train, cv=3, scoring=scoring, n_jobs=-1).mean()
 
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(objective_fn, n_trials=n_trials, show_progress_bar=False)
     return study.best_params
 
 
 def _tune_decision_tree(X_train, y_train, n_trials: int = 30):
-    def objective(trial):
+    def objective_fn(trial):
         params = {
-            "max_depth":        trial.suggest_int("max_depth", 2, 10),
-            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 20),
-            "criterion":        trial.suggest_categorical("criterion", ["gini", "entropy"]),
+            "max_depth": trial.suggest_int("max_depth", 2, 10),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 30),
+            "criterion": trial.suggest_categorical("criterion", ["gini", "entropy", "log_loss"]),
         }
         model = DecisionTreeClassifier(**params, random_state=42)
-        scores = cross_val_score(model, X_train, y_train, cv=3,
-                                 scoring="accuracy", n_jobs=-1)
-        return scores.mean()
-
+        return cross_val_score(model, X_train, y_train, cv=3, scoring="accuracy", n_jobs=-1).mean()
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(objective_fn, n_trials=n_trials, show_progress_bar=False)
     return study.best_params
 
 
-# ---------------------------------------------------------------------------
-# Evaluation helper
-# ---------------------------------------------------------------------------
-
-def _eval(model, X, y) -> dict:
-    preds = model.predict(X)
-    return {
-        "accuracy":    round(accuracy_score(y, preds), 4),
-        "f1_macro":    round(f1_score(y, preds, average="macro",    zero_division=0), 4),
-        "f1_weighted": round(f1_score(y, preds, average="weighted", zero_division=0), 4),
-    }
+def _load_cot_split(out_dir: Path, split: str, fallback: Path | None = None) -> pd.DataFrame:
+    path = out_dir / f"cot_features_{split}.parquet"
+    if path.exists():
+        return pd.read_parquet(path)
+    if fallback and fallback.exists():
+        all_df = pd.read_parquet(fallback)
+        return all_df
+    raise FileNotFoundError(f"CoT features not found for split={split}: {path}")
 
 
-# ---------------------------------------------------------------------------
-# Main training loop
-# ---------------------------------------------------------------------------
+def _split_xy(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    df = df[df["label"] >= 0].copy()
+    feat_cols = [c for c in df.columns if c not in {"customer_id", "label"}]
+    return df[feat_cols].values, df["label"].astype(int).values, feat_cols
+
 
 def run_ml_baseline(config: dict) -> None:
-    """
-    Запускает полный ML эксперимент:
-        - загружает CoT фичи из cot_features.parquet
-        - строит handcrafted фичи из CSV (с диспетчингом для rosbank)
-        - обучает XGBoost и DecisionTree на cot / handcrafted / concat
-        - сохраняет метрики
-    """
-    out_dir   = Path(config["output"]["base_dir"])
-    feat_path = out_dir / config["output"].get("features", "cot_features.parquet")
-    n_trials  = config.get("optuna", {}).get("n_trials", 30)
+    out_dir = Path(config["output"]["base_dir"])
+    n_trials = config.get("optuna", {}).get("n_trials", 30)
 
-    print("Загружаем данные...")
+    print("Loading splits...")
     train_df = add_features(load_dataset(config, "train"))
-    val_df   = add_features(load_dataset(config, "val"))
-    test_df  = add_features(load_dataset(config, "test"))
-    all_df   = pd.concat([train_df, val_df, test_df], ignore_index=True)
+    val_df = add_features(load_dataset(config, "val"))
+    test_df = add_features(load_dataset(config, "test"))
 
-    print("Загружаем CoT фичи...")
-    cot_df = pd.read_parquet(feat_path)
+    hc_builder = _get_handcrafted_builder(config)
+    hc_train = hc_builder(train_df, config)
+    hc_val = hc_builder(val_df, config)
+    hc_test = hc_builder(test_df, config)
 
-    train_ids = set(train_df["customer_id"].unique())
-    val_ids   = set(val_df["customer_id"].unique())
-    test_ids  = set(test_df["customer_id"].unique())
+    fallback = out_dir / config["output"].get("features", "cot_features.parquet")
+    cot_train = _load_cot_split(out_dir, "train", fallback)
+    cot_val = _load_cot_split(out_dir, "val", fallback)
+    cot_test = _load_cot_split(out_dir, "test", fallback) if (out_dir / "cot_features_test.parquet").exists() else None
 
-    def split_cot(ids):
-        sub = cot_df[cot_df["customer_id"].isin(ids)]
-        if "features" in sub.columns:
-            X = np.array(sub["features"].tolist())
-        else:
-            feat_cols = [c for c in sub.columns if c not in ("customer_id", "label")]
-            X = sub[feat_cols].values
-        y = sub["label"].values
-        return X, y
+    def align(cot: pd.DataFrame, hc: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        # Inner merge prevents row-order leakage.
+        cot_cols = [c for c in cot.columns if c.startswith("cot_cluster_")]
+        hc_cols = [c for c in hc.columns if c not in {"customer_id", "label"}]
+        merged = cot[["customer_id", "label"] + cot_cols].merge(
+            hc[["customer_id", "label"] + hc_cols], on=["customer_id", "label"], how="inner"
+        )
+        return merged[["customer_id", "label"] + cot_cols], merged[["customer_id", "label"] + hc_cols], merged[["customer_id", "label"] + cot_cols + hc_cols]
 
-    X_cot_tr, y_tr = split_cot(train_ids)
-    X_cot_va, y_va = split_cot(val_ids)
-    X_cot_te, y_te = split_cot(test_ids)
-
-    print("Строим handcrafted фичи...")
-    hc_builder  = _get_handcrafted_builder(config)
-    hc_df       = hc_builder(all_df, config)
-    feat_cols_hc = [c for c in hc_df.columns if c not in ("customer_id", "label")]
-
-    def split_hc(ids):
-        sub = hc_df[hc_df["customer_id"].isin(ids)]
-        return sub[feat_cols_hc].values, sub["label"].values
-
-    X_hc_tr, _ = split_hc(train_ids)
-    X_hc_va, _ = split_hc(val_ids)
-    X_hc_te, _ = split_hc(test_ids)
-
-    X_cat_tr = np.hstack([X_cot_tr, X_hc_tr])
-    X_cat_va = np.hstack([X_cot_va, X_hc_va])
-    X_cat_te = np.hstack([X_cot_te, X_hc_te])
+    tr_cot, tr_hc, tr_cat = align(cot_train, hc_train)
+    va_cot, va_hc, va_cat = align(cot_val, hc_val)
+    if cot_test is not None:
+        te_cot, te_hc, te_cat = align(cot_test, hc_test)
+    else:
+        te_cot = te_hc = te_cat = None
 
     feature_sets = {
-        "cot":         (X_cot_tr, X_cot_va, X_cot_te),
-        "handcrafted": (X_hc_tr,  X_hc_va,  X_hc_te),
-        "concat":      (X_cat_tr, X_cat_va, X_cat_te),
+        "cot": (tr_cot, va_cot, te_cot),
+        "handcrafted": (tr_hc, va_hc, te_hc),
+        "concat": (tr_cat, va_cat, te_cat),
     }
 
-    n_classes   = config["dataset"]["num_labels"]
     all_results = {}
+    n_classes = config["dataset"]["num_labels"]
+    objective = "binary:logistic" if n_classes == 2 else "multi:softprob"
 
-    for feat_name, (X_tr, X_va, X_te) in feature_sets.items():
-        print(f"\nФичи: {feat_name} (dim={X_tr.shape[1]})")
+    for feat_name, (tr_df, va_df, te_df) in feature_sets.items():
+        X_tr, y_tr, feat_cols = _split_xy(tr_df)
+        X_va, y_va, _ = _split_xy(va_df)
         all_results[feat_name] = {}
+        print(f"\nFeature set: {feat_name}, dim={X_tr.shape[1]}, train={len(y_tr)}, val={len(y_va)}")
 
-        # XGBoost
-        print(f"  XGBoost — подбор гиперпараметров ({n_trials} trials)...")
-        best_xgb     = _tune_xgboost(X_tr, y_tr, n_trials, n_classes)
-        objective_fn = "binary:logistic" if n_classes == 2 else "multi:softprob"
-        xgb = XGBClassifier(
-            **best_xgb,
-            objective=objective_fn,
-            num_class=n_classes if n_classes > 2 else None,
-            random_state=42, n_jobs=4, verbosity=0,
-            eval_metric="logloss",
-        )
+        best_xgb = _tune_xgboost(X_tr, y_tr, config, n_trials)
+        xgb = XGBClassifier(**best_xgb, objective=objective, random_state=42, n_jobs=4, verbosity=0, eval_metric="logloss")
         xgb.fit(X_tr, y_tr)
-        xgb_res = {
-            "params": best_xgb,
-            "val":    _eval(xgb, X_va, y_va),
-            "test":   _eval(xgb, X_te, y_te),
-        }
-        all_results[feat_name]["xgboost"] = xgb_res
-        print(f"    val acc={xgb_res['val']['accuracy']}  "
-              f"test acc={xgb_res['test']['accuracy']}")
+        res = {"params": best_xgb, "val": _eval(xgb, X_va, y_va)}
+        if te_df is not None and (te_df["label"] >= 0).all():
+            X_te, y_te, _ = _split_xy(te_df)
+            res["test"] = _eval(xgb, X_te, y_te)
+        all_results[feat_name]["xgboost"] = res
 
-        # Decision Tree
-        print(f"  Decision Tree — подбор гиперпараметров ({n_trials} trials)...")
         best_dt = _tune_decision_tree(X_tr, y_tr, n_trials)
         dt = DecisionTreeClassifier(**best_dt, random_state=42)
         dt.fit(X_tr, y_tr)
-        dt_text = export_text(dt, max_depth=4)
-        dt_res  = {
-            "params":    best_dt,
-            "val":       _eval(dt, X_va, y_va),
-            "test":      _eval(dt, X_te, y_te),
-            "tree_text": dt_text[:2000],
-        }
-        all_results[feat_name]["decision_tree"] = dt_res
-        print(f"    val acc={dt_res['val']['accuracy']}  "
-              f"test acc={dt_res['test']['accuracy']}")
+        res = {"params": best_dt, "val": _eval(dt, X_va, y_va), "tree_text": export_text(dt, feature_names=feat_cols, max_depth=4)[:4000]}
+        if te_df is not None and (te_df["label"] >= 0).all():
+            X_te, y_te, _ = _split_xy(te_df)
+            res["test"] = _eval(dt, X_te, y_te)
+        all_results[feat_name]["decision_tree"] = res
 
-    ml_path = out_dir / "ml_metrics.json"
-    with open(ml_path, "w", encoding="utf-8") as f:
+    out_path = out_dir / "ml_metrics.json"
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
-    print(f"\nМетрики сохранены → {ml_path}")
-
-    print(f"\n{'─'*60}")
-    print(f"{'Фичи':<14} {'Модель':<16} {'Val acc':<10} {'Test acc'}")
-    print(f"{'─'*60}")
-    for feat, models in all_results.items():
-        for model_name, res in models.items():
-            print(f"{feat:<14} {model_name:<16} "
-                  f"{res['val']['accuracy']:<10} {res['test']['accuracy']}")
-    print(f"{'─'*60}")
+    print(f"Metrics saved -> {out_path}")
