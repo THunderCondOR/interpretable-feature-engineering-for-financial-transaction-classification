@@ -1,44 +1,70 @@
 dataset:
   name: gender
-
-  # Маппинг колонок CSV → внутренняя схема пайплайна.
-  # Если после prepare_gender.py колонки называются иначе — правь здесь, не в коде.
   columns:
-    customer_id: customer_id   # ID клиента
-    datetime:    tr_datetime   # дата/время транзакции (может быть "event_time" или "trans_date")
-    amount:      amount        # сумма транзакции
-    category:    mcc_code_desc # текстовое описание MCC (может быть "mcc_description")
-    label:       gender        # целевая переменная (0 = женщина, 1 = мужчина)
-
+    customer_id: customer_id
+    datetime:    tr_datetime
+    amount:      amount
+    category:    mcc_code_desc
+    label:       gender
   label_names:
-    0: "женщина"
-    1: "мужчина"
-
-  category_label: "категории MCC"   # подставляется в текстовый профиль клиента
+    "0": "женщина"
+    "1": "мужчина"
+  category_label: "категории трат"
   num_labels: 2
   metric: accuracy
-
   splits:
     train: data/gender/train.csv
     val:   data/gender/val.csv
     test:  data/gender/test.csv
 
+llm:
+  api_base_url: "${API_BASE_URL}"
+  api_key:      "${API_KEY}"
+  default_model: "Qwen/Qwen3-235B-A22B-Instruct-2507"
+  max_concurrent: 16
+  batch_size: 32
+  temperature: 1.0
+  top_p: 0.9
+
+# Пути к промптам — плоские файлы в корне проекта
+# Path("base_dir") / "system" = "./prompts_gender_explanation_generation_system_prompt.txt"
+prompts:
+  base_dir: "."
+  system:        prompts_gender_explanation_generation_system_prompt.txt
+  user:          prompts_gender_explanation_generation_user_prompt.txt
+  claims_system: prompts_gender_claims_extraction_system_prompt.txt
+  claims_user:   prompts_gender_claims_extraction_user_prompt.txt
+
 lora:
-  model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
-  max_length: 1024            # хватает для user_summary_str (~500-700 токенов)
+  model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+  max_length: 1024
   lora_rank: 8
   lora_alpha: 8
   lora_dropout: 0.05
   learning_rate: 2.0e-4
-  batch_size: 4               # уменьши до 1-2 если OOM
-  gradient_accumulation_steps: 8   # эффективный batch = batch_size * grad_acc
+  batch_size: 4
+  gradient_accumulation_steps: 8
   num_epochs: 5
   load_in_4bit: true
 
-prompts:
-  base_dir: prompts/gender
-  system: explanation_generation/system_prompt.txt
+pipeline:
+  n_explanation_samples: 8
+  n_claims_samples: 10
+  distance_threshold: 0.01
+  class_diff_threshold: 0.02
+  pca_components: 50
+  perplexity: 15
+  embedding_model: "paraphrase-multilingual-MiniLM-L12-v2"
+
+optuna:
+  n_trials: 30
 
 output:
-  base_dir: results/gender
-  metrics:  metrics.json
+  base_dir:      results/gender
+  summary_stats: summary_stats.txt
+  clients_stats: clients_stats.jsonl
+  prompts:       prompts.jsonl
+  explanations:  explanations.jsonl
+  claims:        claims.jsonl
+  features:      cot_features.parquet
+  metrics:       metrics.json

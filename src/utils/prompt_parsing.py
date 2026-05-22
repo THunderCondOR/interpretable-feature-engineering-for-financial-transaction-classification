@@ -1,34 +1,47 @@
+"""
+src/utils/prompt_parsing.py
+
+Helpers for extracting structured output from LLM responses.
+"""
+
 import json
 import re
 
-def extract_last_json(s):
+
+def extract_json_list(s: str) -> list:
     """
-    Extract the last JSON object or array from a string and parse it.
-    Returns the parsed Python object, or None if no JSON is found.
+    Extract the last JSON array from a string and return it as a Python list.
+    Returns [] if no valid array is found.
     """
-    # Regex to find JSON arrays or objects
-    json_pattern = re.compile(r'(\{.*?\}|\[.*?\])', re.DOTALL)
-    matches = json_pattern.findall(s)
-    
+    # Find all [...] blocks (non-greedy, then greedy for nested)
+    matches = re.findall(r"\[.*?\]", s, re.DOTALL)
     if not matches:
-        return None
-    
-    # Take the last match
-    last_json_str = matches[-1]
-    
-    try:
-        return json.loads(last_json_str)
-    except json.JSONDecodeError:
-        # Sometimes regex captures partial JSON, try to fix by trimming
-        # Find the last closing bracket
-        for i in range(len(last_json_str), 0, -1):
-            try:
-                return json.loads(last_json_str[:i])
-            except:
-                continue
-        return None
+        # Try greedy match for large arrays
+        match = re.search(r"\[.*\]", s, re.DOTALL)
+        if match:
+            matches = [match.group()]
 
-def extract_last_boxed_text(s):
-    matches = re.findall(r'\\boxed\{(.*?)\}', s)
+    for candidate in reversed(matches):
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            # Try truncating to the last closing bracket
+            for i in range(len(candidate), 0, -1):
+                try:
+                    result = json.loads(candidate[:i])
+                    if isinstance(result, list):
+                        return result
+                except Exception:
+                    continue
+    return []
 
-    return matches[-1] if matches else None
+
+def extract_boxed_answer(s: str) -> str | None:
+    """
+    Extract the last \\boxed{...} value from a string.
+    Returns None if not found.
+    """
+    matches = re.findall(r"\\boxed\{(.*?)\}", s)
+    return matches[-1].strip() if matches else None

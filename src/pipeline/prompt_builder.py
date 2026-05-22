@@ -7,7 +7,7 @@ Reads prompt templates from files (dataset-specific) and fills in:
     - FEW_SHOT_EXAMPLES            (sampled client profiles with known labels)
     - CLIENT_STATS                 (the target client's user_summary_str)
 
-Output is a list of dicts saved as JSON — same format consumed by
+Output is a list of dicts saved as JSONL — same format consumed by
 explanation_gen.py and lora_trainer.py.
 """
 
@@ -16,7 +16,7 @@ import random
 from pathlib import Path
 from tqdm import tqdm
 
-from src.data.aggregator import build_user_summary_str, build_dataset_summary_str
+from src.data.aggregator import get_summary_fn
 
 
 def _load_template(base_dir: str, relative_path: str) -> str:
@@ -37,8 +37,9 @@ def build_few_shot_str(
     Uses the same user_summary_str format as the target client.
     """
     random.seed(seed)
-    label_names = config["dataset"]["label_names"]
+    label_names    = config["dataset"]["label_names"]
     category_label = config["dataset"].get("category_label", "категории трат")
+    summary_fn     = get_summary_fn(config)
 
     parts = ["Примеры клиентов:\n"]
     i = 1
@@ -49,7 +50,7 @@ def build_few_shot_str(
 
         for cid in sampled:
             client_df = df[df["customer_id"] == cid]
-            summary = build_user_summary_str(client_df, category_label)
+            summary = summary_fn(client_df, category_label)
             parts.append(f"\nКлиент {i} — {label_name}:\n{summary}\n")
             i += 1
 
@@ -76,18 +77,19 @@ def build_prompts(
         {FEW_SHOT_EXAMPLES}
         {CLIENT_STATS}
     """
-    cfg_prompts = config["prompts"]
+    cfg_prompts   = config["prompts"]
     system_prompt = _load_template(cfg_prompts["base_dir"], cfg_prompts["system"])
     user_template = _load_template(cfg_prompts["base_dir"], cfg_prompts["user"])
 
-    label_names = config["dataset"]["label_names"]
+    label_names    = config["dataset"]["label_names"]
     category_label = config["dataset"].get("category_label", "категории трат")
+    summary_fn     = get_summary_fn(config)
 
     records = []
     for cid in tqdm(df["customer_id"].unique(), desc="Building prompts"):
-        client_df = df[df["customer_id"] == cid]
-        label = int(client_df["label"].iloc[0])
-        client_stats = build_user_summary_str(client_df, category_label)
+        client_df    = df[df["customer_id"] == cid]
+        label        = int(client_df["label"].iloc[0])
+        client_stats = summary_fn(client_df, category_label)
 
         user_prompt = user_template.format(
             SUMMARY_TRANSACTIONAL_STATS=summary_stats_str,
@@ -95,13 +97,16 @@ def build_prompts(
             CLIENT_STATS=client_stats,
         )
 
+        # label_names keys may be int or str depending on YAML loader
+        label_name = label_names.get(str(label), label_names.get(label, str(label)))
+
         records.append({
-            "customer_id": int(cid),
-            "label": label,
-            "label_name": label_names[str(label)],
+            "customer_id":  int(cid),
+            "label":        label,
+            "label_name":   label_name,
             "client_stats": client_stats,
             "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
+            "user_prompt":  user_prompt,
         })
 
     return records

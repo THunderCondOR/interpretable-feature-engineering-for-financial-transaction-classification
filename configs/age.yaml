@@ -1,34 +1,42 @@
 dataset:
   name: age
-
-  # Маппинг колонок CSV → внутренняя схема пайплайна.
-  # prepare_age.py уже переименовывает id → customer_id, bins → age_group.
-  # Остальные колонки зависят от того что пришло с HuggingFace —
-  # проверь вывод prepare_age.py и поправь при необходимости.
   columns:
-    customer_id: customer_id   # ID клиента
-    datetime:    trans_date    # дата транзакции (может быть "event_time")
-    amount:      amount_rur    # сумма транзакции
-    category:    small_group   # числовой код категории (маппинг делает loader.py)
-    label:       age_group     # 0=18-25, 1=26-35, 2=36-45, 3=46+
-
+    customer_id: customer_id
+    datetime:    tr_datetime
+    amount:      amount
+    category:    mcc_code_desc
+    label:       age_group
   label_names:
-    0: "18-25"
-    1: "26-35"
-    2: "36-45"
-    3: "46+"
-
+    "0": "18-25"
+    "1": "26-35"
+    "2": "36-45"
+    "3": "46+"
   category_label: "типы операций"
   num_labels: 4
-  metric: roc_auc_ovr_macro
-
+  metric: accuracy
   splits:
     train: data/age/train.csv
     val:   data/age/val.csv
     test:  data/age/test.csv
 
+llm:
+  api_base_url: "${API_BASE_URL}"
+  api_key:      "${API_KEY}"
+  default_model: "Qwen/Qwen3-235B-A22B-Instruct-2507"
+  max_concurrent: 16
+  batch_size: 32
+  temperature: 1.0
+  top_p: 0.9
+
+prompts:
+  base_dir: "."
+  system:        prompts_age_explanation_generation_system_prompt.txt
+  user:          prompts_age_explanation_generation_user_prompt.txt
+  claims_system: prompts_age_claims_extraction_system_prompt.txt
+  claims_user:   prompts_age_claims_extraction_user_prompt.txt
+
 lora:
-  model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+  model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
   max_length: 1024
   lora_rank: 8
   lora_alpha: 8
@@ -39,10 +47,24 @@ lora:
   num_epochs: 5
   load_in_4bit: true
 
-prompts:
-  base_dir: prompts/age
-  system: explanation_generation/system_prompt.txt
+pipeline:
+  n_explanation_samples: 8
+  n_claims_samples: 10
+  distance_threshold: 0.01
+  class_diff_threshold: 0.02
+  pca_components: 50
+  perplexity: 15
+  embedding_model: "paraphrase-multilingual-MiniLM-L12-v2"
+
+optuna:
+  n_trials: 30
 
 output:
-  base_dir: results/age
-  metrics:  metrics.json
+  base_dir:      results/age
+  summary_stats: summary_stats.txt
+  clients_stats: clients_stats.jsonl
+  prompts:       prompts.jsonl
+  explanations:  explanations.jsonl
+  claims:        claims.jsonl
+  features:      cot_features.parquet
+  metrics:       metrics.json

@@ -3,16 +3,15 @@ src/pipeline/explanation_gen.py
 
 Step 2 of the pipeline: send client prompts to LLM and save CoT explanations.
 
-Reads:  {output.clients_stats}  (from stats step)  OR pre-built prompts JSON
-Writes: {output.explanations}   (jsonl)
+Reads:  {output.prompts}       (prompts.jsonl, written by the prompts step)
+Writes: {output.explanations}  (jsonl)
 
-Each output line: {customer_id, label, label_name, explanation, execution_time}
+Each output line: {customer_id, label, label_name, explanation, predicted, execution_time}
 """
 
 import asyncio
 import json
 from pathlib import Path
-from tqdm import tqdm
 
 from src.utils.async_api import batched_query
 from src.utils.prompt_parsing import extract_boxed_answer
@@ -28,18 +27,10 @@ def load_prompts(path: str) -> list[dict]:
     return records
 
 
-def build_messages(record: dict, n_samples: int = 1) -> list[list[dict]]:
-    """Build n_samples independent message lists for one client (for majority voting)."""
-    messages = [
-        {"role": "system",  "content": record["system_prompt"]},
-        {"role": "user",    "content": record["user_prompt"]},
-    ]
-    return [messages] * n_samples
-
-
 def run_explanation_generation(config: dict) -> None:
-    out_dir  = Path(config["output"]["base_dir"])
-    load_path = out_dir / config["output"]["clients_stats"]
+    out_dir   = Path(config["output"]["base_dir"])
+    # Read from prompts.jsonl (written by the prompts step)
+    load_path = out_dir / config["output"]["prompts"]
     save_path = out_dir / config["output"]["explanations"]
 
     n_samples = config["pipeline"].get("n_explanation_samples", 8)
@@ -51,7 +42,7 @@ def run_explanation_generation(config: dict) -> None:
 
     # Build all dialogue batches: n_samples per client
     all_dialogues = []
-    meta = []  # (customer_id, label, label_name) repeated n_samples times
+    meta = []
     for rec in records:
         for _ in range(n_samples):
             all_dialogues.append([
@@ -67,12 +58,20 @@ def run_explanation_generation(config: dict) -> None:
     print(f"Sending {len(all_dialogues)} requests ({n_samples} per client)...")
     api_results = asyncio.run(batched_query(all_dialogues, model, llm_cfg))
 
-    # Write results
     save_path.parent.mkdir(parents=True, exist_ok=True)
+    n_errors = 0
     with open(save_path, "w", encoding="utf-8") as f:
         for m, result in zip(meta, api_results):
-            response = result["response"]
-            text = response.choices[0].message.content if response.choices else ""
+            if result["error"] or result["response"] is None:
+                n_errors += 1
+                text = ""
+            else:
+                try:
+                    text = result["response"].choices[0].message.content or ""
+                except Exception:
+                    text = ""
+                    n_errors += 1
+
             record = {
                 **m,
                 "explanation":    text,
@@ -81,4 +80,6 @@ def run_explanation_generation(config: dict) -> None:
             }
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    print(f"Saved {len(api_results)} explanations to {save_path}")
+    if n_errors:
+        print(f"  Warning: {n_errors}/{len(api_results)} requests failed")
+    print(f"Saved {len(api_results)} explanations → {save_path}")

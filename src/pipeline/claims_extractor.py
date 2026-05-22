@@ -17,7 +17,7 @@ from src.utils.async_api import batched_query
 from src.utils.prompt_parsing import extract_json_list
 
 
-def load_explanations(path: str) -> list[dict]:
+def load_explanations(path: str) -> list[list[dict]]:
     """Load and group explanations by customer_id (multiple samples per client)."""
     by_client: dict[int, list] = {}
     with open(path, encoding="utf-8") as f:
@@ -52,7 +52,6 @@ def run_claims_extraction(config: dict) -> None:
     meta = []
 
     for group in client_groups:
-        # Use at most n_samples explanations per client
         for rec in group[:n_samples]:
             explanation = rec.get("explanation", "")
             if not explanation:
@@ -71,13 +70,21 @@ def run_claims_extraction(config: dict) -> None:
     print(f"Sending {len(all_dialogues)} claim extraction requests...")
     api_results = asyncio.run(batched_query(all_dialogues, model, llm_cfg))
 
-    # Aggregate claims per client
     claims_by_client: dict[int, dict] = {}
+    n_errors = 0
     for m, result in zip(meta, api_results):
         cid = m["customer_id"]
-        response = result["response"]
-        text = response.choices[0].message.content if response.choices else ""
-        parsed = extract_json_list(text)
+
+        if result["error"] or result["response"] is None:
+            n_errors += 1
+            parsed = []
+        else:
+            try:
+                text   = result["response"].choices[0].message.content or ""
+                parsed = extract_json_list(text)
+            except Exception:
+                parsed = []
+                n_errors += 1
 
         if cid not in claims_by_client:
             claims_by_client[cid] = {
@@ -94,4 +101,6 @@ def run_claims_extraction(config: dict) -> None:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     total_claims = sum(len(r["claims"]) for r in claims_by_client.values())
-    print(f"Saved {total_claims} claims for {len(claims_by_client)} clients to {save_path}")
+    if n_errors:
+        print(f"  Warning: {n_errors}/{len(api_results)} requests failed")
+    print(f"Saved {total_claims} claims for {len(claims_by_client)} clients → {save_path}")

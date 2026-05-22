@@ -3,6 +3,8 @@ dataset:
 
   # Колонки после prepare_rosbank.py
   # mcc_code_desc = "MCC описание [тип операции]"  — основная категориальная
+  # trx_cat_ru и currency_name сохраняются loader'ом автоматически (не в rename-map,
+  # но и не удаляются), и используются rosbank-специфичными агрегаторами.
   columns:
     customer_id: customer_id
     datetime:    tr_datetime
@@ -11,12 +13,13 @@ dataset:
     label:       label
 
   label_names:
-    0: "активный клиент"
-    1: "отток"
+    "0": "активный клиент"
+    "1": "отток"
 
   category_label: "категории операций"
   num_labels: 2
-  metric: accuracy
+  # roc_auc_ovr_macro рекомендуется для несбалансированной бинарной классификации
+  metric: roc_auc_ovr_macro
 
   splits:
     train: data/rosbank/train.csv
@@ -33,14 +36,14 @@ llm:
   top_p: 0.9
 
 prompts:
-  base_dir: prompts/rosbank
-  system:        explanation_generation/system_prompt.txt
-  user:          explanation_generation/user_prompt.txt
-  claims_system: claims_extraction/system_prompt.txt
-  claims_user:   claims_extraction/user_prompt.txt
+  base_dir: "."
+  system:        prompts_rosbank_explanation_generation_system_prompt.txt
+  user:          prompts_rosbank_explanation_generation_user_prompt.txt
+  claims_system: prompts_rosbank_claims_extraction_system_prompt.txt
+  claims_user:   prompts_rosbank_claims_extraction_user_prompt.txt
 
 lora:
-  model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+  model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
   max_length: 1024
   lora_rank: 8
   lora_alpha: 8
@@ -58,6 +61,7 @@ pipeline:
   class_diff_threshold: 0.02
   pca_components: 50
   perplexity: 15
+  embedding_model: "paraphrase-multilingual-MiniLM-L12-v2"
 
 optuna:
   n_trials: 30
@@ -66,6 +70,7 @@ output:
   base_dir:      results/rosbank
   summary_stats: summary_stats.txt
   clients_stats: clients_stats.jsonl
+  prompts:       prompts.jsonl
   explanations:  explanations.jsonl
   claims:        claims.jsonl
   features:      cot_features.parquet
