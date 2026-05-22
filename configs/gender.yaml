@@ -1,0 +1,44 @@
+dataset:
+  name: gender
+
+  # Маппинг колонок CSV → внутренняя схема пайплайна.
+  # Если после prepare_gender.py колонки называются иначе — правь здесь, не в коде.
+  columns:
+    customer_id: customer_id   # ID клиента
+    datetime:    tr_datetime   # дата/время транзакции (может быть "event_time" или "trans_date")
+    amount:      amount        # сумма транзакции
+    category:    mcc_code_desc # текстовое описание MCC (может быть "mcc_description")
+    label:       gender        # целевая переменная (0 = женщина, 1 = мужчина)
+
+  label_names:
+    0: "женщина"
+    1: "мужчина"
+
+  category_label: "категории MCC"   # подставляется в текстовый профиль клиента
+  num_labels: 2
+  metric: accuracy
+
+  splits:
+    train: data/gender/train.csv
+    val:   data/gender/val.csv
+    test:  data/gender/test.csv
+
+lora:
+  model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+  max_length: 1024            # хватает для user_summary_str (~500-700 токенов)
+  lora_rank: 8
+  lora_alpha: 8
+  lora_dropout: 0.05
+  learning_rate: 2.0e-4
+  batch_size: 4               # уменьши до 1-2 если OOM
+  gradient_accumulation_steps: 8   # эффективный batch = batch_size * grad_acc
+  num_epochs: 5
+  load_in_4bit: true
+
+prompts:
+  base_dir: prompts/gender
+  system: explanation_generation/system_prompt.txt
+
+output:
+  base_dir: results/gender
+  metrics:  metrics.json

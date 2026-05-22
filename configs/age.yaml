@@ -1,0 +1,48 @@
+dataset:
+  name: age
+
+  # Маппинг колонок CSV → внутренняя схема пайплайна.
+  # prepare_age.py уже переименовывает id → customer_id, bins → age_group.
+  # Остальные колонки зависят от того что пришло с HuggingFace —
+  # проверь вывод prepare_age.py и поправь при необходимости.
+  columns:
+    customer_id: customer_id   # ID клиента
+    datetime:    trans_date    # дата транзакции (может быть "event_time")
+    amount:      amount_rur    # сумма транзакции
+    category:    small_group   # числовой код категории (маппинг делает loader.py)
+    label:       age_group     # 0=18-25, 1=26-35, 2=36-45, 3=46+
+
+  label_names:
+    0: "18-25"
+    1: "26-35"
+    2: "36-45"
+    3: "46+"
+
+  category_label: "типы операций"
+  num_labels: 4
+  metric: roc_auc_ovr_macro
+
+  splits:
+    train: data/age/train.csv
+    val:   data/age/val.csv
+    test:  data/age/test.csv
+
+lora:
+  model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+  max_length: 1024
+  lora_rank: 8
+  lora_alpha: 8
+  lora_dropout: 0.05
+  learning_rate: 2.0e-4
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  num_epochs: 5
+  load_in_4bit: true
+
+prompts:
+  base_dir: prompts/age
+  system: explanation_generation/system_prompt.txt
+
+output:
+  base_dir: results/age
+  metrics:  metrics.json
