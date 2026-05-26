@@ -16,15 +16,15 @@ dataset:
   num_labels: 2
   metric: accuracy
 
-  # train/val строятся из авторского labeled train subset;
-  # test — авторский test subset. Если в нем нет target_flag, label = -1 и метрики на test не считаются.
+  # train and val are built from the labeled train subset.
+  # test is also a local labeled split so evaluation metrics can be computed.
   splits:
     train: data/rosbank/train.csv
     val:   data/rosbank/val.csv
     test:  data/rosbank/test.csv
 
 llm:
-  # OpenRouter is OpenAI-compatible. Export OPENROUTER_API_KEY before running.
+  # OpenRouter is OpenAI-compatible. Export API_BASE_URL and API_KEY before running.
   api_base_url: "${API_BASE_URL}"
   api_key:      "${API_KEY}"
   default_model: "deepseek/deepseek-r1-0528" # "Openai/Gpt-oss-120b"
@@ -53,13 +53,13 @@ lora:
   load_in_4bit: true
 
 pipeline:
-  # Для быстрого первого прогона можно переопределить CLI: --max-clients-per-split 200
+  # For a quick smoke test, override this in CLI with --max-clients-per-split 200.
   n_explanation_samples: 1
   n_claims_samples: 1
   few_shot_per_class: 2
   embedding_model: "paraphrase-multilingual-MiniLM-L12-v2"
 
-  # train-only supervised filtering for CoT clusters
+  # Train-only supervised filtering for CoT clusters.
   class_diff_threshold: 0.02
   min_cluster_size: 2
   max_assign_distance: 0.45
