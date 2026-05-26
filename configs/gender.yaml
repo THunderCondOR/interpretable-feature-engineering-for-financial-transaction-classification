@@ -26,8 +26,7 @@ llm:
   temperature: 1.0
   top_p: 0.9
 
-# Пути к промптам — плоские файлы в корне проекта
-# Path("base_dir") / "system" = "./prompts_gender_explanation_generation_system_prompt.txt"
+# Prompt templates are stored under the repository root.
 prompts:
   base_dir: "."
   system:        prompts/gender/explanation_generation/system_prompt.txt
