@@ -1,6 +1,0 @@
-diff --git a/run_lora.py b/run_lora.py
---- a/run_lora.py
-+++ b/run_lora.py
-@@ -1,8 +1,8 @@
--Run LoRA training entry point with Russian logs.
-+Run LoRA training entry point with English logs.
