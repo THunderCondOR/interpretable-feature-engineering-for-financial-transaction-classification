@@ -25,9 +25,9 @@ dataset:
 
 llm:
   # OpenRouter is OpenAI-compatible. Export OPENROUTER_API_KEY before running.
-  api_base_url: "https://inference.airi.net:46783/v1"
-  api_key:      "KEY"
-  default_model: "Openai/Gpt-oss-120b"
+  api_base_url: "${API_BASE_URL}"
+  api_key:      "${API_KEY}"
+  default_model: "deepseek/deepseek-r1-0528" # "Openai/Gpt-oss-120b"
   max_concurrent: 8
   batch_size: 16
   temperature: 0.8
@@ -54,8 +54,8 @@ lora:
 
 pipeline:
   # Для быстрого первого прогона можно переопределить CLI: --max-clients-per-split 200
-  n_explanation_samples: 3
-  n_claims_samples: 3
+  n_explanation_samples: 1
+  n_claims_samples: 1
   few_shot_per_class: 2
   embedding_model: "paraphrase-multilingual-MiniLM-L12-v2"
 

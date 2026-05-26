@@ -30,10 +30,10 @@ llm:
 # Path("base_dir") / "system" = "./prompts_gender_explanation_generation_system_prompt.txt"
 prompts:
   base_dir: "."
-  system:        prompts_gender_explanation_generation_system_prompt.txt
-  user:          prompts_gender_explanation_generation_user_prompt.txt
-  claims_system: prompts_gender_claims_extraction_system_prompt.txt
-  claims_user:   prompts_gender_claims_extraction_user_prompt.txt
+  system:        prompts/gender/explanation_generation/system_prompt.txt
+  user:          prompts/gender/explanation_generation/user_prompt.txt
+  claims_system: prompts/gender/claims_extraction/system_prompt.txt
+  claims_user:   prompts/gender/claims_extraction/user_prompt.txt
 
 lora:
   model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"

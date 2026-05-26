@@ -217,10 +217,30 @@ def _load_cot_split(out_dir: Path, split: str, fallback: Path | None = None) -> 
     raise FileNotFoundError(f"CoT features not found for split={split}: {path}")
 
 
-def _split_xy(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
+def _feature_cols(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c not in {"customer_id", "label"}]
+
+
+def _align_feature_frame(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+    """
+    Force a split-specific feature dataframe to use exactly the train feature schema.
+
+    Missing columns are filled with zeros.
+    Extra columns are dropped.
+    """
+    base_cols = ["customer_id", "label"]
+    for col in base_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+
+    return df.reindex(columns=base_cols + feature_cols, fill_value=0)
+
+
+def _split_xy(df: pd.DataFrame, feature_cols: list[str]) -> tuple[np.ndarray, np.ndarray]:
     df = df[df["label"] >= 0].copy()
-    feat_cols = [c for c in df.columns if c not in {"customer_id", "label"}]
-    return df[feat_cols].values, df["label"].astype(int).values, feat_cols
+    X = df[feature_cols].values
+    y = df["label"].astype(int).values
+    return X, y
 
 
 def run_ml_baseline(config: dict) -> None:
@@ -232,67 +252,156 @@ def run_ml_baseline(config: dict) -> None:
     val_df = add_features(load_dataset(config, "val"))
     test_df = add_features(load_dataset(config, "test"))
 
+    print("Building handcrafted features...")
     hc_builder = _get_handcrafted_builder(config)
-    hc_train = hc_builder(train_df, config)
-    hc_val = hc_builder(val_df, config)
-    hc_test = hc_builder(test_df, config)
+    hc_train_raw = hc_builder(train_df, config)
+    hc_val_raw = hc_builder(val_df, config)
+    hc_test_raw = hc_builder(test_df, config)
 
+    print("Loading CoT features...")
     fallback = out_dir / config["output"].get("features", "cot_features.parquet")
-    cot_train = _load_cot_split(out_dir, "train", fallback)
-    cot_val = _load_cot_split(out_dir, "val", fallback)
-    cot_test = _load_cot_split(out_dir, "test", fallback) if (out_dir / "cot_features_test.parquet").exists() else None
+    cot_train_raw = _load_cot_split(out_dir, "train", fallback)
+    cot_val_raw = _load_cot_split(out_dir, "val", fallback)
 
-    def align(cot: pd.DataFrame, hc: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        # Inner merge prevents row-order leakage.
-        cot_cols = [c for c in cot.columns if c.startswith("cot_cluster_")]
-        hc_cols = [c for c in hc.columns if c not in {"customer_id", "label"}]
-        merged = cot[["customer_id", "label"] + cot_cols].merge(
-            hc[["customer_id", "label"] + hc_cols], on=["customer_id", "label"], how="inner"
+    cot_test_path = out_dir / "cot_features_test.parquet"
+    cot_test_raw = _load_cot_split(out_dir, "test", fallback) if cot_test_path.exists() else None
+
+    # ------------------------------------------------------------------
+    # Fix feature schemas by train split.
+    # This is the key fix: val/test must have exactly the same columns
+    # as train, otherwise XGBoost crashes with feature shape mismatch.
+    # ------------------------------------------------------------------
+
+    hc_cols = _feature_cols(hc_train_raw)
+    cot_cols = [c for c in cot_train_raw.columns if c.startswith("cot_cluster_")]
+
+    hc_train = _align_feature_frame(hc_train_raw, hc_cols)
+    hc_val = _align_feature_frame(hc_val_raw, hc_cols)
+    hc_test = _align_feature_frame(hc_test_raw, hc_cols)
+
+    cot_train = _align_feature_frame(cot_train_raw, cot_cols)
+    cot_val = _align_feature_frame(cot_val_raw, cot_cols)
+    cot_test = _align_feature_frame(cot_test_raw, cot_cols) if cot_test_raw is not None else None
+
+    def make_concat(cot_df: pd.DataFrame, hc_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Merge CoT and handcrafted features by customer_id and label.
+        Never concatenate by row order.
+        """
+        merged = cot_df.merge(
+            hc_df,
+            on=["customer_id", "label"],
+            how="inner",
+            suffixes=("", "_hc"),
         )
-        return merged[["customer_id", "label"] + cot_cols], merged[["customer_id", "label"] + hc_cols], merged[["customer_id", "label"] + cot_cols + hc_cols]
+        return merged
 
-    tr_cot, tr_hc, tr_cat = align(cot_train, hc_train)
-    va_cot, va_hc, va_cat = align(cot_val, hc_val)
-    if cot_test is not None:
-        te_cot, te_hc, te_cat = align(cot_test, hc_test)
-    else:
-        te_cot = te_hc = te_cat = None
+    cat_train = make_concat(cot_train, hc_train)
+    cat_val = make_concat(cot_val, hc_val)
+    cat_test = make_concat(cot_test, hc_test) if cot_test is not None else None
+
+    cat_cols = cot_cols + hc_cols
 
     feature_sets = {
-        "cot": (tr_cot, va_cot, te_cot),
-        "handcrafted": (tr_hc, va_hc, te_hc),
-        "concat": (tr_cat, va_cat, te_cat),
+        "cot": {
+            "train": cot_train,
+            "val": cot_val,
+            "test": cot_test,
+            "cols": cot_cols,
+        },
+        "handcrafted": {
+            "train": hc_train,
+            "val": hc_val,
+            "test": hc_test,
+            "cols": hc_cols,
+        },
+        "concat": {
+            "train": cat_train,
+            "val": cat_val,
+            "test": cat_test,
+            "cols": cat_cols,
+        },
     }
 
     all_results = {}
     n_classes = config["dataset"]["num_labels"]
     objective = "binary:logistic" if n_classes == 2 else "multi:softprob"
 
-    for feat_name, (tr_df, va_df, te_df) in feature_sets.items():
-        X_tr, y_tr, feat_cols = _split_xy(tr_df)
-        X_va, y_va, _ = _split_xy(va_df)
-        all_results[feat_name] = {}
-        print(f"\nFeature set: {feat_name}, dim={X_tr.shape[1]}, train={len(y_tr)}, val={len(y_va)}")
+    for feat_name, pack in feature_sets.items():
+        tr_df = pack["train"]
+        va_df = pack["val"]
+        te_df = pack["test"]
+        feat_cols = pack["cols"]
 
+        X_tr, y_tr = _split_xy(tr_df, feat_cols)
+        X_va, y_va = _split_xy(va_df, feat_cols)
+
+        all_results[feat_name] = {}
+
+        print(
+            f"\nFeature set: {feat_name}, "
+            f"dim={X_tr.shape[1]}, train={len(y_tr)}, val={len(y_va)}"
+        )
+
+        if X_tr.shape[1] != X_va.shape[1]:
+            raise ValueError(
+                f"Internal feature mismatch for {feat_name}: "
+                f"train={X_tr.shape[1]}, val={X_va.shape[1]}"
+            )
+
+        # XGBoost
         best_xgb = _tune_xgboost(X_tr, y_tr, config, n_trials)
-        xgb = XGBClassifier(**best_xgb, objective=objective, random_state=42, n_jobs=4, verbosity=0, eval_metric="logloss")
+        xgb = XGBClassifier(
+            **best_xgb,
+            objective=objective,
+            random_state=42,
+            n_jobs=4,
+            verbosity=0,
+            eval_metric="logloss",
+        )
         xgb.fit(X_tr, y_tr)
-        res = {"params": best_xgb, "val": _eval(xgb, X_va, y_va)}
+
+        res = {
+            "params": best_xgb,
+            "val": _eval(xgb, X_va, y_va),
+        }
+
         if te_df is not None and (te_df["label"] >= 0).all():
-            X_te, y_te, _ = _split_xy(te_df)
+            X_te, y_te = _split_xy(te_df, feat_cols)
+
+            if X_te.shape[1] != X_tr.shape[1]:
+                raise ValueError(
+                    f"Internal feature mismatch for {feat_name}: "
+                    f"train={X_tr.shape[1]}, test={X_te.shape[1]}"
+                )
+
             res["test"] = _eval(xgb, X_te, y_te)
+
         all_results[feat_name]["xgboost"] = res
 
+        # Decision Tree
         best_dt = _tune_decision_tree(X_tr, y_tr, n_trials)
         dt = DecisionTreeClassifier(**best_dt, random_state=42)
         dt.fit(X_tr, y_tr)
-        res = {"params": best_dt, "val": _eval(dt, X_va, y_va), "tree_text": export_text(dt, feature_names=feat_cols, max_depth=4)[:4000]}
+
+        dt_res = {
+            "params": best_dt,
+            "val": _eval(dt, X_va, y_va),
+            "tree_text": export_text(
+                dt,
+                feature_names=feat_cols,
+                max_depth=4,
+            )[:4000],
+        }
+
         if te_df is not None and (te_df["label"] >= 0).all():
-            X_te, y_te, _ = _split_xy(te_df)
-            res["test"] = _eval(dt, X_te, y_te)
-        all_results[feat_name]["decision_tree"] = res
+            X_te, y_te = _split_xy(te_df, feat_cols)
+            dt_res["test"] = _eval(dt, X_te, y_te)
+
+        all_results[feat_name]["decision_tree"] = dt_res
 
     out_path = out_dir / "ml_metrics.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
+
     print(f"Metrics saved -> {out_path}")

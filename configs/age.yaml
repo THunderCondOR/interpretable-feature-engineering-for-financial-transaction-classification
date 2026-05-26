@@ -30,10 +30,10 @@ llm:
 
 prompts:
   base_dir: "."
-  system:        prompts_age_explanation_generation_system_prompt.txt
-  user:          prompts_age_explanation_generation_user_prompt.txt
-  claims_system: prompts_age_claims_extraction_system_prompt.txt
-  claims_user:   prompts_age_claims_extraction_user_prompt.txt
+  system:        prompts/age/explanation_generation/system_prompt.txt
+  user:          prompts/age/explanation_generation/user_prompt.txt
+  claims_system: prompts/age/claims_extraction/system_prompt.txt
+  claims_user:   prompts/age/claims_extraction/user_prompt.txt
 
 lora:
   model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"

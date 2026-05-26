@@ -24,8 +24,8 @@ from src.models.lora_trainer import train
 
 RUNS = [
     # --- Gender ---
-    {"dataset": "gender", "config": "configs/gender.yaml", "model_size": "1.5B",
-     "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"},
+    # {"dataset": "gender", "config": "configs/gender.yaml", "model_size": "1.5B",
+    #  "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"},
     # {"dataset": "gender", "config": "configs/gender.yaml", "model_size": "7B",
     #  "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"},
     # {"dataset": "gender", "config": "configs/gender.yaml", "model_size": "14B",
@@ -40,8 +40,8 @@ RUNS = [
     #  "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"},
 
     # --- Rosbank ---
-    {"dataset": "rosbank", "config": "configs/rosbank.yaml", "model_size": "1.5B",
-     "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"},
+    # {"dataset": "rosbank", "config": "configs/rosbank.yaml", "model_size": "1.5B",
+    # "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"},
     # {"dataset": "rosbank", "config": "configs/rosbank.yaml", "model_size": "7B",
     #  "model_name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"},
     # {"dataset": "rosbank", "config": "configs/rosbank.yaml", "model_size": "14B",

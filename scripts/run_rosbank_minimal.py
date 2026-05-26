@@ -230,41 +230,118 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 def step_llm_eval(config: dict, splits: Iterable[str]) -> None:
+    """
+    Evaluate direct LLM baseline.
+
+    Main protocol:
+        one LLM sample per customer.
+
+    Metrics:
+        accuracy is always computed;
+        roc_auc is also computed when labels and valid predictions are available.
+
+    If a file accidentally contains multiple samples per customer, this function:
+        - uses sample_id == 0 when available;
+        - otherwise uses the first valid prediction.
+    This avoids turning the LLM baseline into a self-consistency / majority-vote setup.
+    """
     results = {}
+
     for split in splits:
         path = split_path(config, "explanations", split)
         rows = _read_jsonl(path)
+
         by_client = defaultdict(list)
-        labels = {}
-        raw_answers = defaultdict(list)
         for r in rows:
             cid = int(r["customer_id"])
-            by_client[cid].append(r.get("predicted"))
-            raw_answers[cid].append(r.get("predicted_raw"))
-            labels[cid] = int(r.get("label", -1))
+            by_client[cid].append(r)
 
         pred_records = []
-        y_true, y_pred = [], []
-        for cid, preds in by_client.items():
-            valid = [p for p in preds if p is not None]
-            pred = Counter(valid).most_common(1)[0][0] if valid else -1
+        y_true, y_pred, y_score = [], [], []
+
+        n_total_clients = len(by_client)
+        n_scored_clients = 0
+        n_unscored_clients = 0
+
+        for cid, group in by_client.items():
+            group = sorted(group, key=lambda x: int(x.get("sample_id", 0)))
+
+            # Strict LLM baseline: take one response, preferably sample_id == 0.
+            chosen = None
+            for r in group:
+                if int(r.get("sample_id", 0)) == 0:
+                    chosen = r
+                    break
+            if chosen is None and group:
+                chosen = group[0]
+
+            label = int(chosen.get("label", -1)) if chosen is not None else -1
+            pred = chosen.get("predicted") if chosen is not None else None
+            raw = chosen.get("predicted_raw") if chosen is not None else None
+            error = chosen.get("error") if chosen is not None else None
+
+            if pred is not None:
+                pred = int(pred)
+
+            if pred in (0, 1):
+                # With one LLM sample and no probabilities, score is the hard churn label.
+                # This allows ROC-AUC to be computed, but it is a hard-score AUC.
+                churn_score = float(pred)
+                n_scored_clients += 1
+            else:
+                pred = -1
+                churn_score = None
+                n_unscored_clients += 1
+
             pred_records.append({
                 "customer_id": cid,
-                "label": labels[cid],
+                "label": label,
                 "prediction": pred,
-                "raw_answers": raw_answers[cid],
+                "churn_score": churn_score,
+                "predicted_raw": raw,
+                "sample_id_used": chosen.get("sample_id") if chosen is not None else None,
+                "n_available_samples": len(group),
+                "error": error,
             })
-            if labels[cid] >= 0 and pred >= 0:
-                y_true.append(labels[cid])
+
+            if label >= 0 and pred >= 0 and churn_score is not None:
+                y_true.append(label)
                 y_pred.append(pred)
+                y_score.append(churn_score)
 
         pred_path = out_dir(config) / f"llm_predictions_{split}.csv"
         pd.DataFrame(pred_records).to_csv(pred_path, index=False)
+
         if y_true:
-            results[split] = compute_classification_metrics(y_true, y_pred)
+            split_metrics = compute_classification_metrics(
+                y_true=y_true,
+                y_pred=y_pred,
+                y_score=y_score,
+            )
+            split_metrics.update({
+                "n_total_clients": int(n_total_clients),
+                "n_scored_clients": int(n_scored_clients),
+                "n_unscored_clients": int(n_unscored_clients),
+                "coverage": round(float(n_scored_clients / n_total_clients), 4)
+                if n_total_clients else 0.0,
+                "llm_eval_protocol": "single_sample_per_customer",
+                "roc_auc_score_type": "hard_single_sample_churn_prediction",
+            })
+            results[split] = split_metrics
         else:
-            results[split] = {"n": len(pred_records), "metrics_skipped": "labels or valid predictions unavailable"}
+            results[split] = {
+                "n_total_clients": int(n_total_clients),
+                "n_scored_clients": int(n_scored_clients),
+                "n_unscored_clients": int(n_unscored_clients),
+                "coverage": round(float(n_scored_clients / n_total_clients), 4)
+                if n_total_clients else 0.0,
+                "llm_eval_protocol": "single_sample_per_customer",
+                "metrics_skipped": "labels or valid predictions unavailable",
+            }
+
         print(f"llm eval {split}: {results[split]}")
+        print(f"llm predictions {split} -> {pred_path}")
+
     write_json(out_dir(config) / "metrics_llm.json", results)
 
 
