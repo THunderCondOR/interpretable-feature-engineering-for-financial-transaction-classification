@@ -1,6 +1,7 @@
-# Official test-id split workflow
+# Data preparation workflow
 
-This branch replaces random local test splits with fixed client-level test identifiers.
+The repository uses fixed client-level test identifiers for all supported datasets.
+There is no random local test split.
 
 ## Inputs
 
@@ -20,13 +21,10 @@ Expected id columns:
 | age | `client_id` | `pytorch-lifestream/age-group-prediction`, `train_target` config |
 | rosbank | `cl_id` | `pytorch-lifestream/rosbank-churn`, labeled train config |
 
-The provided ids are removed from the labeled client pool and used as the final test set.
-Train and validation are created from the remaining labeled clients with stratification by client-level label.
-
 ## Prepare data
 
 ```bash
-python prepare_official_splits.py --dataset all
+python prepare_data.py --dataset all
 ```
 
 This writes:
@@ -39,7 +37,17 @@ data/<dataset>/split_report.json
 data/<dataset>/split_summary.txt
 ```
 
-The default validation fraction is `1/9` of the non-test clients. Since the provided test ids are approximately 10% of labeled clients, this gives approximately 80/10/10 train/val/test by clients.
+The prepared CSV files use the internal schema:
+
+```text
+customer_id, tr_datetime, amount, mcc_code_desc, label
+```
+
+Rosbank keeps extra columns used by handcrafted features:
+
+```text
+currency_name, trx_cat_ru, mcc_desc
+```
 
 ## Validate data
 
@@ -47,25 +55,13 @@ The default validation fraction is `1/9` of the non-test clients. Since the prov
 python validate_splits.py --dataset all
 ```
 
-The validator checks that:
+The validator checks that train, validation, and test client ids are disjoint and that `test.csv` exactly matches the provided test-id file.
 
-- train, validation, and test client ids are disjoint;
-- the prepared test split exactly matches the provided test-id file;
-- label counts and majority baselines are printed for each split.
+## Split policy
 
-## Downstream pipeline implications
+For every dataset:
 
-After running the preparation script, existing configs point to the new normalized CSV files:
-
-```text
-data/gender/train.csv, val.csv, test.csv
-data/age/train.csv, val.csv, test.csv
-data/rosbank/train.csv, val.csv, test.csv
-```
-
-The next required refactor is to make CoT feature extraction strictly train-fitted:
-
-1. build summary statistics and few-shot examples from train only;
-2. generate prompts/explanations/claims for train, validation, and test separately;
-3. fit claim clustering and supervised cluster filtering on train claims only;
-4. assign validation and test claims to the train-fitted clusters without using their labels.
+1. download the labeled source split;
+2. normalize columns to the internal schema;
+3. move provided test ids to `test.csv`;
+4. split all remaining labeled clients into train and validation with stratification by label.
