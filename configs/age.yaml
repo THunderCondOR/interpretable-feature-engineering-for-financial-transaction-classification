@@ -1,11 +1,14 @@
 dataset:
   name: age
+  split_policy: provided_test_ids
+  official_test_ids: data/test_ids/age_test_ids.csv
+  test_id_column: client_id
   columns:
     customer_id: customer_id
     datetime:    tr_datetime
     amount:      amount
     category:    mcc_code_desc
-    label:       age_group
+    label:       label
   label_names:
     "0": "18-25"
     "1": "26-35"
