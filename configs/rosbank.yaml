@@ -1,5 +1,8 @@
 dataset:
   name: rosbank
+  split_policy: provided_test_ids
+  official_test_ids: data/test_ids/rosbank_test_ids.csv
+  test_id_column: cl_id
 
   columns:
     customer_id: customer_id
@@ -16,8 +19,6 @@ dataset:
   num_labels: 2
   metric: accuracy
 
-  # train and val are built from the labeled train subset.
-  # test is also a local labeled split so evaluation metrics can be computed.
   splits:
     train: data/rosbank/train.csv
     val:   data/rosbank/val.csv
@@ -53,7 +54,6 @@ lora:
   load_in_4bit: true
 
 pipeline:
-  # For a quick smoke test, override this in CLI with --max-clients-per-split 200.
   n_explanation_samples: 1
   n_claims_samples: 1
   few_shot_per_class: 2
