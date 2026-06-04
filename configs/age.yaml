@@ -53,11 +53,14 @@ lora:
 pipeline:
   n_explanation_samples: 8
   n_claims_samples: 10
+  few_shot_per_class: 1
+  embedding_model: "paraphrase-multilingual-MiniLM-L12-v2"
   distance_threshold: 0.01
   class_diff_threshold: 0.02
+  min_cluster_size: 1
+  max_assign_distance: 0.45
   pca_components: 50
   perplexity: 15
-  embedding_model: "paraphrase-multilingual-MiniLM-L12-v2"
 
 optuna:
   n_trials: 30
