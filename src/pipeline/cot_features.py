@@ -67,15 +67,13 @@ def fit_train_clusters(config: dict, train_records: list[dict[str, Any]]) -> dic
     labels = [label for label, keep in zip(labels, keep_mask) if keep]
     customer_ids = [cid for cid, keep in zip(customer_ids, keep_mask) if keep]
 
-    distance_threshold = float(config["pipeline"].get("distance_threshold", 0.01))
     clusterer = AgglomerativeClustering(
         n_clusters=None,
-        distance_threshold=distance_threshold,
+        distance_threshold=float(config["pipeline"].get("distance_threshold", 0.01)),
         metric="cosine",
         linkage="average",
     )
     raw_cluster_ids = clusterer.fit_predict(embeddings)
-
     cluster_ids = filter_cluster_ids_by_class_diff(
         raw_cluster_ids,
         labels,
@@ -84,11 +82,11 @@ def fit_train_clusters(config: dict, train_records: list[dict[str, Any]]) -> dic
     )
 
     min_cluster_size = int(config["pipeline"].get("min_cluster_size", 1))
-    kept_clusters = []
-    for cluster_id in sorted(set(int(c) for c in cluster_ids if c >= 0)):
-        if int(np.sum(cluster_ids == cluster_id)) >= min_cluster_size:
-            kept_clusters.append(cluster_id)
-
+    kept_clusters = [
+        cluster_id
+        for cluster_id in sorted(set(int(c) for c in cluster_ids if c >= 0))
+        if int(np.sum(cluster_ids == cluster_id)) >= min_cluster_size
+    ]
     if not kept_clusters:
         raise ValueError("No CoT clusters survived filtering. Lower thresholds or inspect claims.")
 
@@ -97,17 +95,17 @@ def fit_train_clusters(config: dict, train_records: list[dict[str, Any]]) -> dic
     cluster_meta = []
     for new_idx, old_cluster_id in enumerate(kept_clusters):
         mask = cluster_ids == old_cluster_id
-        cluster_embeddings = embeddings[mask]
-        centroid = cluster_embeddings.mean(axis=0)
+        centroid = embeddings[mask].mean(axis=0)
         centroid = centroid / max(np.linalg.norm(centroid), 1e-12)
         centroids.append(centroid)
-        feature_names.append(f"cot_cluster_{new_idx:04d}")
+        feature_name = f"cot_cluster_{new_idx:04d}"
+        feature_names.append(feature_name)
         cluster_claims = [claim for claim, keep in zip(claims, mask) if keep]
         cluster_labels = [label for label, keep in zip(labels, mask) if keep]
         label_counts = pd.Series(cluster_labels).value_counts().sort_index().to_dict()
         cluster_meta.append(
             {
-                "feature": feature_names[-1],
+                "feature": feature_name,
                 "old_cluster_id": int(old_cluster_id),
                 "size": int(mask.sum()),
                 "label_counts": {str(k): int(v) for k, v in label_counts.items()},
@@ -116,11 +114,6 @@ def fit_train_clusters(config: dict, train_records: list[dict[str, Any]]) -> dic
         )
 
     return {
-        "claims": claims,
-        "labels": labels,
-        "customer_ids": customer_ids,
-        "embeddings": embeddings,
-        "cluster_ids": cluster_ids,
         "centroids": np.vstack(centroids),
         "feature_names": feature_names,
         "cluster_meta": cluster_meta,
@@ -130,7 +123,6 @@ def fit_train_clusters(config: dict, train_records: list[dict[str, Any]]) -> dic
 def records_to_features(
     records: list[dict[str, Any]],
     embeddings: np.ndarray,
-    claims: list[str],
     customer_ids: list[int],
     model: dict[str, Any],
     max_distance: float,
@@ -138,7 +130,7 @@ def records_to_features(
     feature_names = model["feature_names"]
     vectors = {int(record["customer_id"]): np.zeros(len(feature_names), dtype=np.float32) for record in records}
 
-    if claims:
+    if len(customer_ids):
         distances = cosine_distances(embeddings, model["centroids"])
         nearest = distances.argmin(axis=1)
         nearest_distance = distances.min(axis=1)
@@ -155,12 +147,17 @@ def records_to_features(
     return pd.DataFrame(rows)
 
 
-def transform_split(config: dict, split: str, records: list[dict[str, Any]], model: dict[str, Any]) -> pd.DataFrame:
+def transform_split(config: dict, records: list[dict[str, Any]], model: dict[str, Any]) -> pd.DataFrame:
     claims, _labels, customer_ids = flatten_claim_records(records)
     embedding_model = config["pipeline"].get("embedding_model", "paraphrase-multilingual-MiniLM-L12-v2")
     embeddings = embed_texts(claims, model_name=embedding_model) if claims else np.zeros((0, model["centroids"].shape[1]))
-    max_distance = float(config["pipeline"].get("max_assign_distance", 0.45))
-    return records_to_features(records, embeddings, claims, customer_ids, model, max_distance=max_distance)
+    return records_to_features(
+        records,
+        embeddings,
+        customer_ids,
+        model,
+        max_distance=float(config["pipeline"].get("max_assign_distance", 0.45)),
+    )
 
 
 def build_cot_features(config: dict) -> None:
@@ -176,10 +173,7 @@ def build_cot_features(config: dict) -> None:
 
     for split in SPLITS:
         records = load_claim_records(split_output_path(config, "claims", split))
-        if split == "train":
-            df = transform_split(config, split, records, model)
-        else:
-            df = transform_split(config, split, records, model)
+        features = transform_split(config, records, model)
         path = out_dir / f"cot_features_{split}.parquet"
-        df.to_parquet(path, index=False)
-        print(f"Saved {split} CoT features: shape={df.shape} -> {path}")
+        features.to_parquet(path, index=False)
+        print(f"Saved {split} CoT features: shape={features.shape} -> {path}")
