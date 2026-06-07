@@ -1,8 +1,5 @@
 dataset:
   name: age
-  split_policy: provided_test_ids
-  official_test_ids: data/test_ids/age_test_ids.csv
-  test_id_column: client_id
   columns:
     customer_id: customer_id
     datetime:    tr_datetime
@@ -59,8 +56,6 @@ pipeline:
   class_diff_threshold: 0.02
   min_cluster_size: 1
   max_assign_distance: 0.45
-  pca_components: 50
-  perplexity: 15
 
 optuna:
   n_trials: 30
@@ -72,5 +67,4 @@ output:
   prompts:       prompts.jsonl
   explanations:  explanations.jsonl
   claims:        claims.jsonl
-  features:      cot_features.parquet
   metrics:       metrics.json
