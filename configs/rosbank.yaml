@@ -1,34 +1,26 @@
 dataset:
   name: rosbank
-  split_policy: provided_test_ids
-  official_test_ids: data/test_ids/rosbank_test_ids.csv
-  test_id_column: cl_id
-
   columns:
     customer_id: customer_id
     datetime:    tr_datetime
     amount:      amount
     category:    mcc_code_desc
     label:       label
-
   label_names:
     "0": "активный клиент"
     "1": "отток"
-
   category_label: "категории операций"
   num_labels: 2
   metric: accuracy
-
   splits:
     train: data/rosbank/train.csv
     val:   data/rosbank/val.csv
     test:  data/rosbank/test.csv
 
 llm:
-  # OpenRouter is OpenAI-compatible. Export API_BASE_URL and API_KEY before running.
   api_base_url: "${API_BASE_URL}"
   api_key:      "${API_KEY}"
-  default_model: "deepseek/deepseek-r1-0528" # "Openai/Gpt-oss-120b"
+  default_model: "deepseek/deepseek-r1-0528"
   max_concurrent: 8
   batch_size: 16
   temperature: 0.8
@@ -58,8 +50,7 @@ pipeline:
   n_claims_samples: 1
   few_shot_per_class: 2
   embedding_model: "paraphrase-multilingual-MiniLM-L12-v2"
-
-  # Train-only supervised filtering for CoT clusters.
+  distance_threshold: 0.01
   class_diff_threshold: 0.02
   min_cluster_size: 2
   max_assign_distance: 0.45
@@ -74,5 +65,4 @@ output:
   prompts:       prompts.jsonl
   explanations:  explanations.jsonl
   claims:        claims.jsonl
-  features:      cot_features.parquet
   metrics:       metrics.json
