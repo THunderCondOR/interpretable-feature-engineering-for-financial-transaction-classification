@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 import pandas as pd
-from datasets import load_dataset
+from datasets.load import load_dataset
 from sklearn.model_selection import train_test_split
 
 from src.data.mcc import mcc_to_text
@@ -67,6 +67,14 @@ def label_table(df: pd.DataFrame) -> pd.DataFrame:
     return labels
 
 
+def parse_gender_datetime(values: pd.Series) -> pd.Series:
+    parts = values.astype(str).str.extract(r"^(?P<day>\d+)\s+(?P<time>\d{1,2}:\d{2}:\d{2})$")
+    if parts.isna().any(axis=None):
+        bad = values[parts.isna().any(axis=1)].head(5).tolist()
+        raise ValueError(f"Unexpected gender tr_datetime format. Examples: {bad}")
+    return pd.Timestamp("2000-01-01") + pd.to_timedelta(parts["day"].astype(int), unit="D") + pd.to_timedelta(parts["time"])
+
+
 def parse_rosbank_datetime(value: str) -> pd.Timestamp:
     months = {
         "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
@@ -85,7 +93,7 @@ def load_gender_raw() -> tuple[pd.DataFrame, pd.DataFrame]:
 def normalize_gender(transactions: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
     df = transactions.merge(labels[["customer_id", "gender"]], on="customer_id", how="inner")
     df = df.rename(columns={"gender": "label"})
-    df["tr_datetime"] = pd.to_datetime(df["tr_datetime"])
+    df["tr_datetime"] = parse_gender_datetime(df["tr_datetime"])
     df["amount"] = pd.to_numeric(df["amount"])
     df["mcc_code_desc"] = df["mcc_code"].map(mcc_to_text)
     df["label"] = df["label"].astype(int)
