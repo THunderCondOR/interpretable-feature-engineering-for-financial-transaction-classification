@@ -55,6 +55,7 @@ TRX_CATEGORY_MAP = {
     "MBO": "мобильный банк",
     "WEB": "интернет-банк",
     "BACK": "возврат средств",
+    "BACK_TRX": "возврат транзакции",
 }
 
 
@@ -71,6 +72,10 @@ def label_table(df: pd.DataFrame) -> pd.DataFrame:
 def currency_to_text(code: int | str) -> str:
     code_int = int(code)
     return CURRENCY_MAP.get(code_int, f"Валюта {code_int}")
+
+
+def trx_category_to_text(category: str) -> str:
+    return TRX_CATEGORY_MAP.get(str(category), str(category))
 
 
 def parse_gender_datetime(values: pd.Series) -> pd.Series:
@@ -140,7 +145,7 @@ def normalize_rosbank(transactions: pd.DataFrame, labels: pd.DataFrame) -> pd.Da
     df = transactions.copy()
     df["tr_datetime"] = df["TRDATETIME"].apply(parse_rosbank_datetime)
     df["currency_name"] = df["currency"].map(currency_to_text)
-    df["trx_cat_ru"] = df["trx_category"].map(lambda category: TRX_CATEGORY_MAP[category])
+    df["trx_cat_ru"] = df["trx_category"].map(trx_category_to_text)
     df["mcc_desc"] = df["MCC"].map(mcc_to_text)
     df["mcc_code_desc"] = df["mcc_desc"] + " [" + df["trx_cat_ru"] + "]"
     df = df.rename(columns={"cl_id": "customer_id", "target_flag": "label"})
