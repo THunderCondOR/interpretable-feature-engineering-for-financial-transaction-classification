@@ -40,6 +40,7 @@ CURRENCY_MAP = {
     392: "Японская иена",
     980: "Украинская гривна",
     398: "Казахстанский тенге",
+    504: "Марокканский дирхам",
 }
 
 TRX_CATEGORY_MAP = {
@@ -65,6 +66,11 @@ def label_table(df: pd.DataFrame) -> pd.DataFrame:
     labels = df.drop_duplicates("customer_id")[["customer_id", "label"]].reset_index(drop=True)
     assert labels["customer_id"].is_unique
     return labels
+
+
+def currency_to_text(code: int | str) -> str:
+    code_int = int(code)
+    return CURRENCY_MAP.get(code_int, f"Валюта {code_int}")
 
 
 def parse_gender_datetime(values: pd.Series) -> pd.Series:
@@ -133,7 +139,7 @@ def load_rosbank_raw() -> tuple[pd.DataFrame, pd.DataFrame]:
 def normalize_rosbank(transactions: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
     df = transactions.copy()
     df["tr_datetime"] = df["TRDATETIME"].apply(parse_rosbank_datetime)
-    df["currency_name"] = df["currency"].map(lambda code: CURRENCY_MAP[int(code)])
+    df["currency_name"] = df["currency"].map(currency_to_text)
     df["trx_cat_ru"] = df["trx_category"].map(lambda category: TRX_CATEGORY_MAP[category])
     df["mcc_desc"] = df["MCC"].map(mcc_to_text)
     df["mcc_code_desc"] = df["mcc_desc"] + " [" + df["trx_cat_ru"] + "]"
