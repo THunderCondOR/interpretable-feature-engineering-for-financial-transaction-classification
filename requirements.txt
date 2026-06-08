@@ -1,0 +1,16 @@
+bitsandbytes
+datasets
+httpx
+numpy
+openai
+optuna
+pandas
+peft
+pyarrow
+PyYAML
+scikit-learn
+sentence-transformers
+torch
+tqdm
+transformers
+xgboost
