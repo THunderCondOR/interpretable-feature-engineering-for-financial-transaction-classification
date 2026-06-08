@@ -12,6 +12,8 @@ import pandas as pd
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 
+from src.data.mcc import mcc_to_text
+
 RANDOM_STATE = 42
 VAL_SIZE_FROM_REMAINING = 1.0 / 9.0
 
@@ -85,7 +87,7 @@ def normalize_gender(transactions: pd.DataFrame, labels: pd.DataFrame) -> pd.Dat
     df = df.rename(columns={"gender": "label"})
     df["tr_datetime"] = pd.to_datetime(df["tr_datetime"])
     df["amount"] = pd.to_numeric(df["amount"])
-    df["mcc_code_desc"] = df["mcc_code"].map(lambda code: f"MCC {int(code)}")
+    df["mcc_code_desc"] = df["mcc_code"].map(mcc_to_text)
     df["label"] = df["label"].astype(int)
     return df[["customer_id", "tr_datetime", "amount", "mcc_code_desc", "label", "mcc_code", "tr_type", "term_id"]].copy()
 
@@ -125,7 +127,7 @@ def normalize_rosbank(transactions: pd.DataFrame, labels: pd.DataFrame) -> pd.Da
     df["tr_datetime"] = df["TRDATETIME"].apply(parse_rosbank_datetime)
     df["currency_name"] = df["currency"].map(lambda code: CURRENCY_MAP[int(code)])
     df["trx_cat_ru"] = df["trx_category"].map(lambda category: TRX_CATEGORY_MAP[category])
-    df["mcc_desc"] = df["MCC"].map(lambda code: f"MCC {int(code)}")
+    df["mcc_desc"] = df["MCC"].map(mcc_to_text)
     df["mcc_code_desc"] = df["mcc_desc"] + " [" + df["trx_cat_ru"] + "]"
     df = df.rename(columns={"cl_id": "customer_id", "target_flag": "label"})
     df["customer_id"] = df["customer_id"].astype(int)
