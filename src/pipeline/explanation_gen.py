@@ -3,8 +3,8 @@ src/pipeline/explanation_gen.py
 
 Sends client prompts to an OpenAI-compatible LLM API and saves CoT explanations.
 Supports split-specific files such as prompts_val.jsonl -> explanations_val.jsonl.
-Existing successful rows are reused on restart, so reruns send only missing or
-failed requests.
+When resume=True, existing successful rows are reused on restart and reruns send
+only missing or failed requests.
 """
 
 from __future__ import annotations
@@ -120,7 +120,7 @@ def run_explanation_generation(
     split: str | None = None,
     input_path: str | Path | None = None,
     output_path: str | Path | None = None,
-    resume: bool = True,
+    resume: bool = False,
 ) -> None:
     load_path = Path(input_path) if input_path else _split_path(config, "prompts", split)
     save_path = Path(output_path) if output_path else _split_path(config, "explanations", split)
@@ -160,8 +160,9 @@ def run_explanation_generation(
 
     keys_in_order = [_request_key(meta) for meta in ordered_meta]
     keys_to_run = [key for key in keys_in_order if key not in records_by_key]
+    mode = "resume failed/missing" if resume else "rerun all"
     print(
-        f"Explanation generation plan: expected={len(ordered_meta)}, "
+        f"Explanation generation plan ({mode}): expected={len(ordered_meta)}, "
         f"reuse_successful={len(records_by_key)}, to_run={len(keys_to_run)}"
     )
 
