@@ -2,6 +2,7 @@
 
 Examples:
     python run_pipeline.py --config configs/gender.yaml --steps stats,prompts,cot,llm_eval --splits test
+    python run_pipeline.py --config configs/gender.yaml --steps cot,llm_eval --splits test --resume-cot
     python run_pipeline.py --config configs/age.yaml --steps prompts,cot,claims --splits train,val,test
     python run_pipeline.py --config configs/rosbank.yaml --steps cot_features,ml --experiments handcrafted,cot,concat
     python run_pipeline.py --config configs/gender.yaml --steps lora
@@ -87,9 +88,9 @@ def run_prompts(config: dict, splits: list[str]) -> None:
         print(f"Saved {split} prompts: {len(records)} clients -> {path}")
 
 
-def run_cot(config: dict, splits: list[str]) -> None:
+def run_cot(config: dict, splits: list[str], *, resume_cot: bool) -> None:
     for split in splits:
-        run_explanation_generation(config, split=split)
+        run_explanation_generation(config, split=split, resume=resume_cot)
 
 
 def run_llm_eval(config: dict, splits: list[str]) -> None:
@@ -128,6 +129,11 @@ def main() -> None:
         default="handcrafted,cot,concat",
         help="Comma-separated ML feature sets: handcrafted,cot,concat.",
     )
+    parser.add_argument(
+        "--resume-cot",
+        action="store_true",
+        help="For the cot step, reuse successful existing explanations and resend only failed or missing requests.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -153,7 +159,7 @@ def main() -> None:
     step_fns = {
         "stats": lambda: run_stats(config, splits),
         "prompts": lambda: run_prompts(config, splits),
-        "cot": lambda: run_cot(config, splits),
+        "cot": lambda: run_cot(config, splits, resume_cot=args.resume_cot),
         "llm_eval": lambda: run_llm_eval(config, splits),
         "claims": lambda: run_claims(config, splits),
         "cot_features": lambda: run_cot_features(config, splits),
