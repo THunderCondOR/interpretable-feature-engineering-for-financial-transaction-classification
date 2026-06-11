@@ -41,20 +41,27 @@ prompts:
   claims_user:   prompts/age/claims_extraction/user_prompt.txt
 
 lora:
-  model_name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-  max_length: 1024
-  lora_rank: 8
-  lora_alpha: 8
-  lora_dropout: 0.05
-  learning_rate: 2.0e-4
-  batch_size: 4
-  gradient_accumulation_steps: 8
-  num_epochs: 5
-  load_in_4bit: true
+  defaults:
+    max_length: 1024
+    lora_rank: 8
+    lora_alpha: 8
+    lora_dropout: 0.05
+    learning_rate: 2.0e-4
+    batch_size: 4
+    gradient_accumulation_steps: 8
+    num_epochs: 5
+    load_in_4bit: true
+  models:
+    - name: qwen_1_5b
+      model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+    - name: qwen_7b
+      model_name: "Qwen/Qwen2.5-7B-Instruct"
+    - name: qwen_14b
+      model_name: "Qwen/Qwen2.5-14B-Instruct"
 
 pipeline:
-  n_explanation_samples: 8
-  n_claims_samples: 10
+  n_explanation_samples: 3
+  n_claims_samples: 3
   few_shot_per_class: 1
   embedding_model: "paraphrase-multilingual-MiniLM-L12-v2"
   distance_threshold: 0.01
