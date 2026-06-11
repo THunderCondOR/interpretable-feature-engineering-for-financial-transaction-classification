@@ -3,9 +3,8 @@
 Examples:
     python run_pipeline.py --config configs/gender.yaml --steps stats,prompts,cot,llm_eval --splits test
     python run_pipeline.py --config configs/gender.yaml --steps cot,llm_eval --splits test --resume-cot
-    python run_pipeline.py --config configs/age.yaml --steps prompts,cot,claims --splits train,val,test
-    python run_pipeline.py --config configs/rosbank.yaml --steps cot_features,ml --experiments handcrafted,cot,concat
     python run_pipeline.py --config configs/gender.yaml --steps lora
+    python run_pipeline.py --config configs/gender.yaml --steps lora --lora-models qwen_1_5b,qwen_7b
 """
 
 from __future__ import annotations
@@ -111,8 +110,8 @@ def run_ml(config: dict, splits: list[str], experiments: list[str]) -> None:
     run_ml_baseline(config, experiments=experiments)
 
 
-def run_lora(config: dict, splits: list[str]) -> None:
-    lora_train(config)
+def run_lora(config: dict, splits: list[str], lora_models: list[str] | None) -> None:
+    lora_train(config, model_names=lora_models)
 
 
 def parse_csv(value: str) -> list[str]:
@@ -134,11 +133,17 @@ def main() -> None:
         action="store_true",
         help="For the cot step, reuse successful existing explanations and resend only failed or missing requests.",
     )
+    parser.add_argument(
+        "--lora-models",
+        default=None,
+        help="Comma-separated LoRA run names or model ids. Defaults to all runs listed in config.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
     splits = parse_csv(args.splits)
     experiments = parse_csv(args.experiments)
+    lora_models = parse_csv(args.lora_models) if args.lora_models else None
 
     if args.steps == "default":
         steps = list(DEFAULT_STEPS)
@@ -164,7 +169,7 @@ def main() -> None:
         "claims": lambda: run_claims(config, splits),
         "cot_features": lambda: run_cot_features(config, splits),
         "ml": lambda: run_ml(config, splits, experiments),
-        "lora": lambda: run_lora(config, splits),
+        "lora": lambda: run_lora(config, splits, lora_models),
     }
 
     for step in steps:
