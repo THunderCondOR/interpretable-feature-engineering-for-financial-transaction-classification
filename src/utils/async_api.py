@@ -2,23 +2,28 @@
 src/utils/async_api.py
 
 Async wrapper for OpenAI-compatible inference APIs.
-Reads base_url and api_key from config (or env vars as fallback).
-
-This version logs API errors immediately while requests are running, instead of
-only returning silent {error: ...} records at the end of the batch.
+Reads base_url and api_key from config, expanding environment variables.
 
 Optional llm config keys:
-    log_errors: true              # print failed requests immediately
-    log_retries: true             # print retry attempts for rate-limit/timeouts
-    raise_on_error: false         # stop the whole run on the first failed request
-    error_preview_chars: 1200     # truncate printed error text
-    prompt_preview_chars: 0       # set >0 to also print a prompt preview
+    max_concurrent: 2                  # maximum in-flight requests
+    batch_size: 4                      # number of requests scheduled per batch
+    request_cooldown_seconds: 0.0      # minimum delay between request starts
+    batch_cooldown_seconds: 0.0        # sleep after each batch
+    rate_limit_cooldown_seconds: 60.0  # sleep after 429/rate-limit errors
+    retry_backoff: 2.0                 # exponential retry backoff base
+    max_retries: 3                     # attempts per request
+    log_errors: true
+    log_retries: true
+    raise_on_error: false
+    error_preview_chars: 1200
+    prompt_preview_chars: 0
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import random
 import sys
 import time
 from collections import Counter
@@ -27,6 +32,26 @@ from typing import Any
 import httpx
 import openai
 from tqdm import tqdm
+
+
+class AsyncRateLimiter:
+    """Serialize request starts with an optional minimum interval."""
+
+    def __init__(self, interval_seconds: float) -> None:
+        self.interval_seconds = max(0.0, float(interval_seconds))
+        self._lock = asyncio.Lock()
+        self._next_start = 0.0
+
+    async def wait(self) -> None:
+        if self.interval_seconds <= 0:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_start - now)
+            if delay > 0:
+                await asyncio.sleep(delay)
+                now = time.monotonic()
+            self._next_start = now + self.interval_seconds
 
 
 def _make_client(llm_config: dict) -> openai.AsyncOpenAI:
@@ -62,7 +87,6 @@ def _format_exception(exc: BaseException, limit: int = 1200) -> str:
     if request_id:
         parts.append(f"request_id={request_id}")
 
-    # OpenAI exceptions sometimes keep the server payload in body.
     body = getattr(exc, "body", None)
     if body:
         parts.append(f"body={_short(body, limit)}")
@@ -93,17 +117,26 @@ def _log(message: str) -> None:
     sys.stderr.flush()
 
 
+def _retry_delay(llm_config: dict, attempt: int, *, rate_limited: bool) -> float:
+    backoff = float(llm_config.get("retry_backoff", 2.0)) * (2 ** attempt)
+    jitter = random.uniform(0.0, min(3.0, backoff * 0.25))
+    if rate_limited:
+        cooldown = float(llm_config.get("rate_limit_cooldown_seconds", 60.0))
+        return max(cooldown, backoff) + jitter
+    return backoff + jitter
+
+
 async def _query_with_retry(
     messages: list[dict],
     model: str,
     llm_config: dict,
     client: openai.AsyncOpenAI,
     sem: asyncio.Semaphore,
+    rate_limiter: AsyncRateLimiter,
     request_id: int,
     max_retries: int = 3,
 ) -> dict:
-    """Run one chat completion with semaphore, retry on transient errors."""
-    backoff = float(llm_config.get("retry_backoff", 2.0))
+    """Run one chat completion with semaphore, request pacing, and retries."""
     last_exc: BaseException | None = None
     log_errors = bool(llm_config.get("log_errors", True))
     log_retries = bool(llm_config.get("log_retries", True))
@@ -113,6 +146,7 @@ async def _query_with_retry(
 
     for attempt in range(max_retries):
         try:
+            await rate_limiter.wait()
             async with sem:
                 t0 = time.monotonic()
                 response = await client.chat.completions.create(
@@ -130,15 +164,22 @@ async def _query_with_retry(
 
         except (openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError) as exc:
             last_exc = exc
+            is_rate_limit = isinstance(exc, openai.RateLimitError)
             err = _format_exception(exc, error_preview_chars)
+            if attempt + 1 < max_retries:
+                delay = _retry_delay(llm_config, attempt, rate_limited=is_rate_limit)
+                if log_retries:
+                    _log(
+                        f"[API RETRY] request={request_id} attempt={attempt + 1}/{max_retries} "
+                        f"sleep={delay:.1f}s model={model} error={err}"
+                    )
+                await asyncio.sleep(delay)
+                continue
             if log_retries:
                 _log(
-                    f"[API RETRY] request={request_id} attempt={attempt + 1}/{max_retries} "
+                    f"[API RETRY EXHAUSTED] request={request_id} attempt={attempt + 1}/{max_retries} "
                     f"model={model} error={err}"
                 )
-            if attempt + 1 < max_retries:
-                await asyncio.sleep(backoff * (2 ** attempt))
-                continue
 
         except Exception as exc:
             err = _format_exception(exc, error_preview_chars)
@@ -170,6 +211,7 @@ async def _run_batch(
     llm_config: dict,
     client: openai.AsyncOpenAI,
     sem: asyncio.Semaphore,
+    rate_limiter: AsyncRateLimiter,
 ) -> list[tuple[int, dict]]:
     """Run a batch and return (original_index, result), logging failures as they complete."""
 
@@ -180,6 +222,7 @@ async def _run_batch(
             llm_config,
             client,
             sem,
+            rate_limiter,
             request_id=idx,
             max_retries=int(llm_config.get("max_retries", 3)),
         )
@@ -200,40 +243,55 @@ async def batched_query(
     llm_config: dict,
 ) -> list[dict]:
     """
-    Run all dialogues concurrently, respecting max_concurrent limit.
+    Run dialogues in batches, respecting concurrency, request pacing, and cooldowns.
 
     Args:
-        dialogues:  list of message lists, each is one API call
-        model:      model name string
-        llm_config: config["llm"] dict with api_base_url, api_key,
-                    max_concurrent, batch_size
+        dialogues: list of message lists, each is one API call.
+        model: model name string.
+        llm_config: config["llm"] dict.
 
     Returns:
         List of {response, execution_time, error} dicts, same order as input.
-        response is None and error is set on failure.
     """
     max_concurrent = int(llm_config.get("max_concurrent", 16))
-    # Preserve old behavior: batch_size means chunks of batch_size * max_concurrent tasks.
-    batch_size = int(llm_config.get("batch_size", 32)) * max_concurrent
+    batch_size = int(llm_config.get("batch_size", 32))
+    batch_cooldown = float(llm_config.get("batch_cooldown_seconds", 0.0))
+    request_cooldown = float(llm_config.get("request_cooldown_seconds", 0.0))
+
+    if max_concurrent < 1:
+        raise ValueError("llm.max_concurrent must be >= 1")
+    if batch_size < 1:
+        raise ValueError("llm.batch_size must be >= 1")
+
     sem = asyncio.Semaphore(max_concurrent)
+    rate_limiter = AsyncRateLimiter(request_cooldown)
 
     client = _make_client(llm_config)
     results: list[dict | None] = [None] * len(dialogues)
     error_counter: Counter[str] = Counter()
 
+    _log(
+        f"[API CONFIG] requests={len(dialogues)} max_concurrent={max_concurrent} "
+        f"batch_size={batch_size} request_cooldown={request_cooldown}s "
+        f"batch_cooldown={batch_cooldown}s"
+    )
+
     try:
         indexed = list(enumerate(dialogues))
-        for start in tqdm(range(0, len(indexed), batch_size), desc="API batches"):
+        starts = list(range(0, len(indexed), batch_size))
+        for batch_i, start in enumerate(tqdm(starts, desc="API batches"), start=1):
             batch = indexed[start : start + batch_size]
-            batch_results = await _run_batch(batch, model, llm_config, client, sem)
+            batch_results = await _run_batch(batch, model, llm_config, client, sem, rate_limiter)
             for idx, res in batch_results:
                 results[idx] = res
                 if res.get("error"):
                     error_counter[_short(res["error"], 240)] += 1
+            if batch_cooldown > 0 and batch_i < len(starts):
+                _log(f"[API COOLDOWN] sleeping {batch_cooldown:.1f}s before next batch")
+                await asyncio.sleep(batch_cooldown)
     finally:
         await client.close()
 
-    # mypy/static sanity: all slots should be filled unless a raised exception stopped the run.
     final_results = [r if r is not None else {"response": None, "execution_time": 0.0, "error": "missing result"} for r in results]
 
     n_errors = sum(1 for r in final_results if r.get("error"))
