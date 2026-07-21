@@ -210,8 +210,9 @@ def build_output_record(meta: dict, result: dict, label_names: dict[str, str]) -
             error = f"invalid API response: {exc}"
             error_type = "InvalidAPIResponse"
 
-    explanation = "\n\n".join(part for part in (reasoning_text, text) if part)
-    boxed = extract_boxed_answer(text) or extract_boxed_answer(explanation)
+    # Provider-specific hidden reasoning is diagnostic metadata, not a feature.
+    explanation = text
+    boxed = extract_boxed_answer(text)
     predicted = normalize_text_label(boxed, label_names)
 
     if not error and not text.strip():

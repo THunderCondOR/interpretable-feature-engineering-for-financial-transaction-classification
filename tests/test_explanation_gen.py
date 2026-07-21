@@ -61,7 +61,7 @@ def test_empty_content_with_reasoning_is_not_successful() -> None:
     assert record["error"] == "empty response content"
     assert record["error_type"] == "EmptyResponse"
     assert record["reasoning"] == "Внутреннее рассуждение"
-    assert record["explanation"] == "Внутреннее рассуждение"
+    assert record["explanation"] == ""
     assert record["reasoning_chars"] > 0
 
 
