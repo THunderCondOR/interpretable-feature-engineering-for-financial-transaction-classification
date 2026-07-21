@@ -1,5 +1,9 @@
 dataset:
   name: rosbank
+  amount_semantics: typed_transaction_value
+  amount_unit: dataset_native_units
+  direction_rule: "direction is read from trx_cat_ru, not inferred from amount sign"
+  observation_end: "2018-04-02 23:20:35"
   columns:
     customer_id: customer_id
     datetime:    tr_datetime

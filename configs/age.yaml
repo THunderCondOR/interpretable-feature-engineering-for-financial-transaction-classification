@@ -1,5 +1,8 @@
 dataset:
   name: age
+  amount_semantics: unsigned_transaction_value
+  amount_unit: dataset_native_units
+  direction_rule: "amount encodes transaction value; no income/outflow inference"
   columns:
     customer_id: customer_id
     datetime:    tr_datetime
@@ -11,7 +14,7 @@ dataset:
     "1": "26-35"
     "2": "36-45"
     "3": "46+"
-  category_label: "категории трат"
+  category_label: "категории операций"
   num_labels: 4
   metric: accuracy
   splits:

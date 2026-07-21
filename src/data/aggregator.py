@@ -19,6 +19,12 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
+from src.data.profiles import (
+    format_client_profile,
+    format_robust_summary,
+    robust_statistics_payload,
+)
+
 
 def _filter_top_percentile(d: dict, q: float = 0.8) -> dict:
     if not d:
@@ -202,9 +208,9 @@ def build_user_summary_str_rosbank(client_df: pd.DataFrame, category_label: str 
 
 
 def get_summary_fn(config: dict) -> Callable:
-    if config["dataset"]["name"] == "rosbank":
-        return build_user_summary_str_rosbank
-    return build_user_summary_str
+    # Retain the old two-argument callable API while making v2 profiles depend
+    # on explicit dataset amount semantics.
+    return lambda client_df, _category_label=None: format_client_profile(client_df, config)
 
 
 # ---------------------------------------------------------------------------
@@ -252,56 +258,8 @@ def _client_level_rosbank_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_dataset_summary_str(df: pd.DataFrame, config: dict) -> str:
-    label_names: dict = config["dataset"]["label_names"]
-    category_label: str = config["dataset"].get("category_label", "категории трат")
-
-    if config["dataset"]["name"] == "rosbank":
-        cl = _client_level_rosbank_features(df[df["label"] >= 0])
-        lines = []
-        for label_id_str, label_name in label_names.items():
-            label_id = int(label_id_str)
-            group_clients = cl[cl["label"] == label_id]
-            group_txn = df[df["label"] == label_id]
-            if group_clients.empty:
-                continue
-            lines.append(f"# {label_name.capitalize()}")
-            lines.append(f"Клиентов в train: {len(group_clients)}")
-            for col in ["n_txn", "active_days", "txn_per_day", "total_amount", "avg_amount", "unique_categories", "share_pos", "share_atm", "share_deposit", "share_c2c_out", "recency_ratio"]:
-                lines.append(
-                    f"* {col}: mean={group_clients[col].mean():.3f}, "
-                    f"median={group_clients[col].median():.3f}"
-                )
-            avg_freq = (
-                group_txn.groupby(["customer_id", "mcc_code_desc"]).size()
-                .reset_index(name="count")
-                .groupby("mcc_code_desc")["count"].mean().to_dict()
-            )
-            avg_freq = _round_dict(_top_n(avg_freq, 20))
-            lines.append(f"## Среднее число транзакций по {category_label} ({label_name})")
-            lines.append(f"| {category_label.capitalize()} | Среднее число транзакций |")
-            lines.append("|---|---|")
-            for cat, freq in avg_freq.items():
-                lines.append(f"| {cat} | {freq} |")
-            lines.append("")
-        return "\n".join(lines)
-
-    lines = []
-    for label_id_str, label_name in label_names.items():
-        label_id = int(label_id_str)
-        group_df = df[df["label"] == label_id]
-        if group_df.empty:
-            continue
-        per_client = group_df.groupby(["customer_id", "mcc_code_desc"]).size().reset_index(name="count")
-        avg_freq = per_client.groupby("mcc_code_desc")["count"].mean().to_dict()
-        avg_freq = _round_dict(_filter_top_percentile(avg_freq, q=0.9))
-        lines.append(f"# {label_name.capitalize()}")
-        lines.append(f"## Среднее число транзакций по {category_label} ({label_name}, 90-й перцентиль)")
-        lines.append(f"| {category_label.capitalize()} | Среднее число транзакций |")
-        lines.append("|---|---|")
-        for cat, freq in list(avg_freq.items())[:25]:
-            lines.append(f"| {cat} | {freq} |")
-        lines.append("")
-    return "\n".join(lines)
+    labelled = df[df["label"] >= 0] if "label" in df else df
+    return format_robust_summary(robust_statistics_payload(labelled, config))
 
 
 def build_all_client_stats(df: pd.DataFrame, config: dict) -> list[dict]:
@@ -309,8 +267,7 @@ def build_all_client_stats(df: pd.DataFrame, config: dict) -> list[dict]:
     category_label = config["dataset"].get("category_label", "категории трат")
     summary_fn = get_summary_fn(config)
     records = []
-    for cid in df["customer_id"].unique():
-        client_df = df[df["customer_id"] == cid]
+    for cid, client_df in df.groupby("customer_id", sort=False):
         label = int(client_df["label"].iloc[0]) if "label" in client_df.columns else -1
         label_name = label_names.get(str(label), "unknown") if label >= 0 else "unknown"
         records.append({

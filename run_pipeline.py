@@ -22,6 +22,7 @@ import yaml
 from src.data.aggregator import build_all_client_stats, build_dataset_summary_str
 from src.data.loader import add_features, load_dataset
 from src.experiments.artifacts import ensure_run_manifest
+from src.data.profiles import export_robust_statistics, robust_statistics_payload
 from src.models.lora_trainer import train as lora_train
 from src.models.ml_baseline import run_ml_baseline
 from src.pipeline.claims_extractor import run_claims_extraction
@@ -61,6 +62,10 @@ def run_stats(config: dict, splits: list[str]) -> None:
     summary = build_dataset_summary_str(train_df, config)
     summary_path = out_dir / config["output"]["summary_stats"]
     summary_path.write_text(summary, encoding="utf-8")
+    export_robust_statistics(
+        robust_statistics_payload(train_df[train_df["label"] >= 0], config),
+        out_dir / "statistics",
+    )
     print(f"Saved train summary -> {summary_path}")
 
     for split in splits:

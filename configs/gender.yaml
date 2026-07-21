@@ -1,5 +1,8 @@
 dataset:
   name: gender
+  amount_semantics: signed_cashflow
+  amount_unit: dataset_native_units
+  direction_rule: "amount > 0 is inflow; amount < 0 is outflow"
   columns:
     customer_id: customer_id
     datetime:    tr_datetime
