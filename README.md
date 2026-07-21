@@ -56,6 +56,38 @@ python run_pipeline.py --config configs/gender.yaml --steps stats,prompts,cot,ll
 ```
 
 The same command works for `age` and `rosbank` by changing the config path.
+The CoT step resumes by default: successful existing records are reused, while
+failed or missing records are requested again. Use `--no-resume-cot` only when
+you intentionally want to regenerate every CoT record.
+
+After every API batch, the pipeline prints transport-level and validated CoT
+success/error counts. Accumulated counts by error type are saved next to the
+JSONL output as `explanations_<split>.generation_stats.json`.
+
+### LLM concurrency stress test
+
+Run a bounded stress test against real pipeline prompts without changing
+explanation outputs:
+
+```bash
+PYTHONPATH=. python scripts/stress_test_llm.py \
+  --config configs/gender.yaml --split test \
+  --concurrencies 8,16,32,64 --requests-per-scenario 64 \
+  --max-tokens 1024 --prompt-mode full
+```
+
+The report is checkpointed after every scenario under `results/<dataset>/`.
+
+To measure interference between the three dataset processes:
+
+```bash
+PYTHONPATH=. python scripts/stress_test_parallel_datasets.py \
+  --concurrency 32 --requests 32 --max-tokens 64
+```
+
+After reviewing the stress report, the three production tmux sessions can be
+created with `scripts/run_three_llm_tmux.sh`. The launcher is intentionally
+separate from the stress test.
 
 ### CoT feature pipeline
 

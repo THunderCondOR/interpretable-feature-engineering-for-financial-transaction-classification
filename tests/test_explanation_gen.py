@@ -1,0 +1,233 @@
+import json
+from types import SimpleNamespace
+
+from src.pipeline.explanation_gen import (
+    _is_successful,
+    build_output_record,
+    run_explanation_generation,
+    summarize_records,
+    write_records,
+)
+
+
+LABELS = {"0": "женщина", "1": "мужчина"}
+META = {"customer_id": 1, "label": 0, "label_name": "женщина", "sample_id": 0}
+
+
+def api_result(
+    content: str | None,
+    *,
+    finish_reason: str = "stop",
+    reasoning_content: str | None = None,
+) -> dict:
+    message = SimpleNamespace(
+        content=content,
+        reasoning_content=reasoning_content,
+        model_extra={},
+    )
+    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+    usage = SimpleNamespace(prompt_tokens=100, completion_tokens=20)
+    response = SimpleNamespace(choices=[choice], usage=usage)
+    return {"response": response, "execution_time": 1.5, "error": None}
+
+
+def test_complete_boxed_response_is_successful() -> None:
+    record = build_output_record(
+        META,
+        api_result("Обоснование.\nFinal: \\boxed{женщина}"),
+        LABELS,
+    )
+
+    assert _is_successful(record)
+    assert record["predicted"] == 0
+    assert record["finish_reason"] == "stop"
+    assert record["completion_tokens"] == 20
+
+
+def test_empty_content_with_reasoning_is_not_successful() -> None:
+    record = build_output_record(
+        META,
+        api_result("", reasoning_content="Внутреннее рассуждение"),
+        LABELS,
+    )
+
+    assert not _is_successful(record)
+    assert record["error"] == "empty response content"
+    assert record["error_type"] == "EmptyResponse"
+    assert record["reasoning"] == "Внутреннее рассуждение"
+    assert record["explanation"] == "Внутреннее рассуждение"
+    assert record["reasoning_chars"] > 0
+
+
+def test_truncated_response_is_not_successful() -> None:
+    record = build_output_record(
+        META,
+        api_result("Незавершённое обоснование", finish_reason="length"),
+        LABELS,
+    )
+
+    assert not _is_successful(record)
+    assert record["error"] == "incomplete response: finish_reason=length"
+    assert record["error_type"] == "IncompleteResponse"
+
+
+def test_response_without_boxed_answer_is_not_successful() -> None:
+    record = build_output_record(META, api_result("Вероятно, женщина."), LABELS)
+
+    assert not _is_successful(record)
+    assert record["error"] == "missing or unrecognized boxed final answer"
+    assert record["error_type"] == "MissingFinalAnswer"
+
+
+def test_write_records_is_atomic_and_supports_partial_checkpoint(tmp_path) -> None:
+    record = build_output_record(
+        META,
+        api_result("Обоснование.\nFinal: \\boxed{женщина}"),
+        LABELS,
+    )
+    path = tmp_path / "explanations.jsonl"
+
+    assert write_records(path, [META], {(1, 0): record}) == 0
+    assert path.exists()
+    assert not path.with_suffix(".jsonl.tmp").exists()
+    assert '"predicted": 0' in path.read_text(encoding="utf-8")
+
+
+def test_summarize_records_counts_error_types() -> None:
+    good = build_output_record(
+        META,
+        api_result("Обоснование.\nFinal: \\boxed{женщина}"),
+        LABELS,
+    )
+    empty = build_output_record(META, api_result(""), LABELS)
+    truncated = build_output_record(
+        META,
+        api_result("Незавершённое обоснование", finish_reason="length"),
+        LABELS,
+    )
+
+    assert summarize_records([good, empty, truncated]) == {
+        "total": 3,
+        "successful": 1,
+        "failed": 2,
+        "error_types": {
+            "EmptyResponse": 1,
+            "IncompleteResponse": 1,
+        },
+    }
+
+
+def test_resume_is_default_and_reuses_existing_record(tmp_path, monkeypatch) -> None:
+    prompt_path = tmp_path / "prompts.jsonl"
+    output_path = tmp_path / "explanations.jsonl"
+    prompt_path.write_text(
+        json.dumps(
+            {
+                "customer_id": 1,
+                "label": 0,
+                "label_name": "женщина",
+                "system_prompt": "system",
+                "user_prompt": "user",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    existing = build_output_record(
+        META,
+        api_result("Обоснование.\nFinal: \\boxed{женщина}"),
+        LABELS,
+    )
+    write_records(output_path, [META], {(1, 0): existing})
+
+    async def unexpected_api_call(*args, **kwargs):
+        raise AssertionError("API must not be called when the existing record is valid")
+
+    monkeypatch.setattr(
+        "src.pipeline.explanation_gen.batched_query",
+        unexpected_api_call,
+    )
+    config = {
+        "llm": {"default_model": "test"},
+        "dataset": {"label_names": LABELS},
+        "pipeline": {"n_explanation_samples": 1},
+        "output": {
+            "base_dir": str(tmp_path),
+            "prompts": "prompts.jsonl",
+            "explanations": "explanations.jsonl",
+        },
+    }
+
+    run_explanation_generation(
+        config,
+        input_path=prompt_path,
+        output_path=output_path,
+    )
+
+    stats = json.loads(
+        output_path.with_suffix(".generation_stats.json").read_text(encoding="utf-8")
+    )
+    assert stats["resume"] is True
+    assert stats["reused_successful"] == 1
+    assert stats["planned_new_requests"] == 0
+
+
+def test_batch_error_summary_is_saved_by_type(tmp_path, monkeypatch) -> None:
+    prompt_path = tmp_path / "prompts.jsonl"
+    output_path = tmp_path / "explanations.jsonl"
+    prompts = [
+        {
+            "customer_id": customer_id,
+            "label": 0,
+            "label_name": "женщина",
+            "system_prompt": "system",
+            "user_prompt": "user",
+        }
+        for customer_id in (1, 2)
+    ]
+    prompt_path.write_text(
+        "".join(json.dumps(prompt, ensure_ascii=False) + "\n" for prompt in prompts),
+        encoding="utf-8",
+    )
+    results = [
+        api_result("Обоснование.\nFinal: \\boxed{женщина}"),
+        api_result(""),
+    ]
+
+    async def fake_batched_query(dialogues, model, llm_config, *, on_batch_complete):
+        indexed = list(enumerate(results))
+        on_batch_complete(indexed)
+        return results
+
+    monkeypatch.setattr(
+        "src.pipeline.explanation_gen.batched_query",
+        fake_batched_query,
+    )
+    config = {
+        "llm": {"default_model": "test"},
+        "dataset": {"label_names": LABELS},
+        "pipeline": {"n_explanation_samples": 1},
+        "output": {
+            "base_dir": str(tmp_path),
+            "prompts": "prompts.jsonl",
+            "explanations": "explanations.jsonl",
+        },
+    }
+
+    run_explanation_generation(
+        config,
+        input_path=prompt_path,
+        output_path=output_path,
+    )
+
+    stats = json.loads(
+        output_path.with_suffix(".generation_stats.json").read_text(encoding="utf-8")
+    )
+    assert stats["new_requests"] == {
+        "total": 2,
+        "successful": 1,
+        "failed": 1,
+        "error_types": {"EmptyResponse": 1},
+    }
+    assert stats["last_batch"] == stats["new_requests"]

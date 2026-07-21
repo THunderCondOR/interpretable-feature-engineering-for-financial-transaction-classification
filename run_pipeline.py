@@ -2,7 +2,8 @@
 
 Examples:
     python run_pipeline.py --config configs/gender.yaml --steps stats,prompts,cot,llm_eval --splits test
-    python run_pipeline.py --config configs/gender.yaml --steps cot,llm_eval --splits test --resume-cot
+    python run_pipeline.py --config configs/gender.yaml --steps cot,llm_eval --splits test
+    python run_pipeline.py --config configs/gender.yaml --steps cot --splits test --no-resume-cot
     python run_pipeline.py --config configs/gender.yaml --steps lora
     python run_pipeline.py --config configs/gender.yaml --steps lora --lora-models qwen_1_5b,qwen_7b
 """
@@ -15,6 +16,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import yaml
 
 from src.data.aggregator import build_all_client_stats, build_dataset_summary_str
@@ -29,7 +31,7 @@ from src.pipeline.prompt_builder import build_few_shot_str, build_prompts
 
 SPLITS = ("train", "val", "test")
 DEFAULT_STEPS = ("stats", "prompts", "cot", "llm_eval", "claims", "cot_features", "ml")
-STEPS = DEFAULT_STEPS + ("lora",)
+STEPS = DEFAULT_STEPS + ("majority", "lora")
 
 
 def load_config(path: str) -> dict:
@@ -114,6 +116,37 @@ def run_lora(config: dict, splits: list[str], lora_models: list[str] | None) -> 
     lora_train(config, model_names=lora_models)
 
 
+def run_majority(config: dict, splits: list[str]) -> None:
+    train = load_split(config, "train").drop_duplicates("customer_id")
+    majority_label = int(train["label"].value_counts().idxmax())
+    results = {
+        "majority_label": majority_label,
+        "majority_label_name": config["dataset"]["label_names"][str(majority_label)],
+        "splits": {},
+    }
+    for split in splits:
+        clients = load_split(config, split).drop_duplicates("customer_id")
+        predictions = np.full(len(clients), majority_label)
+        from src.models.ml_baseline import evaluate
+        results["splits"][split] = evaluate(NoneModel(predictions), predictions, clients["label"].to_numpy())
+
+    out_path = Path(config["output"]["base_dir"]) / "metrics_majority.json"
+    temp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(out_path)
+    print(f"Saved majority metrics -> {out_path}")
+
+
+class NoneModel:
+    """Minimal constant predictor adapter for the shared evaluator."""
+
+    def __init__(self, predictions):
+        self.predictions = predictions
+
+    def predict(self, _):
+        return self.predictions
+
+
 def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -121,17 +154,39 @@ def parse_csv(value: str) -> list[str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run transaction classification experiments.")
     parser.add_argument("--config", required=True, help="Path to dataset config YAML.")
+    parser.add_argument("--model", default=None, help="Override llm.default_model from config.")
+    parser.add_argument("--output-base-dir", default=None, help="Override output.base_dir from config.")
+    parser.add_argument("--max-concurrent", type=int, default=None, help="Override LLM concurrency.")
+    parser.add_argument(
+        "--rate-limit-fallback-concurrent",
+        type=int,
+        default=None,
+        help="Override LLM concurrency after a rate-limit batch.",
+    )
+    parser.add_argument(
+        "--rate-limit-recovery-batches",
+        type=int,
+        default=None,
+        help="Clean fallback batches before retrying the configured LLM concurrency.",
+    )
+    parser.add_argument("--batch-size", type=int, default=None, help="Override LLM batch size.")
+    parser.add_argument("--max-tokens", type=int, default=None, help="Override explanation token budget.")
+    parser.add_argument("--claims-max-tokens", type=int, default=None, help="Override claim extraction token budget.")
     parser.add_argument("--steps", default="default", help="Comma-separated steps, 'default', or 'all'.")
     parser.add_argument("--splits", default="train,val,test", help="Comma-separated split list for split-aware steps.")
     parser.add_argument(
         "--experiments",
-        default="handcrafted,cot,concat",
-        help="Comma-separated ML feature sets: handcrafted,cot,concat.",
+        default="standard,handcrafted,cot,concat",
+        help="Comma-separated ML feature sets: standard,handcrafted,cot,concat.",
     )
     parser.add_argument(
         "--resume-cot",
-        action="store_true",
-        help="For the cot step, reuse successful existing explanations and resend only failed or missing requests.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reuse successful existing explanations and resend only failed or missing requests "
+            "(default: enabled; use --no-resume-cot to force a full rerun)."
+        ),
     )
     parser.add_argument(
         "--lora-models",
@@ -141,6 +196,22 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
+    if args.model:
+        config["llm"]["default_model"] = args.model
+    if args.output_base_dir:
+        config["output"]["base_dir"] = args.output_base_dir
+    if args.max_concurrent is not None:
+        config["llm"]["max_concurrent"] = args.max_concurrent
+    if args.rate_limit_fallback_concurrent is not None:
+        config["llm"]["rate_limit_fallback_concurrent"] = args.rate_limit_fallback_concurrent
+    if args.rate_limit_recovery_batches is not None:
+        config["llm"]["rate_limit_recovery_batches"] = args.rate_limit_recovery_batches
+    if args.batch_size is not None:
+        config["llm"]["batch_size"] = args.batch_size
+    if args.max_tokens is not None:
+        config["llm"]["max_tokens"] = args.max_tokens
+    if args.claims_max_tokens is not None:
+        config.setdefault("pipeline", {})["claims_max_tokens"] = args.claims_max_tokens
     splits = parse_csv(args.splits)
     experiments = parse_csv(args.experiments)
     lora_models = parse_csv(args.lora_models) if args.lora_models else None
@@ -154,7 +225,7 @@ def main() -> None:
 
     unknown_steps = [step for step in steps if step not in STEPS]
     unknown_splits = [split for split in splits if split not in SPLITS]
-    unknown_experiments = [exp for exp in experiments if exp not in {"handcrafted", "cot", "concat"}]
+    unknown_experiments = [exp for exp in experiments if exp not in {"standard", "handcrafted", "cot", "concat"}]
     if unknown_steps or unknown_splits or unknown_experiments:
         print(f"Unknown steps: {unknown_steps}", file=sys.stderr)
         print(f"Unknown splits: {unknown_splits}", file=sys.stderr)
@@ -169,6 +240,7 @@ def main() -> None:
         "claims": lambda: run_claims(config, splits),
         "cot_features": lambda: run_cot_features(config, splits),
         "ml": lambda: run_ml(config, splits, experiments),
+        "majority": lambda: run_majority(config, splits),
         "lora": lambda: run_lora(config, splits, lora_models),
     }
 

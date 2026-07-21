@@ -1,6 +1,7 @@
 """Classical ML baselines for prepared transaction datasets.
 
 Supported feature sets:
+- standard: generic amount aggregates and category pivots;
 - handcrafted: deterministic transaction aggregates;
 - cot: train-fitted CoT cluster features;
 - concat: handcrafted + CoT features merged by customer_id and label.
@@ -8,6 +9,7 @@ Supported feature sets:
 
 from __future__ import annotations
 
+import gc
 import json
 from pathlib import Path
 
@@ -22,7 +24,7 @@ from src.data.loader import add_features, load_dataset
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-EXPERIMENTS = {"handcrafted", "cot", "concat"}
+EXPERIMENTS = {"standard", "handcrafted", "cot", "concat"}
 
 
 def safe_name(value: str) -> str:
@@ -37,6 +39,56 @@ def build_handcrafted_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     if config["dataset"]["name"] == "rosbank":
         return build_rosbank_handcrafted_features(df)
     return build_generic_handcrafted_features(df)
+
+
+def build_standard_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Build label-agnostic transaction aggregates without behavioral heuristics."""
+    labels = (
+        df.drop_duplicates("customer_id")[["customer_id", "label"]]
+        .set_index("customer_id")
+        .sort_index()
+    )
+    base = df.groupby("customer_id")["amount"].agg(
+        amount_count="count",
+        amount_sum="sum",
+        amount_mean="mean",
+        amount_min="min",
+        amount_max="max",
+        amount_median="median",
+        amount_std="std",
+    )
+
+    if "tr_datetime" in df.columns:
+        dates = df.assign(
+            _day=df["tr_datetime"].dt.date,
+            _month=df["tr_datetime"].dt.to_period("M"),
+        )
+        active_days = dates.groupby("customer_id")["_day"].nunique().rename("active_days")
+        active_months = dates.groupby("customer_id")["_month"].nunique().rename("active_months")
+        base = base.join(active_days, how="left").join(active_months, how="left")
+        base["txn_per_day"] = base["amount_count"] / base["active_days"].replace(0, np.nan)
+        base["txn_per_month"] = base["amount_count"] / base["active_months"].replace(0, np.nan)
+
+    pivots = []
+    for suffix, agg_func in {
+        "count": "count",
+        "sum": "sum",
+        "mean": "mean",
+        "min": "min",
+        "max": "max",
+        "median": "median",
+    }.items():
+        pivot = (
+            df.groupby(["customer_id", "mcc_code_desc"])["amount"]
+            .agg(agg_func)
+            .unstack("mcc_code_desc")
+            .fillna(0)
+        )
+        pivot.columns = [f"mcc_{safe_name(category)}_{suffix}" for category in pivot.columns]
+        pivots.append(pivot)
+
+    features = pd.concat([base] + pivots, axis=1).fillna(0)
+    return labels.join(features, how="left").fillna(0).reset_index()
 
 
 def build_generic_handcrafted_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -148,7 +200,9 @@ def align_features(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
 
 
 def split_xy(df: pd.DataFrame, columns: list[str]) -> tuple[np.ndarray, np.ndarray]:
-    return df[columns].values, df["label"].astype(int).values
+    x = df[columns].replace([np.inf, -np.inf], 0).fillna(0).to_numpy(dtype=np.float32, copy=True)
+    y = df["label"].astype(int).to_numpy()
+    return x, y
 
 
 def load_cot_features(out_dir: Path, split: str) -> pd.DataFrame:
@@ -201,9 +255,10 @@ def tune_xgboost(x_train, y_train, x_val, y_val, config: dict, n_trials: int) ->
             **params,
             objective=xgb_objective(config),
             random_state=42,
-            n_jobs=4,
+            n_jobs=2,
             verbosity=0,
             eval_metric="logloss",
+            tree_method="hist",
         )
         model.fit(x_train, y_train)
         return primary_score(evaluate(model, x_val, y_val), config)
@@ -241,6 +296,18 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
     test_df = add_features(load_dataset(config, "test"))
 
     feature_sets = {}
+    if "standard" in requested:
+        standard_train_raw = build_standard_features(train_df)
+        standard_val_raw = build_standard_features(val_df)
+        standard_test_raw = build_standard_features(test_df)
+        standard_cols = feature_columns(standard_train_raw)
+        feature_sets["standard"] = {
+            "train": align_features(standard_train_raw, standard_cols),
+            "val": align_features(standard_val_raw, standard_cols),
+            "test": align_features(standard_test_raw, standard_cols),
+            "columns": standard_cols,
+        }
+
     if "handcrafted" in requested or "concat" in requested:
         hc_train_raw = build_handcrafted_features(train_df, config)
         hc_val_raw = build_handcrafted_features(val_df, config)
@@ -278,11 +345,32 @@ def run_ml_baseline(config: dict, experiments: list[str] | None = None) -> None:
     n_trials = int(config.get("optuna", {}).get("n_trials", 30))
     out_dir = Path(config["output"]["base_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "ml_metrics.json"
 
-    feature_sets = build_feature_sets(config, experiments)
     results = {}
+    if out_path.exists():
+        with open(out_path, encoding="utf-8") as file:
+            existing = json.load(file)
+        if isinstance(existing, dict):
+            results.update(existing)
 
-    for name, pack in feature_sets.items():
+    def save_results() -> None:
+        temp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        with open(temp_path, "w", encoding="utf-8") as file:
+            json.dump(results, file, indent=2, ensure_ascii=False)
+        temp_path.replace(out_path)
+        print(f"Saved ML metrics -> {out_path}")
+
+    for name in experiments:
+        if name in results and {"xgboost", "decision_tree"}.issubset(results[name].keys()):
+            print(f"\nFeature set: {name}; already complete in {out_path}, skipping")
+            continue
+
+        # Build one feature set at a time. For high-dimensional CoT features this
+        # avoids holding standard/handcrafted/CoT/concat matrices in memory
+        # simultaneously, and lets restarts reuse already saved results.
+        feature_sets = build_feature_sets(config, [name])
+        pack = feature_sets[name]
         columns = pack["columns"]
         x_train, y_train = split_xy(pack["train"], columns)
         x_val, y_val = split_xy(pack["val"], columns)
@@ -296,9 +384,10 @@ def run_ml_baseline(config: dict, experiments: list[str] | None = None) -> None:
             **best_xgb,
             objective=xgb_objective(config),
             random_state=42,
-            n_jobs=4,
+            n_jobs=2,
             verbosity=0,
             eval_metric="logloss",
+            tree_method="hist",
         )
         xgb.fit(x_train, y_train)
         results[name]["xgboost"] = {
@@ -316,8 +405,7 @@ def run_ml_baseline(config: dict, experiments: list[str] | None = None) -> None:
             "test": evaluate(tree, x_test, y_test),
             "tree_text": export_text(tree, feature_names=columns, max_depth=4)[:4000],
         }
+        save_results()
 
-    out_path = out_dir / "ml_metrics.json"
-    with open(out_path, "w", encoding="utf-8") as file:
-        json.dump(results, file, indent=2, ensure_ascii=False)
-    print(f"Saved ML metrics -> {out_path}")
+        del feature_sets, pack, x_train, y_train, x_val, y_val, x_test, y_test
+        gc.collect()

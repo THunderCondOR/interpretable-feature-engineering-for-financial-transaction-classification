@@ -8,11 +8,31 @@ Supports split-specific files such as explanations_train.jsonl -> claims_train.j
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 from src.utils.async_api import batched_query
 from src.utils.prompt_parsing import extract_json_list
+
+
+def _behavioral_text(explanation: str) -> str:
+    text = str(explanation or "").strip()
+    if not text:
+        return ""
+    final_idx = text.lower().rfind("final:")
+    if final_idx >= 0:
+        text = text[:final_idx].strip()
+    return text
+
+
+def _has_behavioral_explanation(explanation: str, min_chars: int = 80) -> bool:
+    behavioral = _behavioral_text(explanation)
+    if len(behavioral) < min_chars:
+        return False
+    sentence_marks = sum(behavioral.count(mark) for mark in (".", "!", "?", "\n", ";"))
+    return sentence_marks >= 2
 
 
 def _split_path(config: dict, key: str, split: str | None) -> Path:
@@ -38,26 +58,165 @@ def load_explanations(path: str | Path) -> list[list[dict]]:
     return list(by_client.values())
 
 
+def _claims_successful(record: dict) -> bool:
+    return not record.get("error") and bool(record.get("claims"))
+
+
+def _load_successful_claims(path: Path, generation_signature: str) -> dict[int, dict]:
+    if not path.exists():
+        return {}
+    successful = {}
+    error_types: Counter[str] = Counter()
+    total = 0
+    with open(path, encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+            total += 1
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                error_types["MalformedJSONL"] += 1
+                continue
+            if (
+                _claims_successful(record)
+                and record.get("generation_signature") == generation_signature
+            ):
+                successful[int(record["customer_id"])] = record
+            else:
+                error_type = (
+                    str(record.get("error_type"))
+                    if record.get("error_type")
+                    else "IncompatibleGeneration"
+                    if record.get("generation_signature") != generation_signature
+                    else "EmptyClaims"
+                )
+                error_types[error_type] += 1
+    print(
+        f"Existing claims: {len(successful)} successful, "
+        f"{total - len(successful)} failed/empty, error_types={dict(error_types)} -> {path}"
+    )
+    return successful
+
+
+def _parse_claim_result(result: dict) -> tuple[list[str], str | None, str | None]:
+    if result.get("error") or result.get("response") is None:
+        return (
+            [],
+            str(result.get("error_type") or "UnknownAPIError"),
+            str(result.get("error") or "missing API response"),
+        )
+    try:
+        choice = result["response"].choices[0]
+        if choice.finish_reason not in (None, "stop"):
+            return [], "IncompleteResponse", f"finish_reason={choice.finish_reason}"
+        text = choice.message.content or ""
+        parsed = [str(item).strip() for item in extract_json_list(text) if str(item).strip()]
+        if not parsed:
+            return [], "EmptyClaims", "response did not contain a non-empty JSON list"
+        return parsed, None, None
+    except Exception as exc:
+        return [], "InvalidAPIResponse", str(exc)
+
+
+def _write_claim_records(path: Path, ordered_clients: list[int], records: dict[int, dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(temp_path, "w", encoding="utf-8") as file:
+        for customer_id in ordered_clients:
+            if customer_id in records:
+                file.write(json.dumps(records[customer_id], ensure_ascii=False) + "\n")
+    temp_path.replace(path)
+
+
+def _claims_summary(records: list[dict]) -> dict:
+    error_types = Counter(
+        str(record.get("error_type") or "EmptyClaims")
+        for record in records
+        if not _claims_successful(record)
+    )
+    return {
+        "total": len(records),
+        "successful": sum(_claims_successful(record) for record in records),
+        "failed": sum(error_types.values()),
+        "error_types": dict(sorted(error_types.items())),
+        "total_claims": sum(len(record.get("claims", [])) for record in records),
+    }
+
+
 def run_claims_extraction(config: dict, *, split: str | None = None, input_path: str | Path | None = None, output_path: str | Path | None = None) -> None:
     load_path = Path(input_path) if input_path else _split_path(config, "explanations", split)
     save_path = Path(output_path) if output_path else _split_path(config, "claims", split)
 
     n_samples = config.get("pipeline", {}).get("n_claims_samples", 1)
     model = config["llm"]["default_model"]
-    llm_cfg = config["llm"]
+    llm_cfg = dict(config["llm"])
+    llm_cfg["max_tokens"] = int(
+        config.get("pipeline", {}).get("claims_max_tokens", 2048)
+    )
 
     cfg_prompts = config["prompts"]
     base_dir = Path(cfg_prompts["base_dir"])
     claims_sys = (base_dir / cfg_prompts["claims_system"]).read_text(encoding="utf-8")
     claims_usr_t = (base_dir / cfg_prompts["claims_user"]).read_text(encoding="utf-8")
+    generation_signature = hashlib.sha256(
+        json.dumps(
+            {
+                "version": 2,
+                "model": model,
+                "system_prompt": claims_sys,
+                "user_prompt": claims_usr_t,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
     client_groups = load_explanations(load_path)
     print(f"Loaded explanations for {len(client_groups)} clients from {load_path}")
 
+    ordered_clients = [int(group[0]["customer_id"]) for group in client_groups]
+    expected_client_set = set(ordered_clients)
+    existing = _load_successful_claims(save_path, generation_signature)
+    claims_by_client = {
+        customer_id: record
+        for customer_id, record in existing.items()
+        if customer_id in expected_client_set
+    }
+
     all_dialogues, meta = [], []
     for group in client_groups:
-        # Prefer valid explanations, but keep ordering stable.
-        valid = [r for r in group if r.get("explanation")]
+        cid = int(group[0]["customer_id"])
+        if cid in claims_by_client:
+            continue
+        valid = []
+        invalid_behavioral = 0
+        for record in group:
+            if not record.get("explanation") or record.get("error"):
+                continue
+            min_chars = int(record.get("min_behavioral_explanation_chars", 80) or 80)
+            if not _has_behavioral_explanation(record.get("explanation", ""), min_chars):
+                invalid_behavioral += 1
+                continue
+            valid.append(record)
+        if not valid:
+            first = group[0]
+            error_type = "NoBehavioralExplanation" if invalid_behavioral else "NoValidExplanation"
+            error = (
+                "no usable behavioral explanation available"
+                if invalid_behavioral
+                else "no valid explanation available"
+            )
+            claims_by_client[cid] = {
+                "customer_id": cid,
+                "label": first.get("label", -1),
+                "label_name": first.get("label_name", "unknown"),
+                "claims": [],
+                "error": error,
+                "error_type": error_type,
+                "generation_signature": generation_signature,
+            }
+            continue
         for rec in valid[:n_samples]:
             user_prompt = claims_usr_t.format(COT=rec.get("explanation", ""))
             all_dialogues.append([
@@ -70,44 +229,77 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                 "label_name": rec.get("label_name", "unknown"),
             })
 
-    print(f"Sending {len(all_dialogues)} claim extraction requests to {model}...")
-    api_results = asyncio.run(batched_query(all_dialogues, model, llm_cfg))
+    print(
+        f"Claims plan: expected_clients={len(ordered_clients)}, "
+        f"reuse_successful={len(existing)}, requests_to_run={len(all_dialogues)}, "
+        f"max_tokens={llm_cfg['max_tokens']}"
+    )
 
-    claims_by_client: dict[int, dict] = {}
-    n_errors = 0
-    for m, result in zip(meta, api_results):
-        cid = int(m["customer_id"])
-        parsed = []
-        if result.get("error") or result.get("response") is None:
-            n_errors += 1
-        else:
-            try:
-                text = result["response"].choices[0].message.content or ""
-                parsed = [str(x).strip() for x in extract_json_list(text) if str(x).strip()]
-            except Exception:
-                n_errors += 1
-                parsed = []
-        claims_by_client.setdefault(cid, {
-            "customer_id": cid,
-            "label": m.get("label", -1),
-            "label_name": m.get("label_name", "unknown"),
-            "claims": [],
-        })["claims"].extend(parsed)
+    request_errors: dict[int, list[tuple[str, str]]] = {}
 
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(save_path, "w", encoding="utf-8") as f:
-        for rec in claims_by_client.values():
-            # stable de-duplication per client
-            seen, dedup = set(), []
-            for claim in rec["claims"]:
-                key = claim.lower()
-                if key not in seen:
-                    dedup.append(claim)
-                    seen.add(key)
-            rec["claims"] = dedup
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    def checkpoint(batch_results: list[tuple[int, dict]]) -> None:
+        batch_records = []
+        for idx, result in batch_results:
+            item_meta = meta[idx]
+            cid = int(item_meta["customer_id"])
+            parsed, error_type, error = _parse_claim_result(result)
+            record = claims_by_client.setdefault(
+                cid,
+                {
+                    "customer_id": cid,
+                    "label": item_meta.get("label", -1),
+                    "label_name": item_meta.get("label_name", "unknown"),
+                    "claims": [],
+                    "error": None,
+                    "error_type": None,
+                    "generation_signature": generation_signature,
+                },
+            )
+            record["claims"].extend(parsed)
+            if error_type:
+                request_errors.setdefault(cid, []).append((error_type, error or ""))
+            if record["claims"]:
+                seen = set()
+                record["claims"] = [
+                    claim
+                    for claim in record["claims"]
+                    if not (claim.lower() in seen or seen.add(claim.lower()))
+                ]
+                record["error"] = None
+                record["error_type"] = None
+            else:
+                errors = request_errors.get(cid, [])
+                record["error_type"] = errors[-1][0] if errors else "EmptyClaims"
+                record["error"] = errors[-1][1] if errors else "no claims extracted"
+            batch_records.append(record)
 
-    total_claims = sum(len(r["claims"]) for r in claims_by_client.values())
-    if n_errors:
-        print(f"Warning: {n_errors}/{len(api_results)} requests failed")
-    print(f"Saved {total_claims} claims for {len(claims_by_client)} clients -> {save_path}")
+        _write_claim_records(save_path, ordered_clients, claims_by_client)
+        summary = _claims_summary(batch_records)
+        print(
+            f"[CLAIMS BATCH] successful={summary['successful']} failed={summary['failed']} "
+            f"error_types={summary['error_types']} total_claims={summary['total_claims']}"
+        )
+
+    if all_dialogues:
+        asyncio.run(
+            batched_query(
+                all_dialogues,
+                model,
+                llm_cfg,
+                on_batch_complete=checkpoint,
+            )
+        )
+
+    _write_claim_records(save_path, ordered_clients, claims_by_client)
+    final_records = [claims_by_client[cid] for cid in ordered_clients]
+    summary = _claims_summary(final_records)
+    stats_path = save_path.with_suffix(".generation_stats.json")
+    temp_stats = stats_path.with_suffix(stats_path.suffix + ".tmp")
+    with open(temp_stats, "w", encoding="utf-8") as file:
+        json.dump(summary, file, indent=2, ensure_ascii=False)
+    temp_stats.replace(stats_path)
+    print(
+        f"[CLAIMS SUMMARY] successful={summary['successful']} failed={summary['failed']} "
+        f"error_types={summary['error_types']} total_claims={summary['total_claims']} "
+        f"-> {save_path}; stats -> {stats_path}"
+    )

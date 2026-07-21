@@ -5,11 +5,16 @@ Async wrapper for OpenAI-compatible inference APIs.
 Reads base_url and api_key from config, expanding environment variables.
 
 Optional llm config keys:
+    max_tokens: 2048
+    extra_body: {}                     # provider-specific OpenAI request fields
     max_concurrent: 2                  # maximum in-flight requests
+    http_max_connections: max_concurrent
     batch_size: 4                      # number of requests scheduled per batch
     request_cooldown_seconds: 0.0      # minimum delay between request starts
     batch_cooldown_seconds: 0.0        # sleep after each batch
     rate_limit_cooldown_seconds: 60.0  # sleep after 429/rate-limit errors
+    rate_limit_fallback_concurrent: 10 # temporary concurrency after 429
+    rate_limit_recovery_batches: 3     # clean fallback batches before probing max_concurrent
     retry_backoff: 2.0                 # exponential retry backoff base
     max_retries: 3                     # attempts per request
     log_errors: true
@@ -27,6 +32,7 @@ import random
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -58,10 +64,22 @@ def _make_client(llm_config: dict) -> openai.AsyncOpenAI:
     """Build AsyncOpenAI client from config, expanding env vars."""
     base_url = os.path.expandvars(str(llm_config["api_base_url"]))
     api_key = os.path.expandvars(str(llm_config["api_key"]))
+    max_connections = int(
+        llm_config.get(
+            "http_max_connections",
+            llm_config.get("max_concurrent", 16),
+        )
+    )
     return openai.AsyncOpenAI(
         base_url=base_url,
         api_key=api_key,
-        http_client=httpx.AsyncClient(verify=False),
+        http_client=httpx.AsyncClient(
+            verify=False,
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_connections,
+            ),
+        ),
     )
 
 
@@ -143,28 +161,35 @@ async def _query_with_retry(
     raise_on_error = bool(llm_config.get("raise_on_error", False))
     error_preview_chars = int(llm_config.get("error_preview_chars", 1200))
     prompt_preview_chars = int(llm_config.get("prompt_preview_chars", 0))
+    rate_limited_during_request = False
 
     for attempt in range(max_retries):
         try:
             await rate_limiter.wait()
             async with sem:
                 t0 = time.monotonic()
+                extra_body = llm_config.get("extra_body")
                 response = await client.chat.completions.create(
                     model=model,
                     messages=messages,
                     temperature=llm_config.get("temperature", 1.0),
                     top_p=llm_config.get("top_p", 0.9),
+                    max_tokens=llm_config.get("max_tokens", 2048),
                     stream=False,
+                    **({"extra_body": extra_body} if extra_body else {}),
                 )
                 return {
                     "response": response,
                     "execution_time": time.monotonic() - t0,
                     "error": None,
+                    "error_type": None,
+                    "rate_limited": rate_limited_during_request,
                 }
 
         except (openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError) as exc:
             last_exc = exc
             is_rate_limit = isinstance(exc, openai.RateLimitError)
+            rate_limited_during_request = rate_limited_during_request or is_rate_limit
             err = _format_exception(exc, error_preview_chars)
             if attempt + 1 < max_retries:
                 delay = _retry_delay(llm_config, attempt, rate_limited=is_rate_limit)
@@ -191,7 +216,13 @@ async def _query_with_retry(
                 _log(msg)
             if raise_on_error:
                 raise
-            return {"response": None, "execution_time": 0.0, "error": err}
+            return {
+                "response": None,
+                "execution_time": 0.0,
+                "error": err,
+                "error_type": type(exc).__name__,
+                "rate_limited": rate_limited_during_request,
+            }
 
     err = _format_exception(last_exc, error_preview_chars) if last_exc else "unknown retryable error"
     if log_errors:
@@ -202,7 +233,13 @@ async def _query_with_retry(
         _log(msg)
     if raise_on_error and last_exc is not None:
         raise last_exc
-    return {"response": None, "execution_time": 0.0, "error": err}
+    return {
+        "response": None,
+        "execution_time": 0.0,
+        "error": err,
+        "error_type": type(last_exc).__name__ if last_exc is not None else "UnknownAPIError",
+        "rate_limited": rate_limited_during_request,
+    }
 
 
 async def _run_batch(
@@ -241,6 +278,8 @@ async def batched_query(
     dialogues: list[list[dict]],
     model: str,
     llm_config: dict,
+    *,
+    on_batch_complete: Callable[[list[tuple[int, dict]]], None] | None = None,
 ) -> list[dict]:
     """
     Run dialogues in batches, respecting concurrency, request pacing, and cooldowns.
@@ -249,11 +288,16 @@ async def batched_query(
         dialogues: list of message lists, each is one API call.
         model: model name string.
         llm_config: config["llm"] dict.
+        on_batch_complete: optional synchronous callback receiving indexed results
+            after each complete batch. Useful for durable checkpoints.
 
     Returns:
         List of {response, execution_time, error} dicts, same order as input.
     """
-    max_concurrent = int(llm_config.get("max_concurrent", 16))
+    configured_max_concurrent = int(llm_config.get("max_concurrent", 16))
+    max_concurrent = configured_max_concurrent
+    rate_limit_fallback = int(llm_config.get("rate_limit_fallback_concurrent", 10))
+    rate_limit_recovery_batches = int(llm_config.get("rate_limit_recovery_batches", 3))
     batch_size = int(llm_config.get("batch_size", 32))
     batch_cooldown = float(llm_config.get("batch_cooldown_seconds", 0.0))
     request_cooldown = float(llm_config.get("request_cooldown_seconds", 0.0))
@@ -262,13 +306,15 @@ async def batched_query(
         raise ValueError("llm.max_concurrent must be >= 1")
     if batch_size < 1:
         raise ValueError("llm.batch_size must be >= 1")
+    if rate_limit_fallback < 1:
+        raise ValueError("llm.rate_limit_fallback_concurrent must be >= 1")
+    if rate_limit_recovery_batches < 1:
+        raise ValueError("llm.rate_limit_recovery_batches must be >= 1")
 
-    sem = asyncio.Semaphore(max_concurrent)
     rate_limiter = AsyncRateLimiter(request_cooldown)
 
     client = _make_client(llm_config)
     results: list[dict | None] = [None] * len(dialogues)
-    error_counter: Counter[str] = Counter()
 
     _log(
         f"[API CONFIG] requests={len(dialogues)} max_concurrent={max_concurrent} "
@@ -279,25 +325,83 @@ async def batched_query(
     try:
         indexed = list(enumerate(dialogues))
         starts = list(range(0, len(indexed), batch_size))
+        clean_fallback_batches = 0
         for batch_i, start in enumerate(tqdm(starts, desc="API batches"), start=1):
             batch = indexed[start : start + batch_size]
+            sem = asyncio.Semaphore(max_concurrent)
             batch_results = await _run_batch(batch, model, llm_config, client, sem, rate_limiter)
+            batch_error_types: Counter[str] = Counter()
             for idx, res in batch_results:
                 results[idx] = res
                 if res.get("error"):
-                    error_counter[_short(res["error"], 240)] += 1
+                    error_type = str(res.get("error_type") or "UnknownAPIError")
+                    batch_error_types[error_type] += 1
+            batch_failed = sum(batch_error_types.values())
+            _log(
+                f"[API BATCH {batch_i}/{len(starts)}] completed={len(batch_results)} "
+                f"transport_success={len(batch_results) - batch_failed} "
+                f"transport_failed={batch_failed} "
+                f"error_types={dict(batch_error_types)}"
+            )
+            if on_batch_complete is not None:
+                on_batch_complete(batch_results)
+            auth_errors = sum(
+                batch_error_types.get(name, 0)
+                for name in ("AuthenticationError", "PermissionDeniedError")
+            )
+            if auth_errors:
+                raise RuntimeError(
+                    f"Fatal API authentication/permission failure in batch {batch_i}: "
+                    f"{dict(batch_error_types)}"
+                )
+            saw_rate_limit = any(
+                bool(result.get("rate_limited"))
+                or result.get("error_type") == "RateLimitError"
+                for _, result in batch_results
+            )
+            if saw_rate_limit:
+                clean_fallback_batches = 0
+                if max_concurrent > rate_limit_fallback:
+                    _log(
+                        f"[API CONCURRENCY FALLBACK] rate limit observed in batch {batch_i}; "
+                        f"max_concurrent={max_concurrent} -> {rate_limit_fallback}"
+                    )
+                    max_concurrent = rate_limit_fallback
+            elif max_concurrent < configured_max_concurrent:
+                clean_fallback_batches += 1
+                if clean_fallback_batches >= rate_limit_recovery_batches:
+                    _log(
+                        f"[API CONCURRENCY PROBE] {clean_fallback_batches} clean fallback "
+                        f"batches; max_concurrent={max_concurrent} -> {configured_max_concurrent}"
+                    )
+                    max_concurrent = configured_max_concurrent
+                    clean_fallback_batches = 0
             if batch_cooldown > 0 and batch_i < len(starts):
                 _log(f"[API COOLDOWN] sleeping {batch_cooldown:.1f}s before next batch")
                 await asyncio.sleep(batch_cooldown)
     finally:
         await client.close()
 
-    final_results = [r if r is not None else {"response": None, "execution_time": 0.0, "error": "missing result"} for r in results]
+    final_results = [
+        r if r is not None else {
+            "response": None,
+            "execution_time": 0.0,
+            "error": "missing result",
+            "error_type": "MissingResult",
+        }
+        for r in results
+    ]
 
-    n_errors = sum(1 for r in final_results if r.get("error"))
+    final_error_counter = Counter(
+        str(result.get("error_type") or "UnknownAPIError")
+        for result in final_results
+        if result.get("error")
+    )
+    n_errors = sum(final_error_counter.values())
     if n_errors:
-        _log(f"[API SUMMARY] {n_errors}/{len(final_results)} requests failed. Top errors:")
-        for err, n in error_counter.most_common(5):
-            _log(f"  {n}x {err}")
+        _log(
+            f"[API SUMMARY] success={len(final_results) - n_errors} failed={n_errors} "
+            f"error_types={dict(final_error_counter)}"
+        )
 
     return final_results

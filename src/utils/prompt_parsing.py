@@ -33,6 +33,13 @@ def extract_boxed_answer(s: str) -> str | None:
     return matches[-1].strip() if matches else None
 
 
+def _normalize_label_text(value: str) -> str:
+    text = unicodedata.normalize("NFKC", str(value)).strip().lower()
+    text = text.replace("ё", "е")
+    text = re.sub(r"[\s_\-\u2010-\u2015]+", " ", text)
+    return text.strip(" .,:;!?'\"`|[](){}")
+
+
 def normalize_text_label(value: str | None, label_names: dict | None = None) -> int | None:
     """
     Normalize LLM textual answers to label ids.
@@ -44,14 +51,11 @@ def normalize_text_label(value: str | None, label_names: dict | None = None) -> 
     """
     if value is None:
         return None
-    text = unicodedata.normalize("NFKC", str(value)).strip().lower()
-    text = text.replace("ё", "е")
-    text = re.sub(r"[\s_\-]+", " ", text)
-    text = text.strip(" .,:;!?'\"`|[](){}")
+    text = _normalize_label_text(value)
 
     if label_names:
         for k, v in label_names.items():
-            if text == str(k).lower() or text == str(v).lower().replace("ё", "е"):
+            if text in {_normalize_label_text(k), _normalize_label_text(v)}:
                 return int(k)
 
     if text in {"0", "active", "active client", "loyal", "loyal client", "активный", "активный клиент", "лояльный", "лояльный клиент"}:
