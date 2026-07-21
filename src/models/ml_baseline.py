@@ -21,6 +21,7 @@ from sklearn.tree import DecisionTreeClassifier, export_text
 from xgboost import XGBClassifier
 
 from src.data.loader import add_features, load_dataset
+from src.experiments.artifacts import files_fingerprint, stage_signature
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -57,7 +58,6 @@ def build_standard_features(df: pd.DataFrame) -> pd.DataFrame:
         amount_median="median",
         amount_std="std",
     )
-
     if "tr_datetime" in df.columns:
         dates = df.assign(
             _day=df["tr_datetime"].dt.date,
@@ -362,7 +362,12 @@ def run_ml_baseline(config: dict, experiments: list[str] | None = None) -> None:
         print(f"Saved ML metrics -> {out_path}")
 
     for name in experiments:
-        if name in results and {"xgboost", "decision_tree"}.issubset(results[name].keys()):
+        signature = ml_artifact_signature(config, name)
+        if (
+            name in results
+            and {"xgboost", "decision_tree"}.issubset(results[name].keys())
+            and results[name].get("artifact_signature") == signature
+        ):
             print(f"\nFeature set: {name}; already complete in {out_path}, skipping")
             continue
 
@@ -377,7 +382,7 @@ def run_ml_baseline(config: dict, experiments: list[str] | None = None) -> None:
         x_test, y_test = split_xy(pack["test"], columns)
 
         print(f"\nFeature set: {name}; dim={x_train.shape[1]}; train={len(y_train)}; val={len(y_val)}; test={len(y_test)}")
-        results[name] = {}
+        results[name] = {"artifact_signature": signature}
 
         best_xgb = tune_xgboost(x_train, y_train, x_val, y_val, config, n_trials)
         xgb = XGBClassifier(
@@ -409,3 +414,28 @@ def run_ml_baseline(config: dict, experiments: list[str] | None = None) -> None:
 
         del feature_sets, pack, x_train, y_train, x_val, y_val, x_test, y_test
         gc.collect()
+def ml_artifact_signature(config: dict, feature_set: str) -> str:
+    """Identify every source that can change an ML result.
+
+    Old metrics without this signature are deliberately treated as legacy and are
+    recomputed rather than silently reused.
+    """
+    source_paths = list(config["dataset"]["splits"].values())
+    if feature_set in {"cot", "concat"}:
+        out_dir = Path(config["output"]["base_dir"])
+        source_paths.extend(
+            out_dir / f"cot_features_{split}.parquet"
+            for split in ("train", "val", "test")
+        )
+    relevant_config = {
+        "dataset": config.get("dataset", {}),
+        "pipeline": config.get("pipeline", {}),
+        "optuna": config.get("optuna", {}),
+        "experiment": config.get("experiment", {}),
+        "feature_set": feature_set,
+    }
+    return stage_signature(
+        "ml_baseline",
+        inputs=files_fingerprint(source_paths),
+        configuration=relevant_config,
+    )

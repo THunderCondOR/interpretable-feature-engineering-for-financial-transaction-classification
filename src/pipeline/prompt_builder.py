@@ -17,6 +17,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from src.data.aggregator import get_summary_fn
+from src.experiments.artifacts import fingerprint
 
 
 KNOWN_PLACEHOLDERS = {
@@ -62,7 +63,7 @@ def build_few_shot_str(
     seed: int = 42,
 ) -> str:
     """Sample labeled train clients per class and format them as few-shot examples."""
-    random.seed(seed)
+    rng = random.Random(seed)
     label_names = config["dataset"]["label_names"]
     category_label = config["dataset"].get("category_label", "категории трат")
     summary_fn = get_summary_fn(config)
@@ -78,7 +79,7 @@ def build_few_shot_str(
         ids = labeled_df.loc[labeled_df["label"] == label_id, "customer_id"].unique().tolist()
         if not ids:
             continue
-        sampled = random.sample(ids, k=min(n_per_class, len(ids)))
+        sampled = rng.sample(ids, k=min(n_per_class, len(ids)))
         for cid in sampled:
             client_df = labeled_df[labeled_df["customer_id"] == cid]
             summary = summary_fn(client_df, category_label)
@@ -120,6 +121,13 @@ def build_prompts(
             client_stats=client_stats,
         )
         label_name = label_names.get(str(label), "unknown") if label >= 0 else "unknown"
+        prompt_hash = fingerprint(
+            {
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "customer_id": int(cid),
+            }
+        )
         records.append({
             "customer_id": int(cid),
             "label": label,
@@ -127,6 +135,10 @@ def build_prompts(
             "client_stats": client_stats,
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
+            "prompt_hash": prompt_hash,
+            "client_stats_hash": fingerprint(client_stats),
+            "summary_stats_hash": fingerprint(summary_stats_str),
+            "few_shot_hash": fingerprint(few_shot_str),
         })
 
     return records

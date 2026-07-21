@@ -8,11 +8,11 @@ Supports split-specific files such as explanations_train.jsonl -> claims_train.j
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from collections import Counter
 from pathlib import Path
 
+from src.experiments.artifacts import fingerprint, stage_signature
 from src.utils.async_api import batched_query
 from src.utils.prompt_parsing import extract_json_list
 
@@ -62,7 +62,10 @@ def _claims_successful(record: dict) -> bool:
     return not record.get("error") and bool(record.get("claims"))
 
 
-def _load_successful_claims(path: Path, generation_signature: str) -> dict[int, dict]:
+def _load_successful_claims(
+    path: Path,
+    expected_signatures: dict[int, dict[str, str]],
+) -> dict[int, dict]:
     if not path.exists():
         return {}
     successful = {}
@@ -78,17 +81,19 @@ def _load_successful_claims(path: Path, generation_signature: str) -> dict[int, 
             except json.JSONDecodeError:
                 error_types["MalformedJSONL"] += 1
                 continue
-            if (
-                _claims_successful(record)
-                and record.get("generation_signature") == generation_signature
-            ):
-                successful[int(record["customer_id"])] = record
+            cid = int(record["customer_id"])
+            expected = expected_signatures.get(cid)
+            compatible = bool(expected) and all(
+                record.get(key) == value for key, value in expected.items()
+            )
+            if _claims_successful(record) and compatible:
+                successful[cid] = record
             else:
                 error_type = (
                     str(record.get("error_type"))
                     if record.get("error_type")
                     else "IncompatibleGeneration"
-                    if record.get("generation_signature") != generation_signature
+                    if not compatible
                     else "EmptyClaims"
                 )
                 error_types[error_type] += 1
@@ -149,35 +154,76 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
     save_path = Path(output_path) if output_path else _split_path(config, "claims", split)
 
     n_samples = config.get("pipeline", {}).get("n_claims_samples", 1)
-    model = config["llm"]["default_model"]
     llm_cfg = dict(config["llm"])
+    llm_cfg.update(config.get("claims_generation", {}))
+    model = str(llm_cfg.get("model", llm_cfg["default_model"]))
     llm_cfg["max_tokens"] = int(
-        config.get("pipeline", {}).get("claims_max_tokens", 2048)
+        llm_cfg.get(
+            "max_tokens",
+            config.get("pipeline", {}).get("claims_max_tokens", 2048),
+        )
     )
 
     cfg_prompts = config["prompts"]
     base_dir = Path(cfg_prompts["base_dir"])
     claims_sys = (base_dir / cfg_prompts["claims_system"]).read_text(encoding="utf-8")
     claims_usr_t = (base_dir / cfg_prompts["claims_user"]).read_text(encoding="utf-8")
-    generation_signature = hashlib.sha256(
-        json.dumps(
-            {
-                "version": 2,
-                "model": model,
-                "system_prompt": claims_sys,
-                "user_prompt": claims_usr_t,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
+    generation_signature = stage_signature(
+        "claims_extraction",
+        inputs={
+            "system_prompt": claims_sys,
+            "user_prompt": claims_usr_t,
+        },
+        configuration={
+            "model": model,
+            "temperature": llm_cfg.get("temperature", 0.0),
+            "top_p": llm_cfg.get("top_p", 1.0),
+            "max_tokens": llm_cfg["max_tokens"],
+            "seed": llm_cfg.get("seed"),
+            "extra_body": llm_cfg.get("extra_body"),
+            "n_claims_samples": n_samples,
+        },
+    )
 
     client_groups = load_explanations(load_path)
     print(f"Loaded explanations for {len(client_groups)} clients from {load_path}")
 
     ordered_clients = [int(group[0]["customer_id"]) for group in client_groups]
     expected_client_set = set(ordered_clients)
-    existing = _load_successful_claims(save_path, generation_signature)
+    selected_by_client: dict[int, list[dict]] = {}
+    invalid_behavioral_by_client: dict[int, int] = {}
+    expected_signatures: dict[int, dict[str, str]] = {}
+    for group in client_groups:
+        cid = int(group[0]["customer_id"])
+        valid = []
+        invalid_behavioral = 0
+        for record in group:
+            if not record.get("explanation") or record.get("error"):
+                continue
+            min_chars = int(record.get("min_behavioral_explanation_chars", 80) or 80)
+            if not _has_behavioral_explanation(record.get("explanation", ""), min_chars):
+                invalid_behavioral += 1
+                continue
+            valid.append(record)
+        selected = sorted(valid, key=lambda record: int(record.get("sample_id", 0)))[:n_samples]
+        source_hash = fingerprint(
+            [
+                {
+                    "sample_id": record.get("sample_id", 0),
+                    "generation_signature": record.get("generation_signature"),
+                    "explanation": record.get("explanation", ""),
+                }
+                for record in selected
+            ]
+        )
+        selected_by_client[cid] = selected
+        invalid_behavioral_by_client[cid] = invalid_behavioral
+        expected_signatures[cid] = {
+            "generation_signature": generation_signature,
+            "source_explanation_hash": source_hash,
+        }
+
+    existing = _load_successful_claims(save_path, expected_signatures)
     claims_by_client = {
         customer_id: record
         for customer_id, record in existing.items()
@@ -189,18 +235,11 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
         cid = int(group[0]["customer_id"])
         if cid in claims_by_client:
             continue
-        valid = []
-        invalid_behavioral = 0
-        for record in group:
-            if not record.get("explanation") or record.get("error"):
-                continue
-            min_chars = int(record.get("min_behavioral_explanation_chars", 80) or 80)
-            if not _has_behavioral_explanation(record.get("explanation", ""), min_chars):
-                invalid_behavioral += 1
-                continue
-            valid.append(record)
-        if not valid:
+        selected = selected_by_client[cid]
+        source_hash = expected_signatures[cid]["source_explanation_hash"]
+        if not selected:
             first = group[0]
+            invalid_behavioral = invalid_behavioral_by_client[cid]
             error_type = "NoBehavioralExplanation" if invalid_behavioral else "NoValidExplanation"
             error = (
                 "no usable behavioral explanation available"
@@ -215,9 +254,10 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                 "error": error,
                 "error_type": error_type,
                 "generation_signature": generation_signature,
+                "source_explanation_hash": source_hash,
             }
             continue
-        for rec in valid[:n_samples]:
+        for rec in selected:
             user_prompt = claims_usr_t.format(COT=rec.get("explanation", ""))
             all_dialogues.append([
                 {"role": "system", "content": claims_sys},
@@ -227,6 +267,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                 "customer_id": rec["customer_id"],
                 "label": rec.get("label", -1),
                 "label_name": rec.get("label_name", "unknown"),
+                "source_explanation_hash": source_hash,
             })
 
     print(
@@ -253,6 +294,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                     "error": None,
                     "error_type": None,
                     "generation_signature": generation_signature,
+                    "source_explanation_hash": item_meta["source_explanation_hash"],
                 },
             )
             record["claims"].extend(parsed)

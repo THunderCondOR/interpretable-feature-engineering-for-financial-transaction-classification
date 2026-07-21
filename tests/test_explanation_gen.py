@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+from src.experiments.artifacts import fingerprint, prompt_signature
 from src.pipeline.explanation_gen import (
     _is_successful,
     build_output_record,
@@ -12,6 +13,11 @@ from src.pipeline.explanation_gen import (
 
 LABELS = {"0": "женщина", "1": "мужчина"}
 META = {"customer_id": 1, "label": 0, "label_name": "женщина", "sample_id": 0}
+VALID_RESPONSE = (
+    "Клиент регулярно совершает покупки в нескольких категориях. "
+    "Частота операций и структура расходов устойчивы на протяжении периода.\n"
+    "Final: \\boxed{женщина}"
+)
 
 
 def api_result(
@@ -34,7 +40,7 @@ def api_result(
 def test_complete_boxed_response_is_successful() -> None:
     record = build_output_record(
         META,
-        api_result("Обоснование.\nFinal: \\boxed{женщина}"),
+        api_result(VALID_RESPONSE),
         LABELS,
     )
 
@@ -82,7 +88,7 @@ def test_response_without_boxed_answer_is_not_successful() -> None:
 def test_write_records_is_atomic_and_supports_partial_checkpoint(tmp_path) -> None:
     record = build_output_record(
         META,
-        api_result("Обоснование.\nFinal: \\boxed{женщина}"),
+        api_result(VALID_RESPONSE),
         LABELS,
     )
     path = tmp_path / "explanations.jsonl"
@@ -96,7 +102,7 @@ def test_write_records_is_atomic_and_supports_partial_checkpoint(tmp_path) -> No
 def test_summarize_records_counts_error_types() -> None:
     good = build_output_record(
         META,
-        api_result("Обоснование.\nFinal: \\boxed{женщина}"),
+        api_result(VALID_RESPONSE),
         LABELS,
     )
     empty = build_output_record(META, api_result(""), LABELS)
@@ -134,9 +140,29 @@ def test_resume_is_default_and_reuses_existing_record(tmp_path, monkeypatch) -> 
         + "\n",
         encoding="utf-8",
     )
+    signature = prompt_signature(
+        system_prompt="system",
+        user_prompt="user",
+        model="test",
+        decoding={
+            "temperature": 1.0,
+            "top_p": 0.9,
+            "max_tokens": 2048,
+            "seed": None,
+            "extra_body": None,
+        },
+        sample_id=0,
+    )
+    existing_meta = {
+        **META,
+        "generation_signature": signature,
+        "prompt_hash": fingerprint(
+            {"system_prompt": "system", "user_prompt": "user"}
+        ),
+    }
     existing = build_output_record(
-        META,
-        api_result("Обоснование.\nFinal: \\boxed{женщина}"),
+        existing_meta,
+        api_result(VALID_RESPONSE),
         LABELS,
     )
     write_records(output_path, [META], {(1, 0): existing})
@@ -191,7 +217,7 @@ def test_batch_error_summary_is_saved_by_type(tmp_path, monkeypatch) -> None:
         encoding="utf-8",
     )
     results = [
-        api_result("Обоснование.\nFinal: \\boxed{женщина}"),
+        api_result(VALID_RESPONSE),
         api_result(""),
     ]
 

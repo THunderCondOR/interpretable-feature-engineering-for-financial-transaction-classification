@@ -15,6 +15,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from src.experiments.artifacts import fingerprint, prompt_signature
 from src.utils.async_api import batched_query
 from src.utils.prompt_parsing import extract_boxed_answer, normalize_text_label
 
@@ -130,7 +131,10 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
     temp_path.replace(path)
 
 
-def load_successful_existing(path: Path) -> dict[RequestKey, dict]:
+def load_successful_existing(
+    path: Path,
+    expected_signatures: dict[RequestKey, str] | None = None,
+) -> dict[RequestKey, dict]:
     if not path.exists():
         return {}
 
@@ -138,6 +142,7 @@ def load_successful_existing(path: Path) -> dict[RequestKey, dict]:
     total = 0
     failed = 0
     malformed = 0
+    incompatible = 0
     error_types: Counter[str] = Counter()
 
     with open(path, encoding="utf-8") as f:
@@ -151,15 +156,23 @@ def load_successful_existing(path: Path) -> dict[RequestKey, dict]:
             except json.JSONDecodeError:
                 malformed += 1
                 continue
-            if _is_successful(record):
-                successful[_request_key(record)] = record
+            key = _request_key(record)
+            expected = expected_signatures.get(key) if expected_signatures is not None else None
+            compatible = expected is None or record.get("generation_signature") == expected
+            if _is_successful(record) and compatible:
+                successful[key] = record
             else:
                 failed += 1
-                error_types[_record_error_type(record) or "UnknownError"] += 1
+                if not compatible:
+                    incompatible += 1
+                    error_types["IncompatibleGeneration"] += 1
+                else:
+                    error_types[_record_error_type(record) or "UnknownError"] += 1
 
     print(
         f"Existing explanations: {len(successful)} successful, "
-        f"{failed} failed/empty, {malformed} malformed, {total} total, "
+        f"{failed} failed/empty, {incompatible} incompatible, "
+        f"{malformed} malformed, {total} total, "
         f"error_types={dict(error_types)} -> {path}"
     )
     return successful
@@ -267,8 +280,9 @@ def run_explanation_generation(
     save_path = Path(output_path) if output_path else _split_path(config, "explanations", split)
 
     n_samples = config.get("pipeline", {}).get("n_explanation_samples", 1)
-    model = config["llm"]["default_model"]
-    llm_cfg = config["llm"]
+    llm_cfg = dict(config["llm"])
+    llm_cfg.update(config.get("generation", {}))
+    model = str(llm_cfg.get("model", llm_cfg["default_model"]))
     label_names = config["dataset"].get("label_names", {})
     min_behavioral_explanation_chars = int(
         config.get("pipeline", {}).get("min_behavioral_explanation_chars", 80)
@@ -279,6 +293,7 @@ def run_explanation_generation(
 
     ordered_meta: list[dict] = []
     dialogues_by_key: dict[RequestKey, list[dict]] = {}
+    expected_signatures: dict[RequestKey, str] = {}
     sys_role = "sys" + "tem"
     usr_role = "user"
     sys_prompt_key = "system" + "_prompt"
@@ -293,14 +308,39 @@ def run_explanation_generation(
                 "min_behavioral_explanation_chars": min_behavioral_explanation_chars,
             }
             key = _request_key(meta)
+            system_prompt = rec[sys_prompt_key]
+            user_prompt = rec[usr_prompt_key]
+            decoding = {
+                "temperature": llm_cfg.get("temperature", 1.0),
+                "top_p": llm_cfg.get("top_p", 0.9),
+                "max_tokens": llm_cfg.get("max_tokens", 2048),
+                "seed": llm_cfg.get("seed"),
+                "extra_body": llm_cfg.get("extra_body"),
+            }
+            signature = prompt_signature(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+                decoding=decoding,
+                sample_id=sample_id,
+            )
+            meta["prompt_hash"] = fingerprint(
+                {"system_prompt": system_prompt, "user_prompt": user_prompt}
+            )
+            meta["generation_signature"] = signature
+            expected_signatures[key] = signature
             ordered_meta.append(meta)
             dialogues_by_key[key] = [
-                {"role": sys_role, "content": rec[sys_prompt_key]},
-                {"role": usr_role, "content": rec[usr_prompt_key]},
+                {"role": sys_role, "content": system_prompt},
+                {"role": usr_role, "content": user_prompt},
             ]
 
     expected_keys = {_request_key(meta) for meta in ordered_meta}
-    existing = load_successful_existing(save_path) if resume else {}
+    existing = (
+        load_successful_existing(save_path, expected_signatures)
+        if resume
+        else {}
+    )
     records_by_key = {key: record for key, record in existing.items() if key in expected_keys}
 
     keys_in_order = [_request_key(meta) for meta in ordered_meta]

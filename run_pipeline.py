@@ -21,6 +21,7 @@ import yaml
 
 from src.data.aggregator import build_all_client_stats, build_dataset_summary_str
 from src.data.loader import add_features, load_dataset
+from src.experiments.artifacts import ensure_run_manifest
 from src.models.lora_trainer import train as lora_train
 from src.models.ml_baseline import run_ml_baseline
 from src.pipeline.claims_extractor import run_claims_extraction
@@ -212,6 +213,15 @@ def main() -> None:
         config["llm"]["max_tokens"] = args.max_tokens
     if args.claims_max_tokens is not None:
         config.setdefault("pipeline", {})["claims_max_tokens"] = args.claims_max_tokens
+
+    if config.get("experiment"):
+        manifest_path = ensure_run_manifest(config, repo_root=Path(__file__).parent)
+        print(f"Experiment manifest -> {manifest_path}")
+    else:
+        print(
+            "Legacy-compatible mode: no experiment block configured; "
+            "use a v2 config and versioned output directory for strict provenance."
+        )
     splits = parse_csv(args.splits)
     experiments = parse_csv(args.experiments)
     lora_models = parse_csv(args.lora_models) if args.lora_models else None
