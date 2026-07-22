@@ -305,7 +305,20 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
 
     request_errors: dict[int, list[tuple[str, str]]] = {}
 
+    llm_cfg["request_keys"] = [f"{item['customer_id']}:{index}" for index, item in enumerate(meta)]
+    llm_cfg["generation_signature"] = generation_signature
+    llm_cfg.setdefault("scheduler_state_dir", str(save_path.parent / ".scheduler" / save_path.stem))
+    llm_cfg.setdefault("events_path", str(save_path.parent / ".scheduler" / f"{save_path.stem}.events.jsonl"))
+
     def checkpoint(batch_results: list[tuple[int, dict]]) -> None:
+        if llm_cfg.get("until_complete"):
+            repairable = []
+            for idx, result in batch_results:
+                _parsed, error_type, error = _parse_claim_result(result)
+                if error_type:
+                    repairable.append((meta[idx]["customer_id"], error_type, error))
+            if repairable:
+                raise RuntimeError(f"repairable claims window errors: {repairable[:5]}")
         batch_records = []
         for idx, result in batch_results:
             item_meta = meta[idx]

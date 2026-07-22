@@ -387,17 +387,29 @@ def run_explanation_generation(
         dialogues = [dialogues_by_key[key] for key in keys_to_run]
         meta_by_key = {_request_key(meta): meta for meta in ordered_meta}
         metas_to_run = [meta_by_key[key] for key in keys_to_run]
+        llm_cfg["request_keys"] = [f"{key[0]}:{key[1]}" for key in keys_to_run]
+        llm_cfg["generation_signature"] = fingerprint(
+            [expected_signatures[key] for key in keys_to_run]
+        )
+        llm_cfg.setdefault("scheduler_state_dir", str(save_path.parent / ".scheduler" / save_path.stem))
+        llm_cfg.setdefault("events_path", str(save_path.parent / ".scheduler" / f"{save_path.stem}.events.jsonl"))
 
         print(f"Sending {len(dialogues)} requests to {model} ({n_samples} per client configured)...")
         checkpointed_keys: set[RequestKey] = set()
 
         def checkpoint(batch_results: list[tuple[int, dict]]) -> None:
             nonlocal last_batch_summary
-            batch_records = []
+            staged_records = []
             for idx, result in batch_results:
                 meta = metas_to_run[idx]
                 key = _request_key(meta)
                 record = build_output_record(meta, result, label_names)
+                staged_records.append((key, record))
+            if llm_cfg.get("until_complete") and any(not _is_successful(record) for _, record in staged_records):
+                errors = summarize_records([record for _, record in staged_records])["error_types"]
+                raise RuntimeError(f"repairable explanation window errors: {errors}")
+            batch_records = []
+            for key, record in staged_records:
                 records_by_key[key] = record
                 batch_records.append(record)
                 checkpointed_keys.add(key)

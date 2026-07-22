@@ -27,6 +27,7 @@ Optional llm config keys:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 import sys
@@ -34,10 +35,13 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from typing import Any
+from pathlib import Path
 
 import httpx
 import openai
 from tqdm import tqdm
+
+from src.utils.atomic_scheduler import AtomicAdaptiveScheduler, is_rate_limit
 
 
 class AsyncRateLimiter:
@@ -74,7 +78,7 @@ def _make_client(llm_config: dict) -> openai.AsyncOpenAI:
         base_url=base_url,
         api_key=api_key,
         http_client=httpx.AsyncClient(
-            verify=False,
+            verify=bool(llm_config.get("verify_ssl", True)),
             limits=httpx.Limits(
                 max_connections=max_connections,
                 max_keepalive_connections=max_connections,
@@ -176,6 +180,7 @@ async def _query_with_retry(
                     top_p=llm_config.get("top_p", 0.9),
                     max_tokens=llm_config.get("max_tokens", 2048),
                     stream=False,
+                    **({"seed": int(llm_config["seed"])} if llm_config.get("seed") is not None else {}),
                     **({"extra_body": extra_body} if extra_body else {}),
                 )
                 return {
@@ -274,6 +279,69 @@ async def _run_batch(
     return results
 
 
+async def _run_atomic_batch(indexed_dialogues, model, llm_config, client, concurrency, rate_limiter):
+    """Cancel outstanding work as soon as a 429 is observed."""
+    sem = asyncio.Semaphore(concurrency)
+
+    async def runner(idx, dialogue):
+        result = await _query_with_retry(
+            dialogue, model, llm_config, client, sem, rate_limiter,
+            request_id=idx, max_retries=1,
+        )
+        return idx, result
+
+    tasks = [asyncio.create_task(runner(idx, dialogue)) for idx, dialogue in indexed_dialogues]
+    results = []
+    try:
+        for task in asyncio.as_completed(tasks):
+            item = await task
+            results.append(item)
+            if is_rate_limit(item[1]):
+                for pending in tasks:
+                    if not pending.done():
+                        pending.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                break
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+    return results
+
+
+async def _batched_query_atomic(dialogues, model, llm_config, on_batch_complete):
+    rate_limiter = AsyncRateLimiter(float(llm_config.get("request_cooldown_seconds", 0.0)))
+    client = _make_client(llm_config)
+    scheduler = AtomicAdaptiveScheduler(llm_config)
+    _log(
+        f"[ATOMIC API CONFIG] requests={len(dialogues)} high={scheduler.high} "
+        f"fallback={scheduler.low} recovery_windows={scheduler.recovery_windows} "
+        f"cooldown={scheduler.cooldown}s"
+    )
+
+    async def execute(window, concurrency):
+        return await _run_atomic_batch(
+            window, model, llm_config, client, concurrency, rate_limiter,
+        )
+
+    try:
+        results = await scheduler.run(
+            dialogues,
+            execute,
+            on_batch_complete,
+            request_keys=llm_config.get("request_keys"),
+        )
+    finally:
+        await client.close()
+    return [
+        result if result is not None else {
+            "response": None, "execution_time": 0.0,
+            "error": "missing result", "error_type": "MissingResult",
+        }
+        for result in results
+    ]
+
+
 async def batched_query(
     dialogues: list[list[dict]],
     model: str,
@@ -294,6 +362,9 @@ async def batched_query(
     Returns:
         List of {response, execution_time, error} dicts, same order as input.
     """
+    if bool(llm_config.get("atomic_windows", True)):
+        return await _batched_query_atomic(dialogues, model, llm_config, on_batch_complete)
+
     configured_max_concurrent = int(llm_config.get("max_concurrent", 16))
     max_concurrent = configured_max_concurrent
     rate_limit_fallback = int(llm_config.get("rate_limit_fallback_concurrent", 10))

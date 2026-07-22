@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -193,23 +194,35 @@ async def main_async() -> None:
         "max_retries": 5,
         "retry_backoff": 2.0,
         "rate_limit_fallback_concurrent": max(1, min(4, args.max_concurrent)),
-        "rate_limit_recovery_batches": 3,
+        "rate_limit_recovery_batches": 10,
+        "initial_concurrency": args.max_concurrent,
+        "fallback_concurrency": 10,
+        "recovery_clean_batches": 10,
+        "cooldown_seconds": 60,
         "raise_on_error": False,
         "log_errors": True,
         "log_retries": True,
+        "until_complete": True,
+        "request_keys": [str(record["sample_id"]) for record in pending],
+        "generation_signature": hashlib.sha256(
+            json.dumps({"judge": args.judge_name, "model": args.model,
+                "samples": [record["sample_id"] for record in pending]}, sort_keys=True).encode()
+        ).hexdigest(),
+        "scheduler_state_dir": str(args.output.parent / ".scheduler" / args.output.stem),
+        "events_path": str(args.output.parent / ".scheduler" / f"{args.output.stem}.events.jsonl"),
     }
 
     all_records = list(existing.values())
 
     def checkpoint(batch_results: list[tuple[int, dict[str, Any]]]) -> None:
         nonlocal all_records
+        staged = []
         for idx, result in batch_results:
             sample = pending[idx]
             content = extract_content(result)
             parsed, parse_error = parse_json_object(content)
             verdict = normalize_verdict(parsed.get("verdict") if parsed else None)
-            all_records.append(
-                {
+            staged.append({
                     **sample,
                     "judge_name": args.judge_name,
                     "judge_model": args.model,
@@ -222,8 +235,11 @@ async def main_async() -> None:
                     "transport_error": result.get("error"),
                     "transport_error_type": result.get("error_type"),
                     "execution_time": result.get("execution_time"),
-                }
-            )
+                })
+        invalid = [row for row in staged if row["verdict"] == "parse_error" or row["transport_error"]]
+        if invalid:
+            raise RuntimeError(f"repairable grounding window errors: {len(invalid)}")
+        all_records.extend(staged)
         write_records(args.output, all_records)
         counts = Counter(r["verdict"] for r in all_records)
         print(f"checkpoint saved={len(all_records)} verdicts={dict(counts)} -> {args.output}")
