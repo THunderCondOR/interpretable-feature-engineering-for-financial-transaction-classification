@@ -22,6 +22,7 @@ import yaml
 from src.data.aggregator import build_all_client_stats, build_dataset_summary_str
 from src.data.loader import add_features, load_dataset
 from src.experiments.artifacts import ensure_run_manifest
+from src.experiments.events import append_event
 from src.data.profiles import export_robust_statistics, robust_statistics_payload
 from src.models.lora_trainer import train as lora_train
 from src.models.ml_baseline import run_ml_baseline
@@ -35,6 +36,35 @@ SPLITS = ("train", "val", "test")
 DEFAULT_STEPS = ("stats", "prompts", "cot", "llm_eval", "claims", "cot_features", "ml")
 STEPS = DEFAULT_STEPS + ("majority", "lora")
 API_STEPS = frozenset({"cot", "claims"})
+
+
+def prompt_context_split(config: dict) -> str:
+    """Return the only split allowed to fit label-conditioned prompt context."""
+    split = str(config.get("pipeline", {}).get("prompt_context_split", "train"))
+    if split != "train":
+        raise ValueError(
+            "Dataset summaries and few-shot demonstrations must use train only; "
+            f"received prompt_context_split={split!r}"
+        )
+    return split
+
+
+def pipeline_event(config: dict, event: str, stage: str, **payload) -> None:
+    events_path = config.get("llm", {}).get("events_path")
+    if not events_path:
+        events_path = str(Path(config["output"]["base_dir"]) / "events.jsonl")
+    append_event(
+        events_path,
+        event=event,
+        state="completed" if event == "stage_completed" else "running",
+        run_id=config.get("experiment", {}).get("run_id"),
+        dataset=config.get("dataset", {}).get("name", "unknown"),
+        model=config.get("experiment", {}).get(
+            "model_slug", config.get("llm", {}).get("default_model", "unknown")
+        ),
+        stage=stage,
+        **payload,
+    )
 
 
 def load_config(path: str) -> dict:
@@ -59,7 +89,7 @@ def run_stats(config: dict, splits: list[str]) -> None:
     out_dir = Path(config["output"]["base_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_df = load_split(config, "train")
+    train_df = load_split(config, prompt_context_split(config))
     summary = build_dataset_summary_str(train_df, config)
     summary_path = out_dir / config["output"]["summary_stats"]
     summary_path.write_text(summary, encoding="utf-8")
@@ -77,13 +107,21 @@ def run_stats(config: dict, splits: list[str]) -> None:
             for record in records:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
         print(f"Saved {split} client stats: {len(records)} clients -> {path}")
+    pipeline_event(
+        config,
+        "stage_completed",
+        "stats",
+        completed=len(splits),
+        expected=len(splits),
+        splits=splits,
+    )
 
 
 def run_prompts(config: dict, splits: list[str]) -> None:
     out_dir = Path(config["output"]["base_dir"])
     summary_path = out_dir / config["output"]["summary_stats"]
     summary = summary_path.read_text(encoding="utf-8")
-    train_df = load_split(config, "train")
+    train_df = load_split(config, prompt_context_split(config))
     few_shot = build_few_shot_str(train_df, config)
 
     for split in splits:
@@ -94,21 +132,49 @@ def run_prompts(config: dict, splits: list[str]) -> None:
             for record in records:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
         print(f"Saved {split} prompts: {len(records)} clients -> {path}")
+    pipeline_event(
+        config,
+        "stage_completed",
+        "prompts",
+        completed=len(splits),
+        expected=len(splits),
+        splits=splits,
+    )
 
 
 def run_cot(config: dict, splits: list[str], *, resume_cot: bool) -> None:
     for split in splits:
         run_explanation_generation(config, split=split, resume=resume_cot)
+        pipeline_event(
+            config,
+            "stage_completed",
+            "explanations",
+            split=split,
+        )
 
 
 def run_llm_eval(config: dict, splits: list[str]) -> None:
     for split in splits:
         evaluate_llm_predictions(config, split)
+    pipeline_event(
+        config,
+        "stage_completed",
+        "direct_eval",
+        completed=len(splits),
+        expected=len(splits),
+        splits=splits,
+    )
 
 
 def run_claims(config: dict, splits: list[str]) -> None:
     for split in splits:
         run_claims_extraction(config, split=split)
+        pipeline_event(
+            config,
+            "stage_completed",
+            "claims",
+            split=split,
+        )
 
 
 def run_cot_features(config: dict, splits: list[str]) -> None:

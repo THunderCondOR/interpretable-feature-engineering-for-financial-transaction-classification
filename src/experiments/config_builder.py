@@ -178,6 +178,10 @@ def build_runtime_config(
         int(config.get("pipeline", {}).get("claims_max_tokens", 2048)),
     )
     config["execution"] = copy.deepcopy(execution)
+    # Model profiles are reusable templates.  Never retain a profile's old
+    # run-specific event path when materialising a new run.
+    run_events_path = str(Path("logs/runs") / run_id / f"{model_slug}.events.jsonl")
+    config["execution"]["events_path"] = run_events_path
     config["evaluation"] = deep_merge(
         config.get("evaluation", {}),
         {
@@ -213,11 +217,12 @@ def build_runtime_config(
         "rate_limit_cooldown_seconds": float(execution.get("cooldown_seconds", 60)),
         "atomic_windows": bool(execution.get("atomic_windows", True)),
         "verify_ssl": bool(execution.get("verify_ssl", True)),
-        "events_path": str(output_dir / "events.jsonl"),
+        "events_path": run_events_path,
     })
     config["pipeline"] = deep_merge(
         config.get("pipeline", {}),
         {
+            "prompt_context_split": "train",
             "claims_model": claims_generation["model"],
             "claims_temperature": float(claims_generation.get("temperature", 0.0)),
             "claims_top_p": float(claims_generation.get("top_p", 1.0)),

@@ -331,7 +331,13 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
     llm_cfg["generation_signature"] = generation_signature
     llm_cfg.setdefault("scheduler_state_dir", str(save_path.parent / ".scheduler" / save_path.stem))
     llm_cfg.setdefault("events_path", str(save_path.parent / ".scheduler" / f"{save_path.stem}.events.jsonl"))
-    llm_cfg["event_context"] = {"run_id": config.get("experiment", {}).get("run_id"), "dataset": config["dataset"].get("name", "unknown"), "model": model, "stage": "claims", "split": split}
+    llm_cfg["event_context"] = {
+        "run_id": config.get("experiment", {}).get("run_id"),
+        "dataset": config["dataset"].get("name", "unknown"),
+        "model": config.get("experiment", {}).get("model_slug", model),
+        "stage": "claims",
+        "split": split,
+    }
 
     def checkpoint(batch_results: list[tuple[int, dict]]) -> None:
         if llm_cfg.get("until_complete"):

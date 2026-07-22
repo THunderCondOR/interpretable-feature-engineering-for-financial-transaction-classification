@@ -10,7 +10,32 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.experiments.events import STAGES, read_events, status_snapshot
+from src.experiments.events import read_events, status_snapshot
+
+
+DISPLAY_STAGES = [
+    "stats",
+    "prompts",
+    "train_explanations",
+    "val_explanations",
+    "test_explanations",
+    "direct_eval",
+    "train_claims",
+    "val_claims",
+    "test_claims",
+    "queue",
+]
+
+
+def normalize_event(event):
+    normalized = dict(event)
+    stage = normalized.get("stage")
+    split = normalized.get("split")
+    if stage in {"explanations", "claims"} and split in {"train", "val", "test"}:
+        normalized["stage"] = f"{split}_{stage}"
+    elif str(normalized.get("event", "")).startswith("job_") or normalized.get("event") == "dependency_wait":
+        normalized["stage"] = "queue"
+    return normalized
 
 
 def event_state(event):
@@ -21,10 +46,20 @@ def event_state(event):
     return f"{name}{progress}{concurrency}"
 
 
+def snapshot_stages(snapshot):
+    """Keep the overnight matrix stable while still rendering legacy events."""
+    observed = {
+        key.rsplit("|", 1)[1]
+        for key in snapshot["cells"]
+        if "|" in key
+    }
+    return [*DISPLAY_STAGES, *sorted(observed - set(DISPLAY_STAGES))]
+
+
 def terminal_table(snapshot):
     cells = snapshot["cells"]
     keys = sorted({key.split("|", 1)[0] for key in cells}) or ["no-events"]
-    display_stages = ["stats", "prompts", "explanations", "claims", "embeddings", "clusters", "features", "ml", "grounding", "reports"]
+    display_stages = snapshot_stages(snapshot)
     widths = [24] + [14] * len(display_stages)
     lines = ["".join(value[:width - 1].ljust(width) for value, width in zip(["dataset/model", *display_stages], widths))]
     for key in keys:
@@ -40,7 +75,7 @@ def html_document(snapshot, run_id):
     rows = []
     for key in keys:
         stage_cells = []
-        for stage in STAGES:
+        for stage in snapshot_stages(snapshot):
             event = cells.get(f"{key}|{stage}")
             state = event_state(event) if event else "pending"
             completed = event and (
@@ -66,7 +101,9 @@ def render(run_id, logs_root, results_root, output):
         for event in read_events(list(results_root.glob("**/*.events.jsonl")))
         if event.get("run_id") == run_id
     ]
-    snapshot = status_snapshot(log_events + result_events)
+    snapshot = status_snapshot([
+        normalize_event(event) for event in log_events + result_events
+    ])
     print(terminal_table(snapshot))
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")
