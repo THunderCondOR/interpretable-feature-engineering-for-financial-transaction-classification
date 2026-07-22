@@ -39,7 +39,12 @@ def share(part: float, whole: float) -> float:
 def build_handcrafted_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     if config["dataset"]["name"] == "rosbank":
         return build_rosbank_handcrafted_features(df)
-    return build_generic_handcrafted_features(df)
+    return build_generic_handcrafted_features(
+        df,
+        amount_semantics=config.get("dataset", {}).get(
+            "amount_semantics", "signed_cashflow"
+        ),
+    )
 
 
 def build_standard_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -91,7 +96,11 @@ def build_standard_features(df: pd.DataFrame) -> pd.DataFrame:
     return labels.join(features, how="left").fillna(0).reset_index()
 
 
-def build_generic_handcrafted_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_generic_handcrafted_features(
+    df: pd.DataFrame,
+    *,
+    amount_semantics: str = "signed_cashflow",
+) -> pd.DataFrame:
     records = []
     for customer_id, client in df.groupby("customer_id", sort=False):
         label = int(client["label"].iloc[0])
@@ -99,19 +108,35 @@ def build_generic_handcrafted_features(df: pd.DataFrame) -> pd.DataFrame:
         n_days = max(client["tr_datetime"].dt.date.nunique(), 1) if client["tr_datetime"].notna().any() else 1
         pos = client.loc[client["amount"] > 0, "amount"]
         neg = client.loc[client["amount"] < 0, "amount"]
-        row = {
+        row: dict[str, float | int] = {
             "customer_id": int(customer_id),
             "label": label,
             "n_txn": n_txn,
             "active_days": n_days,
             "txn_per_day": n_txn / n_days,
-            "total_income": float(pos.sum()) if len(pos) else 0.0,
-            "total_expense": float(neg.sum()) if len(neg) else 0.0,
-            "avg_income": float(pos.mean()) if len(pos) else 0.0,
-            "avg_expense": float(neg.mean()) if len(neg) else 0.0,
-            "share_income": share(len(pos), n_txn),
-            "share_expense": share(len(neg), n_txn),
         }
+        if amount_semantics == "unsigned_transaction_value":
+            amounts = client["amount"]
+            row.update(
+                {
+                    "total_transaction_value": float(amounts.sum()),
+                    "avg_transaction_value": float(amounts.mean()) if n_txn else 0.0,
+                    "median_transaction_value": float(amounts.median()) if n_txn else 0.0,
+                    "max_transaction_value": float(amounts.max()) if n_txn else 0.0,
+                    "std_transaction_value": float(amounts.std()) if n_txn > 1 else 0.0,
+                }
+            )
+        else:
+            row.update(
+                {
+                    "total_income": float(pos.sum()) if len(pos) else 0.0,
+                    "total_expense": float(neg.sum()) if len(neg) else 0.0,
+                    "avg_income": float(pos.mean()) if len(pos) else 0.0,
+                    "avg_expense": float(neg.mean()) if len(neg) else 0.0,
+                    "share_income": share(len(pos), n_txn),
+                    "share_expense": share(len(neg), n_txn),
+                }
+            )
         if "period_of_day" in client.columns:
             for period in ["утро", "день", "вечер", "ночь"]:
                 row[f"share_{period}"] = float((client["period_of_day"] == period).mean())
@@ -210,8 +235,64 @@ def load_cot_features(out_dir: Path, split: str) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+def canonical_client_frame(transactions: pd.DataFrame, split: str) -> pd.DataFrame:
+    label_counts = transactions.groupby("customer_id")["label"].nunique()
+    if (label_counts != 1).any():
+        raise ValueError(f"{split} contains clients with inconsistent labels")
+    return (
+        transactions[["customer_id", "label"]]
+        .drop_duplicates("customer_id")
+        .sort_values("customer_id")
+        .reset_index(drop=True)
+    )
+
+
+def validate_client_feature_frame(
+    frame: pd.DataFrame,
+    canonical: pd.DataFrame,
+    *,
+    split: str,
+    source: str,
+) -> pd.DataFrame:
+    if not {"customer_id", "label"} <= set(frame.columns):
+        raise ValueError(f"{source} {split} lacks customer_id/label columns")
+    if frame["customer_id"].duplicated().any():
+        raise ValueError(f"{source} {split} contains duplicate customer IDs")
+    expected_ids = set(canonical["customer_id"])
+    actual_ids = set(frame["customer_id"])
+    if actual_ids != expected_ids:
+        raise ValueError(
+            f"{source} {split} client IDs differ from canonical split: "
+            f"missing={len(expected_ids - actual_ids)}, extra={len(actual_ids - expected_ids)}"
+        )
+    expected_labels = canonical.set_index("customer_id")["label"]
+    actual_labels = frame.set_index("customer_id")["label"].reindex(expected_labels.index)
+    if not actual_labels.equals(expected_labels):
+        raise ValueError(f"{source} {split} labels differ from canonical split")
+    return canonical[["customer_id"]].merge(
+        frame,
+        on="customer_id",
+        how="left",
+        validate="one_to_one",
+    )
+
+
 def merge_feature_frames(cot: pd.DataFrame, handcrafted: pd.DataFrame) -> pd.DataFrame:
-    return cot.merge(handcrafted, on=["customer_id", "label"], how="inner", suffixes=("", "_hc"))
+    if cot["customer_id"].duplicated().any() or handcrafted["customer_id"].duplicated().any():
+        raise ValueError("Cannot concatenate feature frames with duplicate customer IDs")
+    merged = cot.merge(
+        handcrafted,
+        on="customer_id",
+        how="outer",
+        suffixes=("", "_hc"),
+        indicator=True,
+        validate="one_to_one",
+    )
+    if not (merged["_merge"] == "both").all():
+        raise ValueError("CoT and handcrafted feature frames contain different client IDs")
+    if not merged["label"].equals(merged["label_hc"]):
+        raise ValueError("CoT and handcrafted feature frames contain different labels")
+    return merged.drop(columns=["label_hc", "_merge"])
 
 
 def evaluate(model, x: np.ndarray, y: np.ndarray) -> dict:
@@ -239,7 +320,7 @@ def xgb_objective(config: dict) -> str:
     return "binary:logistic" if int(config["dataset"]["num_labels"]) == 2 else "multi:softprob"
 
 
-def tune_xgboost(x_train, y_train, x_val, y_val, config: dict, n_trials: int) -> dict:
+def tune_xgboost(x_train, y_train, x_val, y_val, config: dict, n_trials: int, seed: int = 17) -> dict:
     def objective(trial):
         params = {
             "n_estimators": trial.suggest_int("n_estimators", 50, 500),
@@ -254,7 +335,7 @@ def tune_xgboost(x_train, y_train, x_val, y_val, config: dict, n_trials: int) ->
         model = XGBClassifier(
             **params,
             objective=xgb_objective(config),
-            random_state=42,
+            random_state=seed,
             n_jobs=2,
             verbosity=0,
             eval_metric="logloss",
@@ -263,23 +344,29 @@ def tune_xgboost(x_train, y_train, x_val, y_val, config: dict, n_trials: int) ->
         model.fit(x_train, y_train)
         return primary_score(evaluate(model, x_val, y_val), config)
 
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+    )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     return study.best_params
 
 
-def tune_decision_tree(x_train, y_train, x_val, y_val, config: dict, n_trials: int) -> dict:
+def tune_decision_tree(x_train, y_train, x_val, y_val, config: dict, n_trials: int, seed: int = 17) -> dict:
     def objective(trial):
         params = {
             "max_depth": trial.suggest_int("max_depth", 2, 10),
             "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 30),
             "criterion": trial.suggest_categorical("criterion", ["gini", "entropy", "log_loss"]),
         }
-        model = DecisionTreeClassifier(**params, random_state=42)
+        model = DecisionTreeClassifier(**params, random_state=seed)
         model.fit(x_train, y_train)
         return primary_score(evaluate(model, x_val, y_val), config)
 
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+    )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     return study.best_params
 
@@ -291,9 +378,17 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
         raise ValueError(f"Unknown ML experiments: {sorted(unknown)}")
 
     out_dir = Path(config["output"]["base_dir"])
+    cot_dir = Path(
+        config.get("input", {}).get("cot_features_base_dir", out_dir)
+    )
     train_df = add_features(load_dataset(config, "train"))
     val_df = add_features(load_dataset(config, "val"))
     test_df = add_features(load_dataset(config, "test"))
+    canonical_clients = {
+        "train": canonical_client_frame(train_df, "train"),
+        "val": canonical_client_frame(val_df, "val"),
+        "test": canonical_client_frame(test_df, "test"),
+    }
 
     feature_sets = {}
     if "standard" in requested:
@@ -320,9 +415,24 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
             feature_sets["handcrafted"] = {"train": hc_train, "val": hc_val, "test": hc_test, "columns": hc_cols}
 
     if "cot" in requested or "concat" in requested:
-        cot_train_raw = load_cot_features(out_dir, "train")
-        cot_val_raw = load_cot_features(out_dir, "val")
-        cot_test_raw = load_cot_features(out_dir, "test")
+        cot_train_raw = validate_client_feature_frame(
+            load_cot_features(cot_dir, "train"),
+            canonical_clients["train"],
+            split="train",
+            source="CoT features",
+        )
+        cot_val_raw = validate_client_feature_frame(
+            load_cot_features(cot_dir, "val"),
+            canonical_clients["val"],
+            split="val",
+            source="CoT features",
+        )
+        cot_test_raw = validate_client_feature_frame(
+            load_cot_features(cot_dir, "test"),
+            canonical_clients["test"],
+            split="test",
+            source="CoT features",
+        )
         cot_cols = feature_columns(cot_train_raw)
         cot_train = align_features(cot_train_raw, cot_cols)
         cot_val = align_features(cot_val_raw, cot_cols)
@@ -340,12 +450,113 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
     return feature_sets
 
 
+def _seed_metric_summary(runs: dict[str, dict], split: str) -> dict:
+    metric_names = sorted({
+        metric
+        for run in runs.values()
+        for metric, value in run[split].items()
+        if isinstance(value, (int, float)) and metric != "n"
+    })
+    summary = {}
+    for metric in metric_names:
+        values = np.asarray([run[split][metric] for run in runs.values()], dtype=float)
+        summary[metric] = {
+            "mean": float(values.mean()),
+            "sd": float(values.std(ddof=1)) if len(values) > 1 else 0.0,
+            "min": float(values.min()),
+            "max": float(values.max()),
+        }
+    return summary
+
+
+def _balanced_accuracy_ci(y_true, y_pred, *, samples=1000, seed=17):
+    y_true = np.asarray(y_true, dtype=int)
+    y_pred = np.asarray(y_pred, dtype=int)
+    rng = np.random.default_rng(seed)
+    groups = [np.flatnonzero(y_true == label) for label in np.unique(y_true)]
+    values = []
+    for _ in range(samples):
+        indices = np.concatenate([
+            rng.choice(group, size=len(group), replace=True)
+            for group in groups
+        ])
+        values.append(balanced_accuracy_score(y_true[indices], y_pred[indices]))
+    return {
+        "low": float(np.quantile(values, 0.025)),
+        "high": float(np.quantile(values, 0.975)),
+        "method": "paired_stratified_client_bootstrap",
+    }
+
+
+def prediction_artifact_complete(
+    records: list[dict],
+    *,
+    feature_set: str,
+    seeds: list[int],
+    frames: dict[str, pd.DataFrame],
+    num_labels: int,
+) -> bool:
+    probability_fields = {f"probability_{label}" for label in range(num_labels)}
+    for classifier in ("xgboost", "decision_tree"):
+        for seed in seeds:
+            for split, frame in frames.items():
+                cell = [
+                    row for row in records
+                    if row.get("feature_set") == feature_set
+                    and row.get("classifier") == classifier
+                    and row.get("seed") == seed
+                    and row.get("split") == split
+                ]
+                expected_labels = {
+                    int(row.customer_id): int(row.label)
+                    for row in frame[["customer_id", "label"]].itertuples(index=False)
+                }
+                if len(cell) != len(expected_labels):
+                    return False
+                ids = [int(row.get("customer_id", -1)) for row in cell]
+                if len(ids) != len(set(ids)) or set(ids) != set(expected_labels):
+                    return False
+                for row in cell:
+                    customer_id = int(row.get("customer_id", -1))
+                    if int(row.get("label", -1)) != expected_labels[customer_id]:
+                        return False
+                    if int(row.get("prediction", -1)) not in range(num_labels):
+                        return False
+                    row_probability_fields = {
+                        key for key in row if key.startswith("probability_")
+                    }
+                    if row_probability_fields != probability_fields:
+                        return False
+                    probabilities = np.asarray(
+                        [row[field] for field in sorted(probability_fields)],
+                        dtype=float,
+                    )
+                    if (
+                        not np.isfinite(probabilities).all()
+                        or (probabilities < 0).any()
+                        or (probabilities > 1).any()
+                        or not np.isclose(probabilities.sum(), 1.0, atol=1e-5)
+                    ):
+                        return False
+    return True
+
+
 def run_ml_baseline(config: dict, experiments: list[str] | None = None) -> None:
     experiments = experiments or ["handcrafted", "cot", "concat"]
     n_trials = int(config.get("optuna", {}).get("n_trials", 30))
+    seeds = [
+        int(seed) for seed in config.get("evaluation", {}).get(
+            "seeds",
+            [config.get("experiment", {}).get("seed", 17)],
+        )
+    ]
+    if not seeds or len(set(seeds)) != len(seeds):
+        raise ValueError("evaluation.seeds must contain unique integer seeds")
+    bootstrap_samples = int(config.get("evaluation", {}).get("bootstrap_samples", 1000))
     out_dir = Path(config["output"]["base_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "ml_metrics.json"
+    prediction_path = out_dir / "ml_predictions.jsonl"
 
     results = {}
     if out_path.exists():
@@ -354,66 +565,163 @@ def run_ml_baseline(config: dict, experiments: list[str] | None = None) -> None:
         if isinstance(existing, dict):
             results.update(existing)
 
+    prediction_records = []
+    if prediction_path.exists():
+        with open(prediction_path, encoding="utf-8") as file:
+            prediction_records = [json.loads(line) for line in file if line.strip()]
+
     def save_results() -> None:
         temp_path = out_path.with_suffix(out_path.suffix + ".tmp")
         with open(temp_path, "w", encoding="utf-8") as file:
             json.dump(results, file, indent=2, ensure_ascii=False)
         temp_path.replace(out_path)
-        print(f"Saved ML metrics -> {out_path}")
+        prediction_temp = prediction_path.with_suffix(prediction_path.suffix + ".tmp")
+        with open(prediction_temp, "w", encoding="utf-8") as file:
+            for record in prediction_records:
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        prediction_temp.replace(prediction_path)
+        print(f"Saved seeded ML metrics -> {out_path}")
 
     for name in experiments:
         signature = ml_artifact_signature(config, name)
-        if (
-            name in results
-            and {"xgboost", "decision_tree"}.issubset(results[name].keys())
-            and results[name].get("artifact_signature") == signature
-        ):
-            print(f"\nFeature set: {name}; already complete in {out_path}, skipping")
-            continue
-
-        # Build one feature set at a time. For high-dimensional CoT features this
-        # avoids holding standard/handcrafted/CoT/concat matrices in memory
-        # simultaneously, and lets restarts reuse already saved results.
+        expected_seed_keys = {str(seed) for seed in seeds}
         feature_sets = build_feature_sets(config, [name])
         pack = feature_sets[name]
+        metrics_complete = all(
+            set(results.get(name, {}).get(classifier, {}).get("runs", {}))
+            == expected_seed_keys
+            for classifier in ("xgboost", "decision_tree")
+        )
+        predictions_complete = prediction_artifact_complete(
+            prediction_records,
+            feature_set=name,
+            seeds=seeds,
+            frames={split: pack[split] for split in ("train", "val", "test")},
+            num_labels=int(config["dataset"]["num_labels"]),
+        )
+        if (
+            name in results
+            and results[name].get("artifact_signature") == signature
+            and metrics_complete
+            and predictions_complete
+        ):
+            print(f"\nFeature set: {name}; compatible seeded result already complete, skipping")
+            del feature_sets, pack
+            continue
         columns = pack["columns"]
         x_train, y_train = split_xy(pack["train"], columns)
         x_val, y_val = split_xy(pack["val"], columns)
         x_test, y_test = split_xy(pack["test"], columns)
-
-        print(f"\nFeature set: {name}; dim={x_train.shape[1]}; train={len(y_train)}; val={len(y_val)}; test={len(y_test)}")
-        results[name] = {"artifact_signature": signature}
-
-        best_xgb = tune_xgboost(x_train, y_train, x_val, y_val, config, n_trials)
-        xgb = XGBClassifier(
-            **best_xgb,
-            objective=xgb_objective(config),
-            random_state=42,
-            n_jobs=2,
-            verbosity=0,
-            eval_metric="logloss",
-            tree_method="hist",
+        print(
+            f"\nFeature set: {name}; dim={x_train.shape[1]}; "
+            f"train={len(y_train)}; val={len(y_val)}; test={len(y_test)}; seeds={seeds}"
         )
-        xgb.fit(x_train, y_train)
-        results[name]["xgboost"] = {
-            "params": best_xgb,
-            "val": evaluate(xgb, x_val, y_val),
-            "test": evaluate(xgb, x_test, y_test),
-        }
 
-        best_tree = tune_decision_tree(x_train, y_train, x_val, y_val, config, n_trials)
-        tree = DecisionTreeClassifier(**best_tree, random_state=42)
-        tree.fit(x_train, y_train)
-        results[name]["decision_tree"] = {
-            "params": best_tree,
-            "val": evaluate(tree, x_val, y_val),
-            "test": evaluate(tree, x_test, y_test),
-            "tree_text": export_text(tree, feature_names=columns, max_depth=4)[:4000],
+        tuning_seed = seeds[0]
+        best_xgb = tune_xgboost(
+            x_train, y_train, x_val, y_val, config, n_trials, seed=tuning_seed
+        )
+        best_tree = tune_decision_tree(
+            x_train, y_train, x_val, y_val, config, n_trials, seed=tuning_seed
+        )
+        classifier_results = {
+            "xgboost": {"params": best_xgb, "runs": {}},
+            "decision_tree": {"params": best_tree, "runs": {}},
+        }
+        prediction_records = [
+            row for row in prediction_records if row.get("feature_set") != name
+        ]
+
+        for seed in seeds:
+            classifiers = {
+                "xgboost": XGBClassifier(
+                    **best_xgb,
+                    objective=xgb_objective(config),
+                    random_state=seed,
+                    n_jobs=2,
+                    verbosity=0,
+                    eval_metric="logloss",
+                    tree_method="hist",
+                ),
+                "decision_tree": DecisionTreeClassifier(
+                    **best_tree,
+                    random_state=seed,
+                ),
+            }
+            for classifier_name, model in classifiers.items():
+                model.fit(x_train, y_train)
+                split_values = {
+                    "train": (pack["train"], x_train, y_train),
+                    "val": (pack["val"], x_val, y_val),
+                    "test": (pack["test"], x_test, y_test),
+                }
+                split_metrics = {}
+                for split_name, (split_frame, values, truth) in split_values.items():
+                    metrics = evaluate(model, values, truth)
+                    predictions = model.predict(values)
+                    if split_name == "test":
+                        metrics["balanced_accuracy_ci"] = _balanced_accuracy_ci(
+                            truth,
+                            predictions,
+                            samples=bootstrap_samples,
+                            seed=seed,
+                        )
+                    split_metrics[split_name] = metrics
+                    probabilities = (
+                        model.predict_proba(values)
+                        if hasattr(model, "predict_proba")
+                        else None
+                    )
+                    for index, customer_id in enumerate(split_frame["customer_id"]):
+                        record = {
+                            "feature_set": name,
+                            "classifier": classifier_name,
+                            "seed": seed,
+                            "split": split_name,
+                            "customer_id": int(customer_id),
+                            "label": int(truth[index]),
+                            "prediction": int(predictions[index]),
+                        }
+                        if probabilities is not None:
+                            record.update({
+                                f"probability_{int(class_id)}": float(
+                                    probabilities[index, probability_index]
+                                )
+                                for probability_index, class_id in enumerate(model.classes_)
+                            })
+                        prediction_records.append(record)
+                classifier_results[classifier_name]["runs"][str(seed)] = {
+                    "val": split_metrics["val"],
+                    "test": split_metrics["test"],
+                }
+
+        for classifier_name, classifier_result in classifier_results.items():
+            runs = classifier_result["runs"]
+            primary = runs[str(seeds[0])]
+            classifier_result["val"] = primary["val"]
+            classifier_result["test"] = primary["test"]
+            classifier_result["summary"] = {
+                "val": _seed_metric_summary(runs, "val"),
+                "test": _seed_metric_summary(runs, "test"),
+            }
+        tree_for_text = DecisionTreeClassifier(**best_tree, random_state=seeds[0])
+        tree_for_text.fit(x_train, y_train)
+        classifier_results["decision_tree"]["tree_text"] = export_text(
+            tree_for_text,
+            feature_names=columns,
+            max_depth=4,
+        )[:4000]
+        results[name] = {
+            "artifact_signature": signature,
+            "seeds": seeds,
+            **classifier_results,
         }
         save_results()
 
         del feature_sets, pack, x_train, y_train, x_val, y_val, x_test, y_test
         gc.collect()
+
+
 def ml_artifact_signature(config: dict, feature_set: str) -> str:
     """Identify every source that can change an ML result.
 
@@ -422,7 +730,9 @@ def ml_artifact_signature(config: dict, feature_set: str) -> str:
     """
     source_paths = list(config["dataset"]["splits"].values())
     if feature_set in {"cot", "concat"}:
-        out_dir = Path(config["output"]["base_dir"])
+        out_dir = Path(config.get("input", {}).get(
+            "cot_features_base_dir", config["output"]["base_dir"]
+        ))
         source_paths.extend(
             out_dir / f"cot_features_{split}.parquet"
             for split in ("train", "val", "test")
@@ -431,6 +741,8 @@ def ml_artifact_signature(config: dict, feature_set: str) -> str:
         "dataset": config.get("dataset", {}),
         "pipeline": config.get("pipeline", {}),
         "optuna": config.get("optuna", {}),
+        "evaluation": config.get("evaluation", {}),
+        "input": config.get("input", {}),
         "experiment": config.get("experiment", {}),
         "feature_set": feature_set,
     }

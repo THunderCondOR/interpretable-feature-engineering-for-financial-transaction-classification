@@ -30,6 +30,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.utils.async_api import batched_query
+from src.experiments.artifacts import fingerprint
+
+
+GROUNDING_PROTOCOL_VERSION = 2
 
 
 SYSTEM_PROMPT = """You are an auditor for claim-level grounding in a financial transaction study.
@@ -64,7 +68,10 @@ def load_existing(path: Path) -> dict[str, dict[str, Any]]:
         return {}
     existing = {}
     for record in read_jsonl(path):
-        existing[str(record["sample_id"])] = record
+        sample_id = str(record["sample_id"])
+        if sample_id in existing:
+            raise ValueError(f"Duplicate grounding result sample_id: {sample_id}")
+        existing[sample_id] = record
     return existing
 
 
@@ -86,6 +93,17 @@ Return JSON only."""
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
+
+
+def judgment_signature(record: dict[str, Any], judge_signature: str) -> str:
+    """Bind reuse to the complete rendered evidence, claim and protocol."""
+    return fingerprint({
+        "protocol_version": GROUNDING_PROTOCOL_VERSION,
+        "judge_signature": judge_signature,
+        "evidence_hash": record.get("evidence_hash"),
+        "claim": record.get("claim"),
+        "dialogue": make_dialogue(record),
+    })
 
 
 def extract_content(result: dict[str, Any]) -> str:
@@ -140,9 +158,11 @@ def normalize_verdict(value: Any) -> str:
 
 def write_records(path: Path, records: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as file:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with open(temporary, "w", encoding="utf-8") as file:
         for record in records:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    temporary.replace(path)
 
 
 async def main_async() -> None:
@@ -159,6 +179,7 @@ async def main_async() -> None:
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--source-run-names", nargs="+")
     parser.add_argument("--execute-api", action="store_true")
     parser.add_argument("--until-complete", action="store_true")
     args = parser.parse_args()
@@ -173,9 +194,31 @@ async def main_async() -> None:
         raise RuntimeError("Missing API key. Pass --api-key or --api-key-env.")
 
     samples = read_jsonl(args.input)
+    if args.source_run_names:
+        allowed_sources = set(args.source_run_names)
+        samples = [row for row in samples if row.get("run_name") in allowed_sources]
     if args.limit and args.limit > 0:
         samples = samples[: args.limit]
-    existing = load_existing(args.output)
+    judge_signature = hashlib.sha256(json.dumps({
+        "protocol_version": GROUNDING_PROTOCOL_VERSION,
+        "system_prompt": SYSTEM_PROMPT,
+        "judge": args.judge_name,
+        "model": args.model,
+        "temperature": args.temperature,
+        "max_tokens": args.max_tokens,
+    }, sort_keys=True).encode()).hexdigest()
+    loaded_existing = load_existing(args.output)
+    sample_by_id = {str(sample["sample_id"]): sample for sample in samples}
+    if len(sample_by_id) != len(samples):
+        raise ValueError("Duplicate grounding input sample_id")
+    existing = {
+        sample_id: record
+        for sample_id, record in loaded_existing.items()
+        if record.get("judge_signature") == judge_signature
+        and sample_id in sample_by_id
+        and record.get("judgment_signature")
+        == judgment_signature(sample_by_id[sample_id], judge_signature)
+    }
     pending = [record for record in samples if str(record["sample_id"]) not in existing]
     print(f"judge={args.judge_name} total={len(samples)} existing={len(existing)} pending={len(pending)}")
     if not pending:
@@ -205,8 +248,12 @@ async def main_async() -> None:
         "until_complete": True,
         "request_keys": [str(record["sample_id"]) for record in pending],
         "generation_signature": hashlib.sha256(
-            json.dumps({"judge": args.judge_name, "model": args.model,
-                "samples": [record["sample_id"] for record in pending]}, sort_keys=True).encode()
+            json.dumps({
+                "judge_signature": judge_signature,
+                "requests": [
+                    judgment_signature(record, judge_signature) for record in pending
+                ],
+            }, sort_keys=True).encode()
         ).hexdigest(),
         "scheduler_state_dir": str(args.output.parent / ".scheduler" / args.output.stem),
         "events_path": str(args.output.parent / ".scheduler" / f"{args.output.stem}.events.jsonl"),
@@ -226,6 +273,9 @@ async def main_async() -> None:
                     **sample,
                     "judge_name": args.judge_name,
                     "judge_model": args.model,
+                    "judge_signature": judge_signature,
+                    "grounding_protocol_version": GROUNDING_PROTOCOL_VERSION,
+                    "judgment_signature": judgment_signature(sample, judge_signature),
                     "verdict": verdict,
                     "confidence": parsed.get("confidence") if parsed else None,
                     "evidence": parsed.get("evidence") if parsed else "",

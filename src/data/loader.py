@@ -8,7 +8,9 @@ All downstream code (aggregator, prompt_builder, lora_trainer) works
 exclusively with these column names — dataset differences are isolated here.
 """
 
+import json
 import os
+from pathlib import Path
 import pandas as pd
 import numpy as np
 
@@ -27,6 +29,19 @@ def load_dataset(config: dict, split: str = "train") -> pd.DataFrame:
     """
     path = config["dataset"]["splits"][split]
     df = pd.read_csv(path)
+
+    client_filter = config["dataset"].get("client_ids_by_split", {}).get(split)
+    if client_filter is not None:
+        if isinstance(client_filter, (str, os.PathLike)):
+            with open(Path(client_filter), encoding="utf-8") as file:
+                client_filter = json.load(file)
+        allowed = set(client_filter)
+        source_customer_id = config["dataset"]["columns"]["customer_id"]
+        if source_customer_id not in df.columns:
+            raise ValueError(f"Cannot apply client filter: missing {source_customer_id}")
+        df = df[df[source_customer_id].isin(allowed)].copy()
+        if df.empty and allowed:
+            raise ValueError(f"Client filter for split={split} selected no rows")
 
     col_map = config["dataset"]["columns"]
     rename = {

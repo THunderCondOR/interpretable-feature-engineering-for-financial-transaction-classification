@@ -1,9 +1,12 @@
 """Self-contained interactive report and publication exports."""
 from __future__ import annotations
 import json
+import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
+
+from src.experiments.artifacts import fingerprint
 
 TABS = ["Run status", "Metrics", "Article/legacy deltas", "Cluster map", "Cluster table", "Cross-model matching", "Stability", "Classifier/tree explorer", "Fidelity", "Grounding", "Provenance"]
 
@@ -28,20 +31,287 @@ def synthetic_bundle(seed=17):
     return {"synthetic":True,"claims":claims,"clusters":clusters,"metrics":metrics,"stability":{"axes":["generation_seed","clustering_seed","threshold","fixed_k","coverage"],"ari_mean":.78,"nmi_mean":.82},"grounding":{"supported":.72,"partially_supported":.16,"unsupported":.07,"not_verifiable":.05,"kappa":.67},"fidelity":{"hard_agreement":.81,"probability_mae":.09,"jensen_shannon":.035},"cross_model":{"mutual_nearest_share":.58,"weighted_cosine":.79,"unmatched_mass":.14},"provenance":{"mode":"synthetic fixture","note":"No empirical result is represented."}}
 
 
+def _empty_bundle(run_id: str, warning: str | None = None):
+    provenance = {"run_id": run_id, "mode": "empirical artifacts"}
+    if warning:
+        provenance["warning"] = warning
+    return {
+        "synthetic": False,
+        "claims": [],
+        "clusters": [],
+        "metrics": [],
+        "stability": {},
+        "grounding": {},
+        "fidelity": {},
+        "cross_model": {},
+        "tree_paths": [],
+        "provenance": provenance,
+    }
+
+
+def _cluster_artifacts(root: Path, run_id: str, dataset: str, model: str):
+    path = root / "cot_clusters.json"
+    if not path.exists():
+        return [], []
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("cluster_meta", []) if isinstance(payload, dict) else payload
+    centroids_path = root / "cot_cluster_model.npz"
+    coordinates = np.zeros((len(rows), 2), dtype=float)
+    if centroids_path.exists() and rows:
+        centroids = np.load(centroids_path)["centroids"]
+        if len(centroids) == len(rows):
+            if min(centroids.shape) >= 2:
+                from sklearn.decomposition import PCA
+                coordinates = PCA(n_components=2, random_state=17).fit_transform(centroids)
+            elif centroids.shape[1] == 1:
+                coordinates[:, 0] = centroids[:, 0]
+    palette = ["#58b368", "#f39c35", "#4f86c6", "#af7ac5", "#ef6f6c"]
+    clusters, claims = [], []
+    total_clients = max(sum(int(row.get("unique_clients", 0)) for row in rows), 1)
+    for index, row in enumerate(rows):
+        source_cluster_id = str(row.get("cluster_id") or row.get("feature") or f"cluster_{index:04d}")
+        cluster_id = f"{run_id}::{dataset}::{model}::{source_cluster_id}"
+        medoid = str(row.get("medoid") or (row.get("examples") or [source_cluster_id])[0])
+        clients = int(row.get("unique_clients", row.get("size", 0)))
+        color = palette[index % len(palette)]
+        clusters.append({
+            "cluster_id": cluster_id,
+            "source_cluster_id": source_cluster_id,
+            "run_id": run_id,
+            "macro_theme": str(row.get("macro_theme", "Unassigned theme")),
+            "color": color,
+            "medoid": medoid,
+            "occurrences": int(row.get("occurrences", row.get("size", 0))),
+            "unique_clients": clients,
+            "compactness": float(row.get("compactness_mean_distance", row.get("compactness", 0.0))),
+            "prevalence": float(row.get("prevalence", clients / total_clients)),
+            "lift": float(row.get("lift", 0.0)),
+            "cross_model_match": str(row.get("cross_model_match", "")),
+            "match_cosine": float(row.get("match_cosine", 0.0)),
+            "tree_nodes": list(row.get("tree_nodes", [])),
+            "importance": float(row.get("importance", 0.0)),
+            "dataset": dataset,
+            "model": model,
+        })
+        claims.append({
+            "claim_id": f"{dataset}:{model}:{cluster_id}",
+            "x": float(coordinates[index, 0]),
+            "y": float(coordinates[index, 1]),
+            "cluster_id": cluster_id,
+            "macro_theme": str(row.get("macro_theme", "Unassigned theme")),
+            "color": color,
+            "dataset": dataset,
+            "model": model,
+            "variant": "empirical",
+            "seed": 0,
+            "text": medoid,
+            "customer_id": -1,
+            "label": -1,
+            "distance": float(row.get("compactness_mean_distance", 0.0)),
+            "point_kind": "train_cluster_centroid",
+        })
+    return clusters, claims
+
+
+def _metric_artifacts(root: Path, dataset: str, model: str):
+    rows = []
+    ml_path = root / "ml_metrics.json"
+    if ml_path.exists():
+        payload = json.loads(ml_path.read_text(encoding="utf-8"))
+        for experiment, result in payload.items():
+            if not isinstance(result, dict):
+                continue
+            for classifier in ("xgboost", "decision_tree"):
+                classifier_result = result.get(classifier, {})
+                metrics = classifier_result.get("test", {})
+                if metrics:
+                    seeded = classifier_result.get("summary", {}).get("test", {}).get(
+                        "balanced_accuracy", {}
+                    )
+                    rows.append({
+                        "dataset": dataset,
+                        "model": model,
+                        "experiment": f"{experiment}/{classifier}",
+                        "balanced_accuracy": seeded.get("mean", metrics.get("balanced_accuracy")),
+                        "sd": seeded.get("sd"),
+                        "n_seeds": len(classifier_result.get("runs", {})) or None,
+                        "article_delta": None,
+                    })
+    for path in root.glob("llm_metrics_*.json"):
+        metrics = json.loads(path.read_text(encoding="utf-8"))
+        if metrics.get("balanced_accuracy") is not None:
+            rows.append({
+                "dataset": dataset,
+                "model": model,
+                "experiment": f"llm_direct/{metrics.get('split', path.stem)}",
+                "balanced_accuracy": metrics["balanced_accuracy"],
+                "sd": None,
+                "article_delta": None,
+            })
+    return rows
+
+
 def load_bundle(results_root: Path, run_id: str, *, allow_missing=False, strict=False):
-    manifests = list(results_root.glob("**/manifest.json"))
-    if not manifests:
+    if allow_missing and strict:
+        raise ValueError("strict and allow_missing are mutually exclusive")
+    manifests = sorted({
+        *results_root.glob("**/manifest.json"),
+        *results_root.glob("**/run_manifest.json"),
+    })
+    selected = []
+    for path in manifests:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        manifest_run_id = payload.get("run_id") or payload.get("experiment", {}).get("run_id")
+        if manifest_run_id == run_id:
+            selected.append((path, payload))
+    if not selected:
         if not allow_missing:
-            raise FileNotFoundError(f"No manifests below {results_root}")
-        bundle=synthetic_bundle(); bundle["synthetic"]=False
-        bundle["provenance"]={"run_id":run_id,"warning":"No manifests found; placeholders shown."}
-        return bundle
-    loaded=[json.loads(path.read_text(encoding="utf-8")) for path in manifests]
-    mismatched=[row for row in loaded if not (row.get("experiment",{}).get("run_id",run_id)==run_id)]
-    if strict and mismatched:
-        raise ValueError(f"{len(mismatched)} incompatible manifests")
-    bundle=synthetic_bundle(); bundle["synthetic"]=False
-    bundle["provenance"]={"run_id":run_id,"manifests":[str(path) for path in manifests],"warning":"Placeholders remain for missing artifacts."}
+            raise FileNotFoundError(f"No manifests for run_id={run_id} below {results_root}")
+        return _empty_bundle(run_id, "No compatible manifests found; no numerical placeholders were fabricated.")
+    stability_rows = []
+    fidelity_payloads = []
+    tree_paths = []
+
+    if strict:
+        invalid = []
+        for path, payload in selected:
+            identity = {
+                "manifest_version": payload.get("manifest_version"),
+                "config_sha256": payload.get("config_sha256"),
+                "dataset_files": payload.get("dataset_files"),
+                "prompt_files": payload.get("prompt_files"),
+                "git_revision": payload.get("git_revision"),
+                "packages": payload.get("runtime", {}).get("packages"),
+            }
+            if (
+                payload.get("manifest_version", 0) < 2
+                or payload.get("manifest_sha256") != fingerprint(identity)
+            ):
+                invalid.append(str(path))
+        if invalid:
+            raise ValueError(f"Incompatible manifests: {invalid}")
+
+    bundle = _empty_bundle(run_id)
+    artifact_roots = []
+    for path, manifest in selected:
+        root = path.parent
+        artifact_roots.append(str(root))
+        config = manifest.get("config", {})
+        dataset = str(config.get("dataset", {}).get("name", "unknown"))
+        model = str(
+            manifest.get("model_id")
+            or config.get("experiment", {}).get("model_slug")
+            or config.get("llm", {}).get("default_model", "unknown")
+        )
+        clusters, claims = _cluster_artifacts(root, run_id, dataset, model)
+        bundle["clusters"].extend(clusters)
+        bundle["claims"].extend(claims)
+        bundle["metrics"].extend(_metric_artifacts(root, dataset, model))
+        stability_path = root / "cluster_stability" / "summary.json"
+        if stability_path.exists():
+            payload = json.loads(stability_path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                stability_rows.extend(
+                    {"dataset": dataset, "model": model, **row}
+                    for row in payload
+                    if isinstance(row, dict)
+                )
+        for fidelity_path in root.glob("**/fidelity_metrics.json"):
+            fidelity_payloads.append({
+                "dataset": dataset,
+                "model": model,
+                "path": str(fidelity_path),
+                "payload": json.loads(fidelity_path.read_text(encoding="utf-8")),
+            })
+        for tree_path in root.glob("**/tree_decision_paths.jsonl"):
+            tree_paths.extend(
+                json.loads(line)
+                for line in tree_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+
+    if stability_rows:
+        groups = []
+        frame = pd.DataFrame(stability_rows)
+        for keys, group in frame.groupby(["dataset", "model", "axis"], dropna=False):
+            item = {"dataset": keys[0], "model": keys[1], "axis": keys[2], "n": len(group)}
+            for output, column in (("ari", "train_assignment_ari_vs_reference"), ("nmi", "train_assignment_nmi_vs_reference")):
+                values = pd.to_numeric(group[column], errors="coerce").dropna() if column in group else pd.Series(dtype=float)
+                item[f"{output}_mean"] = float(values.mean()) if len(values) else None
+                item[f"{output}_sd"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+            groups.append(item)
+        bundle["stability"] = {"groups": groups, "rows": stability_rows}
+    bundle["tree_paths"] = tree_paths
+    if fidelity_payloads:
+        groups = []
+        for artifact in fidelity_payloads:
+            for classifier, result in artifact["payload"].get("results", {}).items():
+                metrics = result.get("test", {}) if isinstance(result, dict) else {}
+                if metrics:
+                    groups.append({"dataset": artifact["dataset"], "model": artifact["model"], "classifier": classifier, "artifact": artifact["path"], **{key: value for key, value in metrics.items() if isinstance(value, (int, float))}})
+        bundle["fidelity"] = {"groups": groups}
+
+    grounding_path = results_root / "grounding" / run_id / "grounding.metrics.json"
+    if grounding_path.exists():
+        grounding_cells = json.loads(grounding_path.read_text(encoding="utf-8"))
+        denominator = sum(
+            int(cell.get("n_items", 0)) for cell in grounding_cells.values()
+        )
+        bundle["grounding"] = {
+            verdict: (
+                sum(
+                    int(cell.get("n_items", 0))
+                    * float(cell.get("verdicts", {}).get(verdict, {}).get("share", 0.0))
+                    for cell in grounding_cells.values()
+                )
+                / denominator
+            )
+            for verdict in (
+                "supported",
+                "partially_supported",
+                "unsupported",
+                "not_verifiable",
+                "parse_error",
+                "disagreement",
+            )
+            if denominator
+        }
+
+    cross_path = results_root / "analysis" / run_id / "cross_model_clusters.json"
+    if cross_path.exists():
+        cross_payload = json.loads(cross_path.read_text(encoding="utf-8"))
+        summaries = [
+            row.get("summary", {})
+            for row in cross_payload.get("details", {}).values()
+            if isinstance(row, dict)
+        ]
+        keys = (
+            "one_to_one_mean_cosine",
+            "mutual_nearest_share_left",
+            "size_weighted_left_best_cosine",
+            "size_weighted_right_best_cosine",
+            "unmatched_left_mass",
+            "unmatched_right_mass",
+        )
+        bundle["cross_model"] = {
+            key: float(np.mean([
+                row[key] for row in summaries if row.get(key) is not None
+            ]))
+            for key in keys
+            if any(row.get(key) is not None for row in summaries)
+        }
+
+    missing = []
+    for name in ("clusters", "claims", "metrics"):
+        if not bundle[name]:
+            missing.append(name)
+    bundle["provenance"].update({
+        "manifests": [str(path) for path, _ in selected],
+        "artifact_roots": artifact_roots,
+        "missing_sections": missing,
+    })
+    if strict and missing:
+        raise FileNotFoundError(f"Strict report is missing artifacts: {missing}")
     return bundle
 
 
@@ -57,9 +327,21 @@ def export_publication_map(bundle, output_prefix: Path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from scipy.spatial import ConvexHull
+    from scipy.spatial import ConvexHull, QhullError
     claims,clusters=pd.DataFrame(bundle["claims"]),pd.DataFrame(bundle["clusters"])
     fig,(ax,legend)=plt.subplots(1,2,figsize=(14,5),gridspec_kw={"width_ratios":[3,1]})
+    if claims.empty or clusters.empty:
+        ax.axis("off")
+        legend.axis("off")
+        ax.text(
+            .5, .5, "Cluster artifacts are not available yet.",
+            ha="center", va="center", transform=ax.transAxes, fontsize=14,
+        )
+        output_prefix.parent.mkdir(parents=True,exist_ok=True)
+        for suffix in ("svg","pdf","png"):
+            fig.savefig(output_prefix.with_suffix(f".{suffix}"),dpi=300,bbox_inches="tight")
+        plt.close(fig)
+        return
     fig.patch.set_facecolor("white")
     for cluster_id,group in claims.groupby("cluster_id"):
         meta=clusters[clusters.cluster_id==cluster_id].iloc[0]
@@ -69,8 +351,12 @@ def export_publication_map(bundle, output_prefix: Path):
             continue
         points=group[["x","y"]].to_numpy()
         if len(points)>=3:
-            hull=ConvexHull(points); polygon=points[hull.vertices]
-            ax.plot(*np.vstack([polygon,polygon[0]]).T,color="#23314d",lw=1.2,alpha=.7)
+            try:
+                hull=ConvexHull(points); polygon=points[hull.vertices]
+            except QhullError:
+                polygon=None
+            if polygon is not None:
+                ax.plot(*np.vstack([polygon,polygon[0]]).T,color="#23314d",lw=1.2,alpha=.7)
             ax.text(points[:,0].mean(),points[:,1].max()+.3,theme,ha="center",fontsize=9,bbox=dict(fc="white",ec="none",alpha=.8))
     ax.set(xticks=[],yticks=[]); ax.spines[:].set_visible(False); ax.set_title("Atomic claim clusters and macro-themes",loc="left",weight="bold")
     legend.axis("off"); legend.set_title("Representative claims",loc="left",fontweight="bold")
@@ -85,10 +371,33 @@ def export_publication_map(bundle, output_prefix: Path):
 
 
 def _plotly_source():
-    candidates=list(Path("/home/chaichuk/miniconda3/pkgs").glob("plotly-*/lib/python*/site-packages/plotly/package_data/plotly.min.js"))
-    if not candidates:
-        raise FileNotFoundError("Local plotly.min.js not found; install Plotly or keep the Conda package cache")
-    return sorted(candidates)[-1].read_text(encoding="utf-8")
+    source = None
+    try:
+        from plotly.offline import get_plotlyjs
+    except ImportError:
+        # Some lean environments cannot import Plotly while the local conda
+        # package cache still contains the audited offline browser bundle.
+        prefix = Path(sys.prefix).resolve()
+        package_roots = [
+            prefix / "pkgs",
+            prefix.parent.parent / "pkgs",
+            Path.home() / "miniconda3" / "pkgs",
+            Path.home() / "anaconda3" / "pkgs",
+        ]
+        candidates = [
+            candidate
+            for root in package_roots
+            for candidate in root.glob("plotly-*/lib/python*/site-packages/plotly/package_data/plotly.min.js")
+        ]
+        if candidates:
+            source = sorted(candidates)[-1].read_text(encoding="utf-8")
+    else:
+        source = get_plotlyjs()
+    if not source:
+        raise RuntimeError("A local Plotly browser bundle is required for a self-contained report")
+    # Plotly embeds a default topojson CDN URL even when no geo trace is used.
+    # Remove it so the generated document contains no network endpoint at all.
+    return source.replace("https://cdn.plot.ly/", "")
 
 
 REPORT_TEMPLATE=r'''<!doctype html><html><head><meta charset="utf-8"><title>{{ run_id }} analysis</title><style>
@@ -101,17 +410,17 @@ REPORT_TEMPLATE=r'''<!doctype html><html><head><meta charset="utf-8"><title>{{ r
 <section id="t4" class="tab"><div class="card"><h2>Cluster catalogue</h2><table><thead><tr><th>ID</th><th>Theme</th><th>Medoid</th><th>Clients</th><th>Compactness</th><th>Lift</th><th>Cross-model</th></tr></thead><tbody id="clusterRows"></tbody></table></div></section>
 <section id="t5" class="tab"><div class="card"><h2>Cross-model matching</h2><div id="crossPlot"></div></div></section>
 <section id="t6" class="tab"><div class="card"><h2>Stability</h2><div id="stabilityPlot"></div><p>Axes remain separate: generation seed, clustering seed, threshold, fixed K, and coverage.</p></div></section>
-<section id="t7" class="tab"><div class="grid"><div class="card"><h2>Exact shallow-tree path</h2><div class="tree"><div class="node">cluster Mobility present?</div><div class="arrow">→</div><div class="node">Digital services absent?</div><div class="arrow">→</div><div class="node">leaf p=0.74 · n=128</div></div></div><div class="card"><h2>Feature links</h2><div id="importancePlot"></div></div></div></section>
+<section id="t7" class="tab"><div class="grid"><div class="card"><h2>Exact shallow-tree path</h2><div id="treePath" class="warn">No empirical tree path is available for this bundle.</div></div><div class="card"><h2>Feature links</h2><div id="importancePlot"></div></div></div></section>
 <section id="t8" class="tab"><div class="card"><h2>Teacher-surrogate fidelity</h2><div id="fidelityPlot"></div><p>These are surrogate-fidelity measurements, not causal explanations.</p></div></section>
 <section id="t9" class="tab"><div class="card"><h2>Claim grounding</h2><div id="groundingPlot"></div><p>Two-judge disagreements are not converted to a fabricated majority.</p></div></section>
 <section id="t10" class="tab"><div class="card"><h2>Artifact provenance</h2><pre id="provenance"></pre></div></section>
 <script>const DATA={{ data_json|safe }};document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('nav button,.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById(b.dataset.tab).classList.add('active');window.dispatchEvent(new Event('resize'))});
-const unique=k=>[...new Set(DATA.claims.map(x=>x[k]))].sort();for(const [id,key] of [['dataset','dataset'],['model','model'],['seed','seed']]){const s=document.getElementById(id);unique(key).forEach(v=>s.insertAdjacentHTML('beforeend',`<option>${v}</option>`))}document.getElementById('clusterCount').textContent=DATA.clusters.length;document.getElementById('claimCount').textContent=DATA.claims.length;
-function clusterInfo(id){const c=DATA.clusters.find(x=>x.cluster_id===id);if(!c)return;document.getElementById('clusterDetail').innerHTML=`<h3>${c.cluster_id}</h3><p><b>Medoid:</b> ${c.medoid}</p><p>Theme: ${c.macro_theme}<br>Clients: ${c.unique_clients}<br>Compactness: ${c.compactness.toFixed(3)}<br>Prevalence: ${(c.prevalence*100).toFixed(1)}%<br>Lift: ${c.lift.toFixed(2)}<br>Matched: ${c.cross_model_match} (${c.match_cosine.toFixed(2)})<br>Tree nodes: ${c.tree_nodes.join(', ')}</p>`}
+const unique=k=>[...new Set(DATA.claims.map(x=>x[k]))].sort();for(const [id,key] of [['dataset','dataset'],['model','model'],['seed','seed']]){const s=document.getElementById(id);unique(key).forEach(v=>{const option=document.createElement('option');option.value=String(v);option.textContent=String(v);s.appendChild(option)})}document.getElementById('clusterCount').textContent=DATA.clusters.length;document.getElementById('claimCount').textContent=DATA.claims.length;
+function appendText(parent,tag,text){const node=document.createElement(tag);node.textContent=String(text);parent.appendChild(node);return node}function clusterInfo(id){const c=DATA.clusters.find(x=>x.cluster_id===id);if(!c)return;const detail=document.getElementById('clusterDetail');detail.replaceChildren();appendText(detail,'h3',c.source_cluster_id||c.cluster_id);appendText(detail,'p',`Medoid: ${c.medoid}`);appendText(detail,'p',`Theme: ${c.macro_theme} · Clients: ${c.unique_clients} · Compactness: ${c.compactness.toFixed(3)} · Prevalence: ${(c.prevalence*100).toFixed(1)}% · Lift: ${c.lift.toFixed(2)} · Matched: ${c.cross_model_match} (${c.match_cosine.toFixed(2)}) · Tree nodes: ${c.tree_nodes.join(', ')}`)}
 function drawMap(){const d=document.getElementById('dataset').value,m=document.getElementById('model').value,s=document.getElementById('seed').value,q=document.getElementById('search').value.toLowerCase();const rows=DATA.claims.filter(x=>(!d||x.dataset===d)&&(!m||x.model===m)&&(!s||String(x.seed)===s)&&(!q||x.text.toLowerCase().includes(q)));const traces=[...new Set(rows.map(x=>x.cluster_id))].map(id=>{const r=rows.filter(x=>x.cluster_id===id),c=DATA.clusters.find(x=>x.cluster_id===id);return{x:r.map(x=>x.x),y:r.map(x=>x.y),text:r.map(x=>x.text),customdata:r.map(x=>x.cluster_id),name:id,mode:'markers',type:'scattergl',marker:{size:6+80*c.prevalence,color:c.color,opacity:.72}}});Plotly.react('clusterMap',traces,{height:590,hovermode:'closest',xaxis:{visible:false},yaxis:{visible:false},legend:{orientation:'h'}});document.getElementById('clusterMap').on('plotly_click',e=>clusterInfo(e.points[0].customdata))}['dataset','model','seed','search'].forEach(id=>document.getElementById(id).oninput=drawMap);drawMap();
-document.getElementById('clusterRows').innerHTML=DATA.clusters.map(c=>`<tr data-id="${c.cluster_id}"><td>${c.cluster_id}</td><td>${c.macro_theme}</td><td>${c.medoid}</td><td>${c.unique_clients}</td><td>${c.compactness.toFixed(3)}</td><td>${c.lift.toFixed(2)}</td><td>${c.cross_model_match}</td></tr>`).join('');document.querySelectorAll('#clusterRows tr').forEach(r=>r.onclick=()=>{clusterInfo(r.dataset.id);document.querySelector('[data-tab="t3"]').click()});
+const clusterRows=document.getElementById('clusterRows');DATA.clusters.forEach(c=>{const row=document.createElement('tr');row.dataset.id=c.cluster_id;[c.source_cluster_id||c.cluster_id,c.macro_theme,c.medoid,c.unique_clients,c.compactness.toFixed(3),c.lift.toFixed(2),c.cross_model_match].forEach(value=>appendText(row,'td',value));row.onclick=()=>{clusterInfo(c.cluster_id);document.querySelector('[data-tab="t3"]').click()};clusterRows.appendChild(row)});
 const metricNames=DATA.metrics.map(x=>`${x.dataset}/${x.model}/${x.experiment}`);Plotly.newPlot('metricsPlot',[{x:metricNames,y:DATA.metrics.map(x=>x.balanced_accuracy),error_y:{type:'data',array:DATA.metrics.map(x=>x.sd)},type:'bar',marker:{color:'#3867d6'}}],{height:500,yaxis:{title:'Balanced accuracy'}});Plotly.newPlot('deltaPlot',[{x:metricNames,y:DATA.metrics.map(x=>x.article_delta),type:'bar',marker:{color:DATA.metrics.map(x=>x.article_delta>=0?'#16a085':'#d9534f')}}],{height:500,yaxis:{title:'Absolute delta'}});
-Plotly.newPlot('crossPlot',[{x:Object.keys(DATA.cross_model),y:Object.values(DATA.cross_model),type:'bar',marker:{color:'#8e6bbf'}}],{height:430});Plotly.newPlot('stabilityPlot',[{x:['ARI','NMI'],y:[DATA.stability.ari_mean,DATA.stability.nmi_mean],type:'bar',marker:{color:['#3867d6','#16a085']}}],{height:430,yaxis:{range:[0,1]}});Plotly.newPlot('importancePlot',[{x:DATA.clusters.slice(0,10).map(x=>x.importance),y:DATA.clusters.slice(0,10).map(x=>x.cluster_id),type:'bar',orientation:'h'}],{height:430});Plotly.newPlot('fidelityPlot',[{x:Object.keys(DATA.fidelity),y:Object.values(DATA.fidelity),type:'bar',marker:{color:'#f2b134'}}],{height:430});Plotly.newPlot('groundingPlot',[{labels:Object.keys(DATA.grounding),values:Object.values(DATA.grounding),type:'pie',hole:.45}],{height:430});document.getElementById('provenance').textContent=JSON.stringify(DATA.provenance,null,2);
+Plotly.newPlot('crossPlot',[{x:Object.keys(DATA.cross_model),y:Object.values(DATA.cross_model),type:'bar',marker:{color:'#8e6bbf'}}],{height:430});const stabilityGroups=DATA.stability.groups||[];const stabilityLabels=stabilityGroups.map(x=>`${x.dataset}/${x.model}/${x.axis}`);Plotly.newPlot('stabilityPlot',stabilityGroups.length?[{name:'ARI',x:stabilityLabels,y:stabilityGroups.map(x=>x.ari_mean),error_y:{type:'data',array:stabilityGroups.map(x=>x.ari_sd)}},{name:'NMI',x:stabilityLabels,y:stabilityGroups.map(x=>x.nmi_mean),error_y:{type:'data',array:stabilityGroups.map(x=>x.nmi_sd)}}]:[{x:['ARI','NMI'],y:[DATA.stability.ari_mean,DATA.stability.nmi_mean],type:'bar'}],{height:430,yaxis:{range:[0,1]},barmode:'group'});Plotly.newPlot('importancePlot',[{x:DATA.clusters.slice(0,10).map(x=>x.importance),y:DATA.clusters.slice(0,10).map(x=>x.cluster_id),type:'bar',orientation:'h'}],{height:430});const fidelityGroups=DATA.fidelity.groups||[];const fidelityLabels=fidelityGroups.map(x=>`${x.dataset}/${x.model}/${x.classifier}`);const fidelityMetric=fidelityGroups.length&&(['hard_agreement','probability_mae','jensen_shannon'].find(k=>fidelityGroups.some(x=>Number.isFinite(x[k]))));Plotly.newPlot('fidelityPlot',fidelityGroups.length?[{x:fidelityLabels,y:fidelityGroups.map(x=>x[fidelityMetric]),type:'bar',name:fidelityMetric,marker:{color:'#f2b134'}}]:[{x:Object.keys(DATA.fidelity),y:Object.values(DATA.fidelity),type:'bar',marker:{color:'#f2b134'}}],{height:430});Plotly.newPlot('groundingPlot',[{labels:Object.keys(DATA.grounding),values:Object.values(DATA.grounding),type:'pie',hole:.45}],{height:430});if(DATA.tree_paths.length){document.getElementById('treePath').textContent=JSON.stringify(DATA.tree_paths[0],null,2)}document.getElementById('provenance').textContent=JSON.stringify(DATA.provenance,null,2);
 </script></body></html>'''
 
 

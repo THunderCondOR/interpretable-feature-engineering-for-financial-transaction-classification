@@ -2,8 +2,13 @@
 from __future__ import annotations
 import argparse
 import json
+import sys
 from pathlib import Path
 import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.reporting.analysis_report import build_report, export_publication_map, load_bundle, portable_bundle, synthetic_bundle
 
@@ -15,8 +20,9 @@ def main():
     parser.add_argument("--output",type=Path,default=Path("reports/reviewer-v2/index.html"))
     parser.add_argument("--demo",action="store_true")
     mode=parser.add_mutually_exclusive_group(); mode.add_argument("--portable",action="store_true"); mode.add_argument("--full",action="store_true")
-    parser.add_argument("--allow-missing",action="store_true")
-    parser.add_argument("--strict",action="store_true")
+    validation=parser.add_mutually_exclusive_group()
+    validation.add_argument("--allow-missing",action="store_true")
+    validation.add_argument("--strict",action="store_true")
     parser.add_argument("--execute",action="store_true")
     args=parser.parse_args()
     if not args.execute:

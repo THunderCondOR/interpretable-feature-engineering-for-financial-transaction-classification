@@ -5,6 +5,7 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 from sklearn.cluster import AgglomerativeClustering
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.metrics.pairwise import cosine_distances
 
@@ -59,6 +60,39 @@ def _normal(values):
     return values / norms
 
 
+def fit_text_embedding_space(texts, model_name, *, embedder: Embedder = embed_texts):
+    """Fit a text representation on train texts and return its frozen state."""
+    if model_name == "tf-idf":
+        transformer = TfidfVectorizer(
+            max_features=384,
+            stop_words=None,
+            lowercase=True,
+        )
+        embeddings = transformer.fit_transform(texts).toarray()
+        signature = fingerprint({
+            "vocabulary": transformer.vocabulary_,
+            "idf": transformer.idf_.tolist(),
+        })
+        return _normal(embeddings), transformer, signature
+    embeddings = _normal(embedder(texts, model_name=model_name))
+    return embeddings, None, fingerprint({"model_name": model_name})
+
+
+def transform_text_embedding_space(
+    texts,
+    model_name,
+    transformer=None,
+    *,
+    embedder: Embedder = embed_texts,
+):
+    """Transform with the train-fitted representation."""
+    if model_name == "tf-idf":
+        if transformer is None:
+            raise ValueError("Frozen TF-IDF transformer is required for split assignment")
+        return _normal(transformer.transform(texts).toarray())
+    return _normal(embedder(texts, model_name=model_name))
+
+
 def _settings(config):
     legacy, explicit = config.get("pipeline", {}), config.get("clustering", {})
     return {
@@ -96,7 +130,11 @@ def fit_semantic_space(config, train_records, *, embedder: Embedder = embed_text
     model_name = config.get("clustering", {}).get(
         "embedding_model", config.get("pipeline", {}).get("embedding_model", "tf-idf")
     )
-    embeddings = _normal(embedder(texts, model_name=model_name))
+    embeddings, embedding_transformer, embedding_state_signature = fit_text_embedding_space(
+        texts,
+        model_name,
+        embedder=embedder,
+    )
     settings = _settings(config)
     raw_ids = _cluster(embeddings, settings)
     centroids, metadata = [], []
@@ -131,7 +169,14 @@ def fit_semantic_space(config, train_records, *, embedder: Embedder = embed_text
         "centroids": np.vstack(centroids),
         "feature_names": [row["feature"] for row in metadata],
         "cluster_meta": metadata, "embedding_model": model_name, "settings": settings,
-        "formation_signature": fingerprint({"texts": texts, "model": model_name, "settings": settings}),
+        "embedding_transformer": embedding_transformer,
+        "embedding_state_signature": embedding_state_signature,
+        "formation_signature": fingerprint({
+            "texts": texts,
+            "model": model_name,
+            "embedding_state_signature": embedding_state_signature,
+            "settings": settings,
+        }),
     }
     model.update(fit_supervised_selection(config, transform_semantic_space(config, train_records, model, embedder=embedder)))
     return model
@@ -146,7 +191,12 @@ def transform_semantic_space(config, records, model, *, embedder: Embedder = emb
         for row in records
     }
     if texts:
-        embeddings = _normal(embedder(texts, model_name=model["embedding_model"]))
+        embeddings = transform_text_embedding_space(
+            texts,
+            model["embedding_model"],
+            model.get("embedding_transformer"),
+            embedder=embedder,
+        )
         distances = cosine_distances(embeddings, model["centroids"])
         nearest = distances.argmin(axis=1)
         accepted = distances.min(axis=1) <= model["settings"]["max_assign_distance"]

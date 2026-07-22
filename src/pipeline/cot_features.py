@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 
 from src.pipeline.semantic_features import (
@@ -48,7 +49,7 @@ def transform_split(config, records, model):
 def _json_model(model):
     return {
         key: value for key, value in model.items()
-        if key != "centroids"
+        if key not in {"centroids", "embedding_transformer"}
     }
 
 
@@ -63,6 +64,8 @@ def build_cot_features(config: dict) -> None:
     meta_path.write_text(json.dumps(_json_model(model), ensure_ascii=False, indent=2), encoding="utf-8")
     model_path = out_dir / "cot_cluster_model.npz"
     np.savez_compressed(model_path, centroids=model["centroids"])
+    if model.get("embedding_transformer") is not None:
+        joblib.dump(model["embedding_transformer"], out_dir / "cot_embedding_model.joblib")
     print(f"Saved frozen train semantic space -> {meta_path}, {model_path}")
 
     for split in SPLITS:

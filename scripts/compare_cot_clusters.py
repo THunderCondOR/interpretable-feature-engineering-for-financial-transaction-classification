@@ -26,7 +26,12 @@ from src.utils.cluster import embed_texts
 
 def load_clusters(path: Path) -> list[dict[str, Any]]:
     with open(path, encoding="utf-8") as file:
-        return json.load(file)
+        payload = json.load(file)
+    if isinstance(payload, dict):
+        payload = payload.get("cluster_meta", [])
+    if not isinstance(payload, list) or any(not isinstance(row, dict) for row in payload):
+        raise ValueError(f"Unsupported cluster artifact schema: {path}")
+    return payload
 
 
 def cluster_text(cluster: dict[str, Any], max_examples: int) -> str:
@@ -43,7 +48,19 @@ def summarize_matches(
     sim: np.ndarray,
     top_k: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    left_best = sim.max(axis=1) if len(left) and len(right) else np.array([])
+    if not left or not right:
+        return {
+            "n_left_clusters": len(left),
+            "n_right_clusters": len(right),
+            "mean_left_to_right_best_cosine": None,
+            "mean_right_to_left_best_cosine": None,
+            "one_to_one_mean_cosine": None,
+            "mutual_nearest_pairs": 0,
+            "mutual_nearest_share_left": 0.0,
+            "unmatched_left_mass": 1.0 if left else 0.0,
+            "unmatched_right_mass": 1.0 if right else 0.0,
+        }, []
+    left_best = sim.max(axis=1)
     right_best = sim.max(axis=0) if len(left) and len(right) else np.array([])
     weights_left = [cluster.get("occurrences", cluster.get("size", 1)) for cluster in left]
     weights_right = [cluster.get("occurrences", cluster.get("size", 1)) for cluster in right]
@@ -105,7 +122,18 @@ def main() -> None:
     parser.add_argument("--max-examples", type=int, default=10)
     parser.add_argument("--top-k", type=int, default=25)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
+
+    print(json.dumps({
+        "mode": "execute" if args.execute else "dry-run",
+        "datasets": args.datasets,
+        "left_root": str(args.left_root),
+        "right_root": str(args.right_root),
+        "output": str(args.output),
+    }, indent=2))
+    if not args.execute:
+        return
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     rows = []

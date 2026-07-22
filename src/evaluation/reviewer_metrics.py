@@ -72,9 +72,20 @@ def grounding_summary(records: pd.DataFrame, *, bootstrap_samples=1000, seed=17)
     """Return item verdicts, judge agreement, and client-level bootstrap CIs."""
     items = []
     for sample_id, group in records.groupby("sample_id", sort=False):
-        verdict, majority = adjudicate_grounding(group["verdict"].fillna("parse_error").tolist())
+        raw_verdicts = [
+            value if value in GROUNDING_VERDICTS else "parse_error"
+            for value in group["verdict"].fillna("parse_error").tolist()
+        ]
+        verdict, majority = adjudicate_grounding(raw_verdicts)
         first = group.iloc[0]
-        items.append({"sample_id": sample_id, "customer_id": first["customer_id"], "verdict": verdict, "has_majority": majority})
+        items.append({
+            "sample_id": sample_id,
+            "customer_id": first["customer_id"],
+            "verdict": verdict,
+            "has_majority": majority,
+            "strict_consensus": len(set(raw_verdicts)) == 1,
+            "has_disagreement": len(set(raw_verdicts)) > 1,
+        })
     item_frame = pd.DataFrame(items)
     judges = records["judge_name"].dropna().unique().tolist()
     kappa = None
@@ -93,8 +104,8 @@ def grounding_summary(records: pd.DataFrame, *, bootstrap_samples=1000, seed=17)
                 proportions[verdict].append(float((boot["verdict"] == verdict).mean()))
     summary = {
         "n_items": int(len(item_frame)), "n_clients": int(len(clients)), "cohen_kappa": kappa,
-        "strict_consensus_share": float(item_frame["has_majority"].mean()) if len(item_frame) else 0.0,
-        "disagreement_share": float((item_frame["verdict"] == "disagreement").mean()) if len(item_frame) else 0.0,
+        "strict_consensus_share": float(item_frame["strict_consensus"].mean()) if len(item_frame) else 0.0,
+        "disagreement_share": float(item_frame["has_disagreement"].mean()) if len(item_frame) else 0.0,
         "verdicts": {},
     }
     for verdict, samples in proportions.items():
@@ -158,7 +169,7 @@ def surrogate_fidelity(teacher_probabilities, surrogate_probabilities, labels):
         + np.sum(surrogate * np.log(surrogate / midpoint), axis=1)
     )
     teacher_correct, surrogate_correct = teacher_pred == labels, surrogate_pred == labels
-    return {
+    result = {
         "hard_agreement": float((teacher_pred == surrogate_pred).mean()),
         "probability_mae": float(np.abs(teacher - surrogate).mean()),
         "probability_rmse": float(np.sqrt(np.square(teacher - surrogate).mean())),
@@ -168,6 +179,20 @@ def surrogate_fidelity(teacher_probabilities, surrogate_probabilities, labels):
         "teacher_only_correct": float((teacher_correct & ~surrogate_correct).mean()),
         "surrogate_only_correct": float((~teacher_correct & surrogate_correct).mean()),
     }
+    confidence = teacher.max(axis=1)
+    result["confidence_coverage"] = []
+    for threshold in np.linspace(0.5, 0.95, 10):
+        selected = confidence >= threshold
+        result["confidence_coverage"].append({
+            "threshold": float(threshold),
+            "coverage": float(selected.mean()),
+            "agreement": (
+                float((teacher_pred[selected] == surrogate_pred[selected]).mean())
+                if selected.any()
+                else None
+            ),
+        })
+    return result
 
 
 def cluster_occlusion(predict_proba: Callable[[np.ndarray], np.ndarray], x: np.ndarray, shown_indices: list[int]):
