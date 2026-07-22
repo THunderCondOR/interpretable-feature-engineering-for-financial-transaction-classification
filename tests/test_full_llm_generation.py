@@ -85,6 +85,10 @@ def test_runtime_config_has_independent_seeds_counts_and_exact_paths(tmp_path):
     assert config["generation"]["seed"] == 17
     assert config["claims_generation"]["seed"] == 23
     assert config["pipeline"]["few_shot_seed"] == 137
+    assert config["execution"]["events_path"].endswith(
+        "logs/runs/overnight/qwen_test.events.jsonl"
+    )
+    assert config["llm"]["events_path"] == config["execution"]["events_path"]
     assert config["evaluation"]["ml_seed"] == 41
     assert config["output"]["base_dir"].endswith(
         "age/robust_zero_shot_v2/qwen_test/seed_17"

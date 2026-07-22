@@ -214,3 +214,32 @@ def test_permanent_api_error_blocks_without_retrying(tmp_path):
     with pytest.raises(RuntimeError, match="Permanent API failure"):
         asyncio.run(scheduler.run([1], execute))
     assert attempts == 1
+
+
+def test_until_complete_is_not_limited_by_default_window_attempt_cap(tmp_path):
+    state = config(tmp_path)
+    state["until_complete"] = True
+    attempts = 0
+
+    async def execute(window, _concurrency):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 21:
+            return [
+                (
+                    window[0][0],
+                    {
+                        "response": None,
+                        "error": "temporary parser failure",
+                        "error_type": "InvalidAPIResponse",
+                    },
+                )
+            ]
+        return [(index, ok(index)) for index, _ in window]
+
+    scheduler = AtomicAdaptiveScheduler(
+        state, sleep=lambda _: asyncio.sleep(0)
+    )
+    result = asyncio.run(scheduler.run([1], execute))
+    assert attempts == 22
+    assert result[0]["response"] == "ok-0"

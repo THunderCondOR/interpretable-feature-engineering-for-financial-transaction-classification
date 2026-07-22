@@ -87,6 +87,7 @@ def _base_config(tmp_path: Path, *, n_clients: int = 400) -> Path:
             "pipeline": {"n_explanation_samples": 1, "n_claims_samples": 1},
             "output": {
                 "base_dir": str(legacy_dir),
+                "clients_stats": "clients_stats.jsonl",
                 "prompts": "prompts.jsonl",
                 "explanations": "explanations.jsonl",
                 "claims": "claims.jsonl",
@@ -123,6 +124,15 @@ def _complete_outputs(
     out_dir.mkdir(parents=True, exist_ok=True)
     for split, ids in ids_by_split.items():
         _write_jsonl(
+            out_dir / f"clients_stats_{split}.jsonl",
+            [{"customer_id": cid} for cid in ids],
+        )
+        prompt_rows = [
+            {"customer_id": cid, "prompt_hash": f"prompt-{split}-{cid}"}
+            for cid in ids
+        ]
+        _write_jsonl(out_dir / f"prompts_{split}.jsonl", prompt_rows)
+        _write_jsonl(
             out_dir / f"explanations_{split}.jsonl",
             [
                 {
@@ -131,19 +141,37 @@ def _complete_outputs(
                     "predicted": cid % 2,
                     "explanation": "Observed transaction behaviour. Final: label.",
                     "error": None,
+                    "error_type": None,
+                    "generation_signature": f"generation-{split}-{cid}",
+                    "prompt_hash": f"prompt-{split}-{cid}",
                 }
                 for cid in ids
             ],
         )
         (out_dir / f"llm_metrics_{split}.json").write_text(
-            json.dumps({"n_rows": len(ids), "n_scored": len(ids)}),
+            json.dumps({
+                "split": split,
+                "n_rows": len(ids),
+                "n_scored": len(ids),
+                "n_skipped": 0,
+                "n_errors": 0,
+                "coverage": 1.0,
+            }),
             encoding="utf-8",
         )
         if claims:
             _write_jsonl(
                 out_dir / f"claims_{split}.jsonl",
                 [
-                    {"customer_id": cid, "claims": ["Observed claim"], "error": None}
+                    {
+                        "customer_id": cid,
+                        "claims": ["Observed claim"],
+                        "error": None,
+                        "error_type": None,
+                        "generation_signature": f"claims-{split}-{cid}",
+                        "source_explanation_hash": f"source-{split}-{cid}",
+                        "source_prompt_hashes": [f"prompt-{split}-{cid}"],
+                    }
                     for cid in ids
                 ],
             )
