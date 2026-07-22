@@ -65,6 +65,7 @@ SOCKET_NAME="reviewer_v2_${SESSION_PREFIX}"
 QWEN_SESSION="${SESSION_PREFIX}_qwen"
 GPT_SESSION="${SESSION_PREFIX}_gpt_oss"
 STATUS_SESSION="${SESSION_PREFIX}_status"
+BOOTSTRAP_SESSION="${SESSION_PREFIX}_bootstrap"
 QWEN_LOG="logs/runs/${RUN_ID}/qwen.log"
 GPT_LOG="logs/runs/${RUN_ID}/gpt_oss.log"
 
@@ -156,9 +157,28 @@ done
   --probe
 
 mkdir -p "$REPO_ROOT/logs/runs/$RUN_ID"
-tmux -L "$SOCKET_NAME" new-session -d -s "$QWEN_SESSION" -c "$REPO_ROOT" "$QWEN_CMD"
-tmux -L "$SOCKET_NAME" new-session -d -s "$GPT_SESSION" -c "$REPO_ROOT" "$GPT_CMD"
-tmux -L "$SOCKET_NAME" new-session -d -s "$STATUS_SESSION" -c "$REPO_ROOT" "$STATUS_CMD"
+
+# Keep failed panes inspectable and pass bash argv directly to tmux.  A short
+# bootstrap session lets us set remain-on-exit before any worker can fail.
+tmux -L "$SOCKET_NAME" new-session -d -s "$BOOTSTRAP_SESSION" "sleep 60"
+tmux -L "$SOCKET_NAME" set-option -g remain-on-exit on
+tmux -L "$SOCKET_NAME" new-session -d -s "$QWEN_SESSION" -c "$REPO_ROOT" \
+  bash -o pipefail -lc "$QWEN_INNER"
+tmux -L "$SOCKET_NAME" new-session -d -s "$GPT_SESSION" -c "$REPO_ROOT" \
+  bash -o pipefail -lc "$GPT_INNER"
+tmux -L "$SOCKET_NAME" new-session -d -s "$STATUS_SESSION" -c "$REPO_ROOT" \
+  bash -o pipefail -lc "$STATUS_INNER"
+tmux -L "$SOCKET_NAME" kill-session -t "$BOOTSTRAP_SESSION"
+
+sleep 1
+for session in "$QWEN_SESSION" "$GPT_SESSION" "$STATUS_SESSION"; do
+  if [[ "$(tmux -L "$SOCKET_NAME" display-message -p -t "$session":0.0 '#{pane_dead}')" == "1" ]]; then
+    echo "Session exited during launch: $session" >&2
+    tmux -L "$SOCKET_NAME" capture-pane -p -t "$session":0.0 -S -80 >&2 || true
+    tmux -L "$SOCKET_NAME" kill-server || true
+    exit 1
+  fi
+done
 
 printf 'Launched independent sessions on tmux socket %s: %s %s %s\n' \
   "$SOCKET_NAME" "$QWEN_SESSION" "$GPT_SESSION" "$STATUS_SESSION"
