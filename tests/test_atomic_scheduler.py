@@ -130,3 +130,87 @@ def test_commit_validation_failure_rolls_back_window(tmp_path):
     asyncio.run(scheduler.run(list(range(8)), execute, commit))
     assert attempts == 2
     assert commits == 2
+
+
+def test_duplicate_or_wrong_result_indices_roll_back_window(tmp_path):
+    attempts = 0
+
+    async def execute(window, _concurrency):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            first = window[0][0]
+            return [(first, ok(first)) for _ in window]
+        return [(index, ok(index)) for index, _ in window]
+
+    scheduler = AtomicAdaptiveScheduler(
+        config(tmp_path), sleep=lambda _: asyncio.sleep(0)
+    )
+    result = asyncio.run(scheduler.run(list(range(6)), execute))
+    assert attempts == 2
+    assert [row["response"] for row in result] == [f"ok-{index}" for index in range(6)]
+
+
+def test_pending_batch_with_changed_request_order_is_ignored(tmp_path):
+    state = config(tmp_path)
+    state_dir = tmp_path / "worker"
+    state_dir.mkdir()
+    (state_dir / "pending_batch.json").write_text(
+        json.dumps(
+            {
+                "ordered_request_keys": ["k2", "k3"],
+                "generation_signature": "worker",
+                "mode": "fallback",
+            }
+        ),
+        encoding="utf-8",
+    )
+    starts = []
+
+    async def execute(window, concurrency):
+        starts.append((window[0][0], concurrency))
+        return [(index, ok(index)) for index, _ in window]
+
+    scheduler = AtomicAdaptiveScheduler(state, sleep=lambda _: asyncio.sleep(0))
+    asyncio.run(
+        scheduler.run(
+            list(range(4)),
+            execute,
+            request_keys=["k0", "k2", "k1", "k3"],
+        )
+    )
+    assert starts == [(0, 64)]
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "worker.jsonl").read_text().splitlines()
+    ]
+    assert any(
+        event.get("reason") == "request_order_changed"
+        for event in events
+        if event["event"] == "pending_batch_ignored"
+    )
+
+
+def test_permanent_api_error_blocks_without_retrying(tmp_path):
+    attempts = 0
+
+    async def execute(window, _concurrency):
+        nonlocal attempts
+        attempts += 1
+        return [
+            (
+                window[0][0],
+                {
+                    "response": None,
+                    "error": "invalid token",
+                    "error_type": "AuthenticationError",
+                },
+            )
+        ]
+
+    scheduler = AtomicAdaptiveScheduler(
+        config(tmp_path), sleep=lambda _: asyncio.sleep(0)
+    )
+    with pytest.raises(RuntimeError, match="Permanent API failure"):
+        asyncio.run(scheduler.run([1], execute))
+    assert attempts == 1

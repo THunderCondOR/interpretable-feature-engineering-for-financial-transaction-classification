@@ -9,11 +9,13 @@ small, dependency-free signature layer shared by every pipeline stage.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -125,14 +127,24 @@ def git_revision(repo_root: str | Path = ".") -> str | None:
 
 
 def runtime_identity() -> dict[str, Any]:
+    packages = {}
+    for name in (
+        "numpy", "pandas", "scikit-learn", "scipy", "sentence-transformers",
+        "torch", "xgboost", "optuna", "openai", "httpx", "plotly", "jinja2",
+    ):
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
     return {
         "python": sys.version.split()[0],
         "platform": platform.platform(),
-        "pid": os.getpid(),
+        "packages": packages,
     }
 
 
 def build_run_manifest(config: dict[str, Any], *, repo_root: str | Path = ".") -> dict[str, Any]:
+    """Capture immutable inputs and a content identity for safe reuse."""
     split_paths = list(config.get("dataset", {}).get("splits", {}).values())
     prompt_cfg = config.get("prompts", {})
     base_dir = Path(prompt_cfg.get("base_dir", "."))
@@ -142,32 +154,52 @@ def build_run_manifest(config: dict[str, Any], *, repo_root: str | Path = ".") -
         if prompt_cfg.get(key)
     ]
     experiment = config.get("experiment", {})
+    dataset_files = files_fingerprint(split_paths)
+    prompt_files = files_fingerprint(prompt_paths)
+    revision = git_revision(repo_root)
+    runtime = runtime_identity()
+    config_sha256 = fingerprint(config)
+    identity_payload = {
+        "manifest_version": 2,
+        "config_sha256": config_sha256,
+        "dataset_files": dataset_files,
+        "prompt_files": prompt_files,
+        "git_revision": revision,
+        "packages": runtime["packages"],
+    }
     return {
-        "manifest_version": 1,
+        "manifest_version": 2,
         "run_id": experiment.get("run_id", config.get("dataset", {}).get("name", "run")),
         "variant": experiment.get("variant", "legacy-compatible"),
         "seed": int(experiment.get("seed", 42)),
-        "git_revision": git_revision(repo_root),
+        "model_id": config.get("generation", {}).get(
+            "model", config.get("llm", {}).get("default_model")
+        ),
+        "git_revision": revision,
         "config": config,
-        "config_sha256": fingerprint(config),
-        "dataset_files": files_fingerprint(split_paths),
-        "prompt_files": files_fingerprint(prompt_paths),
-        "runtime": runtime_identity(),
+        "config_sha256": config_sha256,
+        "dataset_files": dataset_files,
+        "prompt_files": prompt_files,
+        "few_shot_configuration": config.get("pipeline", {}),
+        "runtime": runtime,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "manifest_sha256": fingerprint(identity_payload),
     }
 
 
 def ensure_run_manifest(config: dict[str, Any], *, repo_root: str | Path = ".") -> Path:
     out_dir = Path(config["output"]["base_dir"])
-    path = out_dir / "run_manifest.json"
+    path = out_dir / "manifest.json"
     candidate = build_run_manifest(config, repo_root=repo_root)
     if path.exists():
         with open(path, encoding="utf-8") as file:
             existing = json.load(file)
-        if existing.get("config_sha256") != candidate["config_sha256"]:
+        if existing.get("manifest_sha256") != candidate["manifest_sha256"]:
             raise RuntimeError(
                 f"Output directory {out_dir} belongs to an incompatible experiment: "
-                f"manifest config hash {existing.get('config_sha256')} != "
-                f"{candidate['config_sha256']}. Choose a versioned output directory."
+                f"manifest identity {existing.get('manifest_sha256')} != "
+                f"{candidate['manifest_sha256']}. Dataset, prompt, code, package, or "
+                "configuration content changed; choose a new versioned output directory."
             )
         return path
     atomic_write_json(path, candidate)

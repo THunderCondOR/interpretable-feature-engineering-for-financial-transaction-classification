@@ -249,6 +249,21 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
         expected_signatures[cid] = {
             "generation_signature": generation_signature,
             "source_explanation_hash": source_hash,
+            "source_prompt_hashes": sorted({
+                str(record.get("prompt_hash"))
+                for record in selected
+                if record.get("prompt_hash")
+            }),
+            "source_client_stats_hashes": sorted({
+                str(record.get("client_stats_hash"))
+                for record in selected
+                if record.get("client_stats_hash")
+            }),
+            "source_summary_stats_hashes": sorted({
+                str(record.get("summary_stats_hash"))
+                for record in selected
+                if record.get("summary_stats_hash")
+            }),
         }
 
     existing = _load_successful_claims(save_path, expected_signatures)
@@ -283,6 +298,9 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                 "error_type": error_type,
                 "generation_signature": generation_signature,
                 "source_explanation_hash": source_hash,
+                "source_prompt_hashes": expected_signatures[cid]["source_prompt_hashes"],
+                "source_client_stats_hashes": expected_signatures[cid]["source_client_stats_hashes"],
+                "source_summary_stats_hashes": expected_signatures[cid]["source_summary_stats_hashes"],
             }
             continue
         for rec in selected:
@@ -296,6 +314,9 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                 "label": rec.get("label", -1),
                 "label_name": rec.get("label_name", "unknown"),
                 "source_explanation_hash": source_hash,
+                "source_prompt_hashes": expected_signatures[cid]["source_prompt_hashes"],
+                "source_client_stats_hashes": expected_signatures[cid]["source_client_stats_hashes"],
+                "source_summary_stats_hashes": expected_signatures[cid]["source_summary_stats_hashes"],
             })
 
     print(
@@ -310,7 +331,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
     llm_cfg["generation_signature"] = generation_signature
     llm_cfg.setdefault("scheduler_state_dir", str(save_path.parent / ".scheduler" / save_path.stem))
     llm_cfg.setdefault("events_path", str(save_path.parent / ".scheduler" / f"{save_path.stem}.events.jsonl"))
-    llm_cfg["event_context"] = {"dataset": config["dataset"].get("name", "unknown"), "model": model, "stage": "claims", "split": split}
+    llm_cfg["event_context"] = {"run_id": config.get("experiment", {}).get("run_id"), "dataset": config["dataset"].get("name", "unknown"), "model": model, "stage": "claims", "split": split}
 
     def checkpoint(batch_results: list[tuple[int, dict]]) -> None:
         if llm_cfg.get("until_complete"):
@@ -337,6 +358,9 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                     "error_type": None,
                     "generation_signature": generation_signature,
                     "source_explanation_hash": item_meta["source_explanation_hash"],
+                    "source_prompt_hashes": item_meta["source_prompt_hashes"],
+                    "source_client_stats_hashes": item_meta["source_client_stats_hashes"],
+                    "source_summary_stats_hashes": item_meta["source_summary_stats_hashes"],
                 },
             )
             record["claims"].extend(parsed)

@@ -326,9 +326,14 @@ def run_explanation_generation(
                 decoding=decoding,
                 sample_id=sample_id,
             )
-            meta["prompt_hash"] = fingerprint(
-                {"system_prompt": system_prompt, "user_prompt": user_prompt}
-            )
+            meta["prompt_hash"] = rec.get("prompt_hash") or fingerprint({
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "customer_id": int(rec["customer_id"]),
+            })
+            meta["client_stats_hash"] = rec.get("client_stats_hash")
+            meta["summary_stats_hash"] = rec.get("summary_stats_hash")
+            meta["few_shot_hash"] = rec.get("few_shot_hash")
             meta["generation_signature"] = signature
             expected_signatures[key] = signature
             ordered_meta.append(meta)
@@ -394,7 +399,7 @@ def run_explanation_generation(
         )
         llm_cfg.setdefault("scheduler_state_dir", str(save_path.parent / ".scheduler" / save_path.stem))
         llm_cfg.setdefault("events_path", str(save_path.parent / ".scheduler" / f"{save_path.stem}.events.jsonl"))
-        llm_cfg["event_context"] = {"dataset": config["dataset"].get("name", "unknown"), "model": model, "stage": "explanations", "split": split}
+        llm_cfg["event_context"] = {"run_id": config.get("experiment", {}).get("run_id"), "dataset": config["dataset"].get("name", "unknown"), "model": model, "stage": "explanations", "split": split}
 
         print(f"Sending {len(dialogues)} requests to {model} ({n_samples} per client configured)...")
         checkpointed_keys: set[RequestKey] = set()

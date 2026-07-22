@@ -2,8 +2,13 @@
 from __future__ import annotations
 import argparse
 import html
+import sys
 import time
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.experiments.events import STAGES, read_events, status_snapshot
 
@@ -38,7 +43,13 @@ def html_document(snapshot, run_id):
         for stage in STAGES:
             event = cells.get(f"{key}|{stage}")
             state = event_state(event) if event else "pending"
-            css = "done" if event and (event.get("state") == "completed" or event.get("event") == "window_committed" and event.get("completed") == event.get("expected")) else "running" if event else "pending"
+            completed = event and (
+                event.get("state") == "completed"
+                or event.get("event") in {"job_completed", "job_reused"}
+                or event.get("event") == "window_committed"
+                and event.get("completed") == event.get("expected")
+            )
+            css = "done" if completed else "running" if event else "pending"
             stage_cells.append(f'<td class="{css}"><b>{html.escape(stage)}</b><span>{html.escape(state)}</span></td>')
         rows.append(f"<tr><th>{html.escape(key)}</th>{''.join(stage_cells)}</tr>")
     history = "".join(f"<li>{html.escape(str(item['key']))}: {item['concurrency']} ({html.escape(str(item.get('mode')) )})</li>" for item in snapshot["concurrency_history"][-50:]) or "<li>No samples yet</li>"
@@ -49,9 +60,13 @@ body{{font:14px system-ui;background:#f4f6fb;color:#15213a;margin:28px}}h1{{marg
 
 
 def render(run_id, logs_root, results_root, output):
-    paths = list((logs_root / run_id).glob("**/*.events.jsonl"))
-    paths += list(results_root.glob("**/*.events.jsonl"))
-    snapshot = status_snapshot(read_events(paths))
+    log_events = read_events(list((logs_root / run_id).glob("**/*.events.jsonl")))
+    result_events = [
+        event
+        for event in read_events(list(results_root.glob("**/*.events.jsonl")))
+        if event.get("run_id") == run_id
+    ]
+    snapshot = status_snapshot(log_events + result_events)
     print(terminal_table(snapshot))
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")

@@ -19,6 +19,25 @@ TRANSIENT_ERRORS = {
     "APITimeoutError", "APIConnectionError", "InternalServerError",
     "TimeoutError", "ConnectionError", "HTTPStatusError",
 }
+def is_permanent_exception(exc: BaseException) -> bool:
+    """Recognize failures that cannot be repaired by retrying the same request."""
+    name = type(exc).__name__
+    if name in PERMANENT_ERRORS:
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "invalid api key",
+            "invalid token",
+            "authentication failed",
+            "permission denied",
+            "model not found",
+            "unknown model",
+            "http 401",
+            "http 403",
+        )
+    )
 
 
 def is_rate_limit(result: dict) -> bool:
@@ -86,9 +105,14 @@ class AtomicAdaptiveScheduler:
                 pending = json.loads(pending_path.read_text(encoding="utf-8"))
                 pending_keys = pending.get("ordered_request_keys") or []
                 if pending.get("generation_signature") == self.signature and pending_keys:
-                    offset = keys.index(str(pending_keys[0]))
-                    mode = str(pending.get("mode", "high"))
-                    self._event("pending_batch_recovered", start=offset, ordered_request_keys=pending_keys)
+                    candidate_offset = keys.index(str(pending_keys[0]))
+                    expected_slice = keys[candidate_offset:candidate_offset + len(pending_keys)]
+                    if expected_slice == [str(key) for key in pending_keys]:
+                        offset = candidate_offset
+                        mode = str(pending.get("mode", "high"))
+                        self._event("pending_batch_recovered", start=offset, ordered_request_keys=pending_keys)
+                    else:
+                        self._event("pending_batch_ignored", reason="request_order_changed")
             except (ValueError, json.JSONDecodeError, KeyError):
                 self._event("pending_batch_ignored", reason="incompatible_or_malformed")
         attempt_by_offset: Counter[int] = Counter()
@@ -110,6 +134,15 @@ class AtomicAdaptiveScheduler:
                 self._event("window_interrupted", batch_id=batch_id)
                 raise
             except Exception as exc:
+                if is_permanent_exception(exc):
+                    self._event(
+                        "stage_blocked",
+                        batch_id=batch_id,
+                        errors={type(exc).__name__: 1},
+                    )
+                    raise RuntimeError(
+                        f"Permanent API failure: {type(exc).__name__}: {exc}"
+                    ) from exc
                 self._event("window_rolled_back", batch_id=batch_id, reason=type(exc).__name__)
                 await self.sleep(min(self.cooldown, self.backoff * (2 ** min(attempt - 1, 6))))
                 continue
@@ -123,7 +156,14 @@ class AtomicAdaptiveScheduler:
                 self._event("window_rolled_back", batch_id=batch_id, reason="rate_limit", errors=dict(errors), retry_in=self.cooldown)
                 await self.sleep(self.cooldown)
                 continue
-            if errors or len(batch_results) != len(window):
+            expected_indices = [index for index, _ in window]
+            returned_indices = [index for index, _ in batch_results]
+            invalid_indices = (
+                len(returned_indices) != len(expected_indices)
+                or len(set(returned_indices)) != len(returned_indices)
+                or set(returned_indices) != set(expected_indices)
+            )
+            if errors or invalid_indices:
                 self._event("window_rolled_back", batch_id=batch_id, reason="transient_or_incomplete", errors=dict(errors))
                 await self.sleep(min(self.cooldown, self.backoff * (2 ** min(attempt - 1, 6))))
                 continue

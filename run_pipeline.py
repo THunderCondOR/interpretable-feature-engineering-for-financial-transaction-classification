@@ -34,6 +34,7 @@ from src.pipeline.prompt_builder import build_few_shot_str, build_prompts
 SPLITS = ("train", "val", "test")
 DEFAULT_STEPS = ("stats", "prompts", "cot", "llm_eval", "claims", "cot_features", "ml")
 STEPS = DEFAULT_STEPS + ("majority", "lora")
+API_STEPS = frozenset({"cot", "claims"})
 
 
 def load_config(path: str) -> dict:
@@ -199,6 +200,21 @@ def main() -> None:
         default=None,
         help="Comma-separated LoRA run names or model ids. Defaults to all runs listed in config.",
     )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Execute the printed plan. Without this flag the runner is read-only.",
+    )
+    parser.add_argument(
+        "--until-complete",
+        action="store_true",
+        help="Required for stages that issue LLM API requests.",
+    )
+    parser.add_argument(
+        "--allow-legacy-output",
+        action="store_true",
+        help="Explicitly allow writes from a config without an experiment block.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -218,15 +234,9 @@ def main() -> None:
         config["llm"]["max_tokens"] = args.max_tokens
     if args.claims_max_tokens is not None:
         config.setdefault("pipeline", {})["claims_max_tokens"] = args.claims_max_tokens
+    if args.until_complete:
+        config.setdefault("execution", {})["until_complete"] = True
 
-    if config.get("experiment"):
-        manifest_path = ensure_run_manifest(config, repo_root=Path(__file__).parent)
-        print(f"Experiment manifest -> {manifest_path}")
-    else:
-        print(
-            "Legacy-compatible mode: no experiment block configured; "
-            "use a v2 config and versioned output directory for strict provenance."
-        )
     splits = parse_csv(args.splits)
     experiments = parse_csv(args.experiments)
     lora_models = parse_csv(args.lora_models) if args.lora_models else None
@@ -246,6 +256,30 @@ def main() -> None:
         print(f"Unknown splits: {unknown_splits}", file=sys.stderr)
         print(f"Unknown experiments: {unknown_experiments}", file=sys.stderr)
         sys.exit(1)
+
+    plan = {
+        "mode": "execute" if args.execute else "dry-run",
+        "config": str(args.config),
+        "output_base_dir": config["output"]["base_dir"],
+        "steps": steps,
+        "splits": splits,
+        "experiments": experiments,
+        "api_steps": sorted(set(steps) & API_STEPS),
+    }
+    print(json.dumps(plan, indent=2, ensure_ascii=False))
+    if not args.execute:
+        return
+    if set(steps) & API_STEPS and not args.until_complete:
+        raise ValueError("API stages require --until-complete")
+    if not config.get("experiment") and not args.allow_legacy_output:
+        raise RuntimeError(
+            "Refusing to write to a legacy output directory. Use a versioned v2 config "
+            "or pass --allow-legacy-output explicitly."
+        )
+
+    if config.get("experiment"):
+        manifest_path = ensure_run_manifest(config, repo_root=Path(__file__).parent)
+        print(f"Experiment manifest -> {manifest_path}")
 
     step_fns = {
         "stats": lambda: run_stats(config, splits),
