@@ -43,7 +43,6 @@ from xgboost import XGBClassifier
 
 from src.pipeline.cot_features import flatten_claim_records, load_claim_records
 from src.utils.cluster import embed_texts
-from src.utils.filtration import filter_cluster_ids_by_class_diff, label_based_outlier_detection
 
 
 SPLITS = ("train", "val", "test")
@@ -105,18 +104,6 @@ def fit_variant(
     fit_customer_ids = [customer_ids[i] for i in idx]
     fit_claims = [claims[i] for i in idx]
 
-    top_k = min(5, max(len(fit_claims) - 1, 1))
-    outlier_flags = (
-        label_based_outlier_detection(fit_embeddings, fit_labels, top_k=top_k)
-        if len(fit_claims) > 2
-        else [False] * len(fit_claims)
-    )
-    keep_mask = np.asarray([not flag for flag in outlier_flags], dtype=bool)
-    fit_embeddings = fit_embeddings[keep_mask]
-    fit_labels = [label for label, keep in zip(fit_labels, keep_mask) if keep]
-    fit_customer_ids = [cid for cid, keep in zip(fit_customer_ids, keep_mask) if keep]
-    fit_claims = [claim for claim, keep in zip(fit_claims, keep_mask) if keep]
-
     if variant.n_clusters is not None:
         n_clusters = min(max(2, int(variant.n_clusters)), len(fit_claims))
         clusterer = AgglomerativeClustering(
@@ -133,18 +120,15 @@ def fit_variant(
         )
 
     raw_cluster_ids = clusterer.fit_predict(fit_embeddings)
-    filtered_cluster_ids = filter_cluster_ids_by_class_diff(
-        raw_cluster_ids,
-        fit_labels,
-        int(config["dataset"]["num_labels"]),
-        min_diff=float(config["pipeline"].get("class_diff_threshold", 0.02)),
-    )
+    filtered_cluster_ids = np.asarray(raw_cluster_ids, dtype=np.int32)
 
-    min_cluster_size = int(config["pipeline"].get("min_cluster_size", 1))
+    min_cluster_size = int(config.get("clustering", {}).get(
+        "min_client_coverage", config["pipeline"].get("min_cluster_size", 1)
+    ))
     kept_old_ids = [
         cluster_id
         for cluster_id in sorted(set(int(c) for c in filtered_cluster_ids if c >= 0))
-        if int(np.sum(filtered_cluster_ids == cluster_id)) >= min_cluster_size
+        if len({cid for cid, assigned in zip(fit_customer_ids, filtered_cluster_ids) if assigned == cluster_id}) >= min_cluster_size
     ]
     if not kept_old_ids:
         raise ValueError(f"No clusters survived filtering for variant={variant.name}")
@@ -181,8 +165,8 @@ def fit_variant(
         "centroids": np.vstack(centroids),
         "feature_names": feature_names,
         "cluster_meta": cluster_meta,
-        "n_fit_claims_before_outlier_filter": int(len(idx)),
-        "n_fit_claims_after_outlier_filter": int(len(fit_claims)),
+        "n_fit_claims": int(len(fit_claims)),
+        "cluster_formation": "label_agnostic",
         "n_clusters": int(len(feature_names)),
     }
 
@@ -215,7 +199,7 @@ def records_to_feature_frame(
     }
     for cid, cluster_idx in zip(claim_customer_ids, assignments):
         if int(cluster_idx) >= 0:
-            vectors[int(cid)][int(cluster_idx)] += 1.0
+            vectors[int(cid)][int(cluster_idx)] = 1.0
 
     rows = []
     for record in records:
@@ -299,12 +283,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--output-base-dir", default=None)
-    parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3, 4, 5])
+    parser.add_argument("--seeds", type=int, nargs="+", default=[17, 101, 947])
     parser.add_argument("--distance-thresholds", type=float, nargs="+", default=[0.008, 0.01, 0.012])
-    parser.add_argument("--n-clusters", type=int, nargs="*", default=[])
+    parser.add_argument("--n-clusters", type=int, nargs="*", default=[100, 200, 400, 800])
     parser.add_argument("--max-train-claims", type=int, default=0, help="0 means use all train claims.")
     parser.add_argument("--skip-xgb", action="store_true")
+    parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
+
+    if not args.execute:
+        print(json.dumps({"mode": "dry-run", "seeds": args.seeds,
+            "distance_thresholds": args.distance_thresholds,
+            "fixed_cluster_counts": args.n_clusters,
+            "max_train_claims": args.max_train_claims or "all"}, indent=2))
+        return
 
     config = load_config(args.config, args.output_base_dir)
     out_dir = Path(config["output"]["base_dir"]) / "cluster_stability"
@@ -404,8 +396,8 @@ def main() -> None:
             "seed": variant.seed,
             "distance_threshold": variant.distance_threshold,
             "n_clusters_requested": variant.n_clusters,
-            "n_fit_claims_before_outlier_filter": model["n_fit_claims_before_outlier_filter"],
-            "n_fit_claims_after_outlier_filter": model["n_fit_claims_after_outlier_filter"],
+            "n_fit_claims": model["n_fit_claims"],
+            "cluster_formation": model["cluster_formation"],
             "n_clusters_kept": model["n_clusters"],
             "train_assignment_ari_vs_reference": float(ari),
             "train_assignment_nmi_vs_reference": float(nmi),

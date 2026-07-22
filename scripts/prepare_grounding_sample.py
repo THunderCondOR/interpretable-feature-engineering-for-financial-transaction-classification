@@ -9,6 +9,7 @@ No API calls are made here.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -48,6 +49,8 @@ def main() -> None:
         for dataset in args.datasets:
             stats_path = root / dataset / f"clients_stats_{args.split}.jsonl"
             claims_path = root / dataset / f"claims_{args.split}.jsonl"
+            summary_path = root / dataset / "summary_stats.txt"
+            train_summary = summary_path.read_text(encoding="utf-8")
             stats = {
                 int(record["customer_id"]): record
                 for record in read_jsonl(stats_path)
@@ -77,9 +80,16 @@ def main() -> None:
                             "dataset": dataset,
                             "split": args.split,
                             "customer_id": cid,
-                            "label": record.get("label"),
-                            "label_name": record.get("label_name"),
                             "client_stats": stats[cid]["client_stats"],
+                            "train_reference_summary": train_summary,
+                            "evidence_hash": hashlib.sha256(
+                                (stats[cid]["client_stats"] + "\n" + train_summary).encode("utf-8")
+                            ).hexdigest(),
+                            "field_semantics": {
+                                "gender": "signed cashflow: negative amounts are outflow",
+                                "age": "amount is unsigned transaction value, not income",
+                                "rosbank": "direction is defined by operation type",
+                            }[dataset],
                             "claim": claim,
                         }
                     )

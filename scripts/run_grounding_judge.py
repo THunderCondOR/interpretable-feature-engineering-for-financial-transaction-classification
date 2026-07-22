@@ -3,7 +3,7 @@
 The judge receives only the exact client-level transaction summary supplied to
 the explanation generator and one extracted atomic claim. It must return JSON:
 
-{"verdict": "supported|partially_supported|unsupported|not_applicable",
+{"verdict": "supported|partially_supported|unsupported|not_verifiable",
  "confidence": 1-5,
  "evidence": "...",
  "reason": "..."}
@@ -43,7 +43,7 @@ or external knowledge. A claim is:
   than what the summary strictly shows.
 - unsupported: not present, contradicted, or based on stereotypes/inferences not grounded
   in the summary.
-- not_applicable: the claim is empty, malformed, or cannot be evaluated as behavior.
+- not_verifiable: the supplied evidence is insufficient to verify the claim.
 
 Return only valid JSON with keys: verdict, confidence, evidence, reason.
 Keep evidence and reason short."""
@@ -70,6 +70,12 @@ def load_existing(path: Path) -> dict[str, dict[str, Any]]:
 def make_dialogue(record: dict[str, Any]) -> list[dict[str, str]]:
     user = f"""CLIENT TRANSACTION SUMMARY:
 {record["client_stats"]}
+
+TRAIN-ONLY REFERENCE SUMMARY:
+{record.get("train_reference_summary", "not supplied")}
+
+FIELD SEMANTICS:
+{record.get("field_semantics", "not supplied")}
 
 CLAIM:
 {record["claim"]}
@@ -120,12 +126,13 @@ def normalize_verdict(value: Any) -> str:
         "not_supported": "unsupported",
         "no": "unsupported",
         "ungrounded": "unsupported",
-        "not_applicable": "not_applicable",
-        "na": "not_applicable",
-        "n/a": "not_applicable",
+        "not_applicable": "not_verifiable",
+        "not_verifiable": "not_verifiable",
+        "na": "not_verifiable",
+        "n/a": "not_verifiable",
     }
     text = aliases.get(text, text)
-    if text not in {"supported", "partially_supported", "unsupported", "not_applicable"}:
+    if text not in {"supported", "partially_supported", "unsupported", "not_verifiable"}:
         return "parse_error"
     return text
 
@@ -146,12 +153,19 @@ async def main_async() -> None:
     parser.add_argument("--api-base-url", required=True)
     parser.add_argument("--api-key-env", default=None)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--max-concurrent", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--max-concurrent", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--execute-api", action="store_true")
+    parser.add_argument("--until-complete", action="store_true")
     args = parser.parse_args()
+
+    if not (args.execute_api and args.until_complete):
+        print(json.dumps({"mode": "dry-run", "judge": args.judge_name,
+            "model": args.model, "requires": ["--execute-api", "--until-complete"]}, indent=2))
+        return
 
     api_key = args.api_key or (os.environ.get(args.api_key_env) if args.api_key_env else None)
     if not api_key:

@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+from src.evaluation.reviewer_metrics import GROUNDING_VERDICTS, adjudicate_grounding, grounding_summary
 
-VERDICTS = ["supported", "partially_supported", "unsupported", "not_applicable", "parse_error"]
+
+VERDICTS = [*GROUNDING_VERDICTS, "disagreement"]
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -24,12 +26,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def majority(verdicts: list[str]) -> tuple[str, bool]:
-    counts = Counter(verdicts)
-    if not counts:
-        return "missing", False
-    top = counts.most_common()
-    tied = len(top) > 1 and top[0][1] == top[1][1]
-    return top[0][0], not tied
+    return adjudicate_grounding(verdicts)
 
 
 def main() -> None:
@@ -75,6 +72,7 @@ def main() -> None:
 
     item_df = pd.DataFrame(grouped_rows)
     summary_rows = []
+    aggregate_metrics = {}
     for keys, group in item_df.groupby(["run_name", "dataset"], dropna=False):
         run_name, dataset = keys
         total = len(group)
@@ -84,17 +82,24 @@ def main() -> None:
             row[f"{verdict}_share"] = float((group["majority_verdict"] == verdict).mean()) if total else 0.0
         row["disagreement_share"] = float((~group["has_majority"]).mean()) if total else 0.0
         summary_rows.append(row)
+        source = df[(df["run_name"] == run_name) & (df["dataset"] == dataset)]
+        _, metrics = grounding_summary(source)
+        aggregate_metrics[f"{run_name}/{dataset}"] = metrics
 
     item_path = args.output_prefix.with_suffix(".items.csv")
     summary_path = args.output_prefix.with_suffix(".summary.csv")
     disagreement_path = args.output_prefix.with_suffix(".disagreements.json")
+    metrics_path = args.output_prefix.with_suffix(".metrics.json")
     item_df.to_csv(item_path, index=False)
     pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
     with open(disagreement_path, "w", encoding="utf-8") as file:
         json.dump(disagreements, file, indent=2, ensure_ascii=False)
+    with open(metrics_path, "w", encoding="utf-8") as file:
+        json.dump(aggregate_metrics, file, indent=2, ensure_ascii=False)
     print(f"Saved item-level grounding -> {item_path}")
     print(f"Saved summary -> {summary_path}")
     print(f"Saved disagreements -> {disagreement_path}")
+    print(f"Saved kappa/bootstrap metrics -> {metrics_path}")
 
 
 if __name__ == "__main__":
