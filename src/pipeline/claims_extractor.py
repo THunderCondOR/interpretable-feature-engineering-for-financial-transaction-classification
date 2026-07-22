@@ -13,6 +13,7 @@ from collections import Counter
 from pathlib import Path
 
 from src.experiments.artifacts import fingerprint, stage_signature
+from src.pipeline.semantic_features import normalize_claim
 from src.utils.async_api import batched_query
 from src.utils.prompt_parsing import extract_json_list
 
@@ -147,6 +148,32 @@ def _claims_summary(records: list[dict]) -> dict:
         "error_types": dict(sorted(error_types.items())),
         "total_claims": sum(len(record.get("claims", [])) for record in records),
     }
+
+
+def _attach_claim_records(record: dict) -> None:
+    """Attach stable provenance while retaining the legacy string list."""
+    source_hash = str(record.get("source_explanation_hash", ""))
+    extractor = str(record.get("generation_signature", ""))
+    generation_run = str(record.get("generation_run", extractor[:16]))
+    record["claim_records"] = [
+        {
+            "claim_id": fingerprint({
+                "customer_id": int(record["customer_id"]),
+                "source_explanation_hash": source_hash,
+                "extractor_signature": extractor,
+                "normalized_text": normalize_claim(claim),
+                "occurrence": index,
+            })[:20],
+            "customer_id": int(record["customer_id"]),
+            "source_explanation_hash": source_hash,
+            "generation_run": generation_run,
+            "extractor_signature": extractor,
+            "normalized_text": normalize_claim(claim),
+            "original_text": claim,
+        }
+        for index, claim in enumerate(record.get("claims", []))
+        if normalize_claim(claim)
+    ]
 
 
 def run_claims_extraction(config: dict, *, split: str | None = None, input_path: str | Path | None = None, output_path: str | Path | None = None) -> None:
@@ -313,6 +340,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                 errors = request_errors.get(cid, [])
                 record["error_type"] = errors[-1][0] if errors else "EmptyClaims"
                 record["error"] = errors[-1][1] if errors else "no claims extracted"
+            _attach_claim_records(record)
             batch_records.append(record)
 
         _write_claim_records(save_path, ordered_clients, claims_by_client)
@@ -332,6 +360,8 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
             )
         )
 
+    for record in claims_by_client.values():
+        _attach_claim_records(record)
     _write_claim_records(save_path, ordered_clients, claims_by_client)
     final_records = [claims_by_client[cid] for cid in ordered_clients]
     summary = _claims_summary(final_records)

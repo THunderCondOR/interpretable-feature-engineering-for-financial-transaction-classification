@@ -32,11 +32,10 @@ def embed_texts(texts, model_name="tf-idf"):
 
     print("Encoding texts with SentenceTransformer...")
     model = SentenceTransformer(model_name, device=device)
-    embeddings = []
-    for t in tqdm(texts, desc="Encoding", ncols=80):
-        emb = model.encode(t, normalize_embeddings=True)
-        embeddings.append(emb)
-    return np.array(embeddings)
+    return np.asarray(model.encode(
+        list(texts), batch_size=256,
+        normalize_embeddings=True, show_progress_bar=True,
+    ))
 
 def fine_cluster_dbscan(embeddings, eps=0.1, min_samples=2):
     """
