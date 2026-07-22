@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 RUN_ID=""
 QWEN_CONFIG=""
 GPT_CONFIG=""
@@ -149,6 +150,7 @@ done
 # all local validation, including the clean-worktree guard, before probing.
 "$PYTHON_BIN" "$REPO_ROOT/scripts/api_preflight.py" \
   --repo-root "$REPO_ROOT" \
+  --run-id "$RUN_ID" \
   --qwen-config "$QWEN_CONFIG" \
   --gpt-config "$GPT_CONFIG" \
   --probe

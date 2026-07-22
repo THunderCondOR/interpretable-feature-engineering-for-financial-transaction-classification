@@ -15,6 +15,7 @@ import os
 import platform
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -106,7 +107,9 @@ def prompt_signature(
 def atomic_write_json(path: str | Path, payload: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
     with open(temporary, "w", encoding="utf-8") as file:
         json.dump(payload, file, indent=2, ensure_ascii=False, default=_json_default)
     temporary.replace(path)
@@ -155,6 +158,12 @@ def build_run_manifest(config: dict[str, Any], *, repo_root: str | Path = ".") -
     ]
     experiment = config.get("experiment", {})
     dataset_files = files_fingerprint(split_paths)
+    selection_paths = [
+        value
+        for value in config.get("dataset", {}).get("client_ids_by_split", {}).values()
+        if isinstance(value, (str, Path))
+    ]
+    client_selection_files = files_fingerprint(selection_paths)
     prompt_files = files_fingerprint(prompt_paths)
     revision = git_revision(repo_root)
     runtime = runtime_identity()
@@ -163,6 +172,7 @@ def build_run_manifest(config: dict[str, Any], *, repo_root: str | Path = ".") -
         "manifest_version": 2,
         "config_sha256": config_sha256,
         "dataset_files": dataset_files,
+        "client_selection_files": client_selection_files,
         "prompt_files": prompt_files,
         "git_revision": revision,
         "packages": runtime["packages"],
@@ -179,6 +189,7 @@ def build_run_manifest(config: dict[str, Any], *, repo_root: str | Path = ".") -
         "config": config,
         "config_sha256": config_sha256,
         "dataset_files": dataset_files,
+        "client_selection_files": client_selection_files,
         "prompt_files": prompt_files,
         "few_shot_configuration": config.get("pipeline", {}),
         "runtime": runtime,

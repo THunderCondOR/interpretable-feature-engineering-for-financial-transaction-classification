@@ -52,13 +52,20 @@ class AtomicAdaptiveScheduler:
         self.recovery_windows = int(config.get("recovery_clean_batches", config.get("rate_limit_recovery_batches", 10)))
         self.cooldown = float(config.get("cooldown_seconds", config.get("rate_limit_cooldown_seconds", 60)))
         self.backoff = float(config.get("retry_backoff", 2))
-        self.max_attempts = int(config.get("max_window_attempts", 20))
+        configured_attempts = int(config.get("max_window_attempts", 20))
+        # Paid overnight runs explicitly guarded by --until-complete keep
+        # retrying repairable windows. Permanent auth/model/config errors are
+        # still detected and block immediately below.
+        self.max_attempts = None if config.get("until_complete") else configured_attempts
         self.signature = str(config.get("generation_signature", "unspecified"))
         self.event_context = dict(config.get("event_context", {}))
         self.state_dir = Path(config["scheduler_state_dir"]) if config.get("scheduler_state_dir") else None
         self.events_path = Path(config["events_path"]) if config.get("events_path") else None
         self.sleep = sleep
-        if min(self.high, self.low, self.recovery_windows, self.max_attempts) < 1:
+        positive_values = [self.high, self.low, self.recovery_windows]
+        if self.max_attempts is not None:
+            positive_values.append(self.max_attempts)
+        if min(positive_values) < 1:
             raise ValueError("scheduler concurrency/recovery/attempt values must be positive")
 
     def _atomic_json(self, path: Path, payload: dict) -> None:
@@ -123,7 +130,7 @@ class AtomicAdaptiveScheduler:
             window_keys = keys[offset: offset + len(window)]
             attempt_by_offset[offset] += 1
             attempt = attempt_by_offset[offset]
-            if attempt > self.max_attempts:
+            if self.max_attempts is not None and attempt > self.max_attempts:
                 raise RuntimeError(f"Atomic window at offset {offset} exceeded {self.max_attempts} attempts")
             batch_id = f"{self.signature[:12]}:{offset}:{len(window)}"
             self._write_pending(batch_id=batch_id, keys=window_keys, start=offset, concurrency=concurrency, attempt=attempt, mode=mode)

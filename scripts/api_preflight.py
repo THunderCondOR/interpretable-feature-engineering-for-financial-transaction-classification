@@ -18,6 +18,15 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.run_gender_v2 import PILOT_SIZE, PILOT_SAMPLING_SEED, PILOT_VARIANTS, stratified_pilot_ids
+from scripts.run_model_queue import default_jobs
+from src.experiments.artifacts import build_run_manifest
+from src.experiments.config_builder import build_runtime_config
+
 
 EXPECTED_CLIENT_COUNTS: dict[str, dict[str, int]] = {
     "gender": {"train": 6_720, "val": 840, "test": 840},
@@ -202,6 +211,225 @@ def validate_datasets(
     return observed
 
 
+def validate_gender_legacy_pilot(
+    repo_root: Path,
+    gender_config_path: Path,
+) -> dict[str, Any]:
+    """Prove exact legacy coverage for the deterministic 400-client pilot."""
+    pandas = importlib.import_module("pandas")
+    config = _load_yaml(gender_config_path)
+    dataset = config["dataset"]
+    columns = dataset["columns"]
+    validation_path = _resolve_repo_path(repo_root, dataset["splits"]["val"])
+    frame = pandas.read_csv(
+        validation_path,
+        usecols=[columns["customer_id"], columns["amount"], columns["label"]],
+    ).rename(
+        columns={
+            columns["customer_id"]: "customer_id",
+            columns["amount"]: "amount",
+            columns["label"]: "label",
+        }
+    )
+    pilot_ids = stratified_pilot_ids(
+        frame,
+        n_clients=PILOT_SIZE,
+        seed=PILOT_SAMPLING_SEED,
+    )
+    if len(pilot_ids) != PILOT_SIZE or len(set(pilot_ids)) != PILOT_SIZE:
+        raise PreflightError(
+            f"Gender pilot selected {len(pilot_ids)} rows / {len(set(pilot_ids))} "
+            f"unique IDs, expected {PILOT_SIZE}"
+        )
+
+    explanations = _resolve_repo_path(
+        repo_root,
+        Path(config["output"]["base_dir"]) / "explanations_val.jsonl",
+    )
+    if not explanations.is_file():
+        raise PreflightError(f"Missing legacy gender predictions: {explanations}")
+    expected = set(pilot_ids)
+    observed: dict[int, dict[str, Any]] = {}
+    with explanations.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                client_id = int(row["customer_id"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise PreflightError(
+                    f"Malformed legacy prediction at {explanations}:{line_number}: {exc}"
+                ) from exc
+            if client_id not in expected:
+                continue
+            if client_id in observed:
+                raise PreflightError(
+                    f"Duplicate legacy gender prediction for pilot client {client_id}"
+                )
+            observed[client_id] = row
+    missing = expected - set(observed)
+    failed = [
+        client_id
+        for client_id, row in observed.items()
+        if row.get("error") or row.get("predicted") is None
+    ]
+    if missing or failed:
+        raise PreflightError(
+            "Legacy gender pilot coverage is incomplete: "
+            f"missing={len(missing)}, failed_or_unparsed={len(failed)}"
+        )
+    return {
+        "sampling_seed": PILOT_SAMPLING_SEED,
+        "selected": len(pilot_ids),
+        "covered": len(observed),
+    }
+
+
+def planned_runtime_configs(
+    *,
+    repo_root: Path,
+    run_id: str,
+    qwen_config: Path,
+    gpt_config: Path,
+    dataset_configs: list[Path],
+) -> list[dict[str, Any]]:
+    """Build every possible overnight runtime config without writing it."""
+    profiles = {
+        str(profile["experiment"]["model_slug"]): profile
+        for profile in (_load_yaml(qwen_config), _load_yaml(gpt_config))
+    }
+    bases = {
+        str(base["dataset"]["name"]): base
+        for base in (_load_yaml(path) for path in dataset_configs)
+    }
+    configs: list[dict[str, Any]] = []
+    for dataset in ("age", "rosbank"):
+        for profile in profiles.values():
+            config = build_runtime_config(
+                bases[dataset],
+                profile,
+                run_id=run_id,
+                variant="robust_zero_shot_v2",
+                sampling_seed=137,
+                generation_seed=17,
+                claims_seed=17,
+                ml_seed=17,
+                results_root=Path("results/v2"),
+                expected_client_counts=EXPECTED_CLIENT_COUNTS[dataset],
+            )
+            model_slug = config["experiment"]["model_slug"]
+            config["output"]["completion_marker"] = str(
+                Path("logs/runs")
+                / run_id
+                / "completion"
+                / f"{model_slug}_{dataset}.json"
+            )
+            configs.append(config)
+    # Selection may choose any pilot variant; validate every possible final
+    # output root for both models before the first paid request.
+    for variant in PILOT_VARIANTS:
+        for profile in profiles.values():
+            configs.append(
+                build_runtime_config(
+                    bases["gender"],
+                    profile,
+                    run_id=run_id,
+                    variant=variant,
+                    sampling_seed=PILOT_SAMPLING_SEED,
+                    generation_seed=17,
+                    claims_seed=17,
+                    ml_seed=17,
+                    results_root=Path("results/v2"),
+                    expected_client_counts=EXPECTED_CLIENT_COUNTS["gender"],
+                )
+            )
+        pilot_ids_path = Path("logs/runs") / run_id / "generated/gender_pilot_client_ids.json"
+        configs.append(
+            build_runtime_config(
+                bases["gender"],
+                profiles["qwen"],
+                run_id=run_id,
+                variant=variant,
+                sampling_seed=PILOT_SAMPLING_SEED,
+                generation_seed=17,
+                claims_seed=17,
+                ml_seed=17,
+                results_root=Path("results/v2/pilot"),
+                client_ids_by_split={"val": str(pilot_ids_path)},
+                expected_client_counts={
+                    "train": EXPECTED_CLIENT_COUNTS["gender"]["train"],
+                    "val": PILOT_SIZE,
+                    "test": EXPECTED_CLIENT_COUNTS["gender"]["test"],
+                },
+            )
+        )
+    return configs
+
+
+def validate_train_only_and_outputs(
+    configs: list[dict[str, Any]],
+    *,
+    repo_root: Path,
+) -> dict[str, int]:
+    checked = 0
+    existing = 0
+    for config in configs:
+        if config.get("pipeline", {}).get("prompt_context_split") != "train":
+            raise PreflightError(
+                "Runtime config does not enforce a train-only prompt context: "
+                f"{config['dataset']['name']}/{config['experiment']['model_slug']}"
+            )
+        output_root = _resolve_repo_path(repo_root, config["output"]["base_dir"])
+        manifest_path = output_root / "manifest.json"
+        if output_root.exists():
+            existing += 1
+            if not manifest_path.is_file():
+                raise PreflightError(
+                    f"Existing output root has no compatible manifest: {output_root}"
+                )
+            try:
+                current = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise PreflightError(f"Malformed output manifest: {manifest_path}") from exc
+            candidate = build_run_manifest(config, repo_root=repo_root)
+            if current.get("manifest_sha256") != candidate["manifest_sha256"]:
+                raise PreflightError(
+                    f"Incompatible existing output root: {output_root}"
+                )
+        checked += 1
+    return {"planned_configs": checked, "existing_compatible_roots": existing}
+
+
+def validate_queue_matrix(
+    *, run_id: str, qwen_config: Path, gpt_config: Path
+) -> dict[str, int]:
+    profiles = [_load_yaml(qwen_config), _load_yaml(gpt_config)]
+    jobs_by_model = {
+        profile["experiment"]["model_slug"]: default_jobs(
+            profile,
+            model_config=qwen_config
+            if profile["experiment"]["model_slug"] == "qwen"
+            else gpt_config,
+            run_id=run_id,
+        )
+        for profile in profiles
+    }
+    for model, jobs in jobs_by_model.items():
+        full = [job for job in jobs if job.get("stage") == "full"]
+        cells = sum(len(job.get("expected_splits", [])) for job in full)
+        if len(full) != 3 or cells != 9:
+            raise PreflightError(
+                f"Queue matrix mismatch for {model}: full_jobs={len(full)}, split_cells={cells}"
+            )
+        if {job.get("dataset") for job in full} != set(EXPECTED_CLIENT_COUNTS):
+            raise PreflightError(f"Queue does not cover all datasets for {model}")
+    pilot = [job for job in jobs_by_model["qwen"] if job.get("stage") == "pilot"]
+    if len(pilot) != 1 or pilot[0].get("expected_client_counts") != {"val": PILOT_SIZE}:
+        raise PreflightError("Qwen queue does not contain the exact gender pilot")
+    return {"models": 2, "full_jobs": 6, "split_cells_per_model": 9}
+
+
 def probe_models(
     profiles: list[dict[str, str]],
     *,
@@ -237,6 +465,7 @@ def run_preflight(
     gpt_config: Path,
     dataset_configs: list[Path],
     environ: dict[str, str] | os._Environ[str],
+    run_id: str = "reviewer-v2",
     expected_counts: dict[str, dict[str, int]] = EXPECTED_CLIENT_COUNTS,
     check_git: bool = True,
     probe: bool = False,
@@ -246,6 +475,32 @@ def run_preflight(
     base_url, api_key = _required_environment(environ)
     profiles = validate_model_profiles([qwen_config, gpt_config])
     counts = validate_datasets(repo_root, dataset_configs, expected_counts)
+    production_contract = expected_counts == EXPECTED_CLIENT_COUNTS
+    if production_contract:
+        config_by_name = {
+            str(_load_yaml(path)["dataset"]["name"]): path
+            for path in dataset_configs
+        }
+        pilot = validate_gender_legacy_pilot(repo_root, config_by_name["gender"])
+        runtime_configs = planned_runtime_configs(
+            repo_root=repo_root,
+            run_id=run_id,
+            qwen_config=qwen_config,
+            gpt_config=gpt_config,
+            dataset_configs=dataset_configs,
+        )
+        outputs = validate_train_only_and_outputs(runtime_configs, repo_root=repo_root)
+        queue = validate_queue_matrix(
+            run_id=run_id,
+            qwen_config=qwen_config,
+            gpt_config=gpt_config,
+        )
+    else:
+        # Small synthetic fixtures exercise dependency checks without needing a
+        # fabricated 400-client historical gender run.
+        pilot = {"status": "skipped_nonproduction_fixture"}
+        outputs = {"planned_configs": 0, "existing_compatible_roots": 0}
+        queue = {"models": 2, "full_jobs": 6, "split_cells_per_model": 9}
     revision = validate_git_clean(repo_root) if check_git else "test-no-git-check"
     probed = (
         probe_models(
@@ -264,6 +519,9 @@ def run_preflight(
         "datasets": counts,
         "clients_per_model": sum(sum(splits.values()) for splits in counts.values()),
         "estimated_api_requests": 174_800,
+        "gender_legacy_pilot": pilot,
+        "runtime_outputs": outputs,
+        "queue": queue,
         "probed_models": probed,
     }
 
@@ -271,6 +529,7 @@ def run_preflight(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--run-id", default="reviewer-v2")
     parser.add_argument("--qwen-config", type=Path, required=True)
     parser.add_argument("--gpt-config", type=Path, required=True)
     parser.add_argument("--dataset-config", action="append", type=Path, default=[])
@@ -289,6 +548,7 @@ def main() -> None:
             gpt_config=args.gpt_config.resolve(),
             dataset_configs=[path.resolve() for path in dataset_configs],
             environ=os.environ,
+            run_id=args.run_id,
             probe=args.probe,
         )
     except (PreflightError, subprocess.CalledProcessError) as exc:

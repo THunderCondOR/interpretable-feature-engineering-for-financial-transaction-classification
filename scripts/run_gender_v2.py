@@ -24,6 +24,7 @@ from src.experiments.config_builder import (
     write_runtime_config,
 )
 from src.pipeline.llm_eval import balanced_accuracy_interval, summarize_prediction_rows
+from scripts.run_full_llm_generation import validate_completion
 
 PILOT_VARIANTS = (
     "neutral_only",
@@ -213,6 +214,11 @@ def materialize(
             seed=generation_seed,
             results_root=results_root / "pilot",
             client_ids_by_split={"val": str(pilot_ids_path)},
+            expected_client_counts={
+                "train": 6720,
+                "val": PILOT_SIZE,
+                "test": 840,
+            },
         )
         config.setdefault("experiment", {})["sampling_seed"] = PILOT_SAMPLING_SEED
         config["experiment"]["generation_seed"] = generation_seed
@@ -460,7 +466,12 @@ def _write_full_completion(
     config_path: Path,
 ) -> Path:
     model_slug = str(config["experiment"]["model_slug"])
-    expected_counts, manifest_sha256 = validate_complete_generation(config)
+    expected_ids = {
+        split: set(_expected_client_ids(config, split)) for split in FULL_SPLITS
+    }
+    evidence = validate_completion(config, list(FULL_SPLITS), expected_ids)
+    expected_counts = {split: len(expected_ids[split]) for split in FULL_SPLITS}
+    manifest_sha256 = evidence["manifest_sha256"]
     marker = {
         "run_id": run_id,
         "dataset": "gender",
