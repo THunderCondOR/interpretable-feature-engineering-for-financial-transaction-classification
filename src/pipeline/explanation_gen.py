@@ -282,6 +282,7 @@ def run_explanation_generation(
 
     n_samples = config.get("pipeline", {}).get("n_explanation_samples", 1)
     llm_cfg = dict(config["llm"])
+    llm_cfg.update(config.get("execution", {}))
     llm_cfg.update(config.get("generation", {}))
     model = str(llm_cfg.get("model", llm_cfg["default_model"]))
     label_names = config["dataset"].get("label_names", {})
@@ -393,6 +394,7 @@ def run_explanation_generation(
         )
         llm_cfg.setdefault("scheduler_state_dir", str(save_path.parent / ".scheduler" / save_path.stem))
         llm_cfg.setdefault("events_path", str(save_path.parent / ".scheduler" / f"{save_path.stem}.events.jsonl"))
+        llm_cfg["event_context"] = {"dataset": config["dataset"]["name"], "model": model, "stage": "explanations", "split": split}
 
         print(f"Sending {len(dialogues)} requests to {model} ({n_samples} per client configured)...")
         checkpointed_keys: set[RequestKey] = set()

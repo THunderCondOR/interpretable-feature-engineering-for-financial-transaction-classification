@@ -35,6 +35,7 @@ class AtomicAdaptiveScheduler:
         self.backoff = float(config.get("retry_backoff", 2))
         self.max_attempts = int(config.get("max_window_attempts", 20))
         self.signature = str(config.get("generation_signature", "unspecified"))
+        self.event_context = dict(config.get("event_context", {}))
         self.state_dir = Path(config["scheduler_state_dir"]) if config.get("scheduler_state_dir") else None
         self.events_path = Path(config["events_path"]) if config.get("events_path") else None
         self.sleep = sleep
@@ -51,7 +52,7 @@ class AtomicAdaptiveScheduler:
         if not self.events_path:
             return
         self.events_path.parent.mkdir(parents=True, exist_ok=True)
-        record = {"timestamp": time.time(), "event": event, "generation_signature": self.signature, **payload}
+        record = {"timestamp": time.time(), "event": event, "generation_signature": self.signature, **self.event_context, **payload}
         with open(self.events_path, "a", encoding="utf-8") as file:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
 

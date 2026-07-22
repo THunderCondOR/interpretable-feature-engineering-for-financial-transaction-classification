@@ -182,6 +182,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
 
     n_samples = config.get("pipeline", {}).get("n_claims_samples", 1)
     llm_cfg = dict(config["llm"])
+    llm_cfg.update(config.get("execution", {}))
     llm_cfg.update(config.get("claims_generation", {}))
     model = str(llm_cfg.get("model", llm_cfg["default_model"]))
     llm_cfg["max_tokens"] = int(
@@ -309,6 +310,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
     llm_cfg["generation_signature"] = generation_signature
     llm_cfg.setdefault("scheduler_state_dir", str(save_path.parent / ".scheduler" / save_path.stem))
     llm_cfg.setdefault("events_path", str(save_path.parent / ".scheduler" / f"{save_path.stem}.events.jsonl"))
+    llm_cfg["event_context"] = {"dataset": config["dataset"]["name"], "model": model, "stage": "claims", "split": split}
 
     def checkpoint(batch_results: list[tuple[int, dict]]) -> None:
         if llm_cfg.get("until_complete"):

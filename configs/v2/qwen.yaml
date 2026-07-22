@@ -1,0 +1,31 @@
+experiment:
+  run_id: reviewer-v2
+  model_slug: qwen
+  seed: 17
+generation:
+  model: Qwen/Qwen3.5-122B-A10B
+  temperature: 0.8
+  top_p: 0.9
+  seed: 17
+claims_generation:
+  model: Qwen/Qwen3.5-122B-A10B
+  temperature: 0.0
+  top_p: 1.0
+  seed: 17
+execution:
+  initial_concurrency: 64
+  fallback_concurrency: 10
+  recovery_clean_batches: 10
+  cooldown_seconds: 60
+  atomic_windows: true
+  until_complete: true
+  verify_ssl: true
+  events_path: logs/runs/reviewer-v2/qwen.events.jsonl
+clustering:
+  mode: label_agnostic
+  feature_encoding: binary
+  min_client_coverage: 5
+  distance_threshold: 0.010
+  max_assign_distance: 0.45
+feature_selection:
+  enabled: false
