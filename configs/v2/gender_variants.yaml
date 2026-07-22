@@ -9,6 +9,20 @@ pilot:
     - neutral_only
     - neutral_robust_fewshot
     - neutral_robust_zero_shot
+  variant_settings:
+    legacy:
+      source: immutable_existing_predictions
+    neutral_only:
+      statistics.summary_profile: legacy_mean_categories
+      pipeline.few_shot_strategy: random
+    neutral_robust_fewshot:
+      statistics.summary_profile: robust
+      pipeline.few_shot_strategy: representative
+      pipeline.few_shot_per_class: 2
+      pipeline.few_shot_seed: 137
+    neutral_robust_zero_shot:
+      statistics.summary_profile: robust
+      pipeline.few_shot_per_class: 0
   selection_rule:
     practical_equivalence_points: 1.0
     require_overlapping_confidence_intervals: true

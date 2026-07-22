@@ -14,6 +14,7 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
+import numpy as np
 from tqdm import tqdm
 
 from src.data.aggregator import get_summary_fn
@@ -63,12 +64,16 @@ def build_few_shot_str(
     seed: int = 42,
 ) -> str:
     """Sample labeled train clients per class and format them as few-shot examples."""
+    seed = int(config.get("pipeline", {}).get("few_shot_seed", seed))
     rng = random.Random(seed)
     label_names = config["dataset"]["label_names"]
     category_label = config["dataset"].get("category_label", "категории трат")
     summary_fn = get_summary_fn(config)
     if n_per_class is None:
         n_per_class = config.get("pipeline", {}).get("few_shot_per_class", 1)
+    if int(n_per_class) == 0:
+        return ""
+    strategy = config.get("pipeline", {}).get("few_shot_strategy", "random")
 
     parts = ["Примеры клиентов из обучающей выборки:\n"]
     i = 1
@@ -79,7 +84,22 @@ def build_few_shot_str(
         ids = labeled_df.loc[labeled_df["label"] == label_id, "customer_id"].unique().tolist()
         if not ids:
             continue
-        sampled = rng.sample(ids, k=min(n_per_class, len(ids)))
+        if strategy == "representative":
+            candidates = labeled_df[labeled_df["customer_id"].isin(ids)].groupby("customer_id").agg(
+                transaction_count=("amount", "size"),
+                transaction_volume=("amount", lambda values: values.abs().sum()),
+            )
+            distances = np.zeros(len(candidates), dtype=float)
+            for column in candidates.columns:
+                median = candidates[column].median()
+                scale = candidates[column].quantile(.75) - candidates[column].quantile(.25)
+                distances += np.abs(candidates[column].to_numpy() - median) / max(float(scale), 1.0)
+            candidates = candidates.assign(distance=distances).sort_values(["distance", "customer_id"])
+            sampled = candidates.index[: min(n_per_class, len(candidates))].tolist()
+        elif strategy == "random":
+            sampled = rng.sample(ids, k=min(n_per_class, len(ids)))
+        else:
+            raise ValueError(f"Unknown few_shot_strategy: {strategy}")
         for cid in sampled:
             client_df = labeled_df[labeled_df["customer_id"] == cid]
             summary = summary_fn(client_df, category_label)

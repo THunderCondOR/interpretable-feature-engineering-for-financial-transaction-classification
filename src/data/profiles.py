@@ -215,6 +215,19 @@ def format_robust_summary(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_legacy_mean_category_summary(df: pd.DataFrame, config: dict) -> str:
+    """Corrected legacy-format category means used only by the neutral pilot."""
+    lines = ["# Training-split category-frequency summary (legacy format)"]
+    category_label = config["dataset"].get("category_label", "категории операций")
+    for label, name in config["dataset"].get("label_names", {}).items():
+        group = df[df["label"] == int(label)]
+        counts = group.groupby(["customer_id", "mcc_code_desc"]).size().reset_index(name="count")
+        means = counts.groupby("mcc_code_desc")["count"].mean().sort_values(ascending=False).head(25)
+        lines.extend(["", f"## {name}", f"| {category_label} | mean count among clients using category |", "|---|---:|"])
+        lines.extend(f"| {category} | {value:.3f} |" for category, value in means.items())
+    return "\n".join(lines)
+
+
 def export_robust_statistics(payload: dict[str, Any], output_dir: str | Path, stem: str = "robust_statistics") -> dict[str, Path]:
     """Export one payload as JSON, long CSV, Markdown, and LaTeX."""
     output = Path(output_dir)

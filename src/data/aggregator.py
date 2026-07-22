@@ -21,6 +21,7 @@ import pandas as pd
 
 from src.data.profiles import (
     format_client_profile,
+    format_legacy_mean_category_summary,
     format_robust_summary,
     robust_statistics_payload,
 )
@@ -259,6 +260,8 @@ def _client_level_rosbank_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_dataset_summary_str(df: pd.DataFrame, config: dict) -> str:
     labelled = df[df["label"] >= 0] if "label" in df else df
+    if config.get("statistics", {}).get("summary_profile") == "legacy_mean_categories":
+        return format_legacy_mean_category_summary(labelled, config)
     return format_robust_summary(robust_statistics_payload(labelled, config))
 
 
