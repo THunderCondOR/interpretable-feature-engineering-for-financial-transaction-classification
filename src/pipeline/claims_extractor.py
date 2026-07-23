@@ -119,9 +119,14 @@ def _validate_claims(
     claims = [value.strip() for value in values if value.strip()]
     if not claims:
         return [], "EmptyClaims", "response did not contain a non-empty claim"
+    valid_claims: list[str] = []
+    rejected: list[tuple[str, str]] = []
     for claim in claims:
         if contains_cyrillic(claim):
-            return [], "NonEnglishClaims", f"claim contains Cyrillic: {claim[:120]!r}"
+            rejected.append(
+                ("NonEnglishClaims", f"claim contains Cyrillic: {claim[:120]!r}")
+            )
+            continue
         normalized = re.sub(r"[\s_-]+", " ", claim.lower())
         if any(
             re.search(
@@ -132,16 +137,37 @@ def _validate_claims(
             )
             for label in forbidden_labels
         ):
-            return [], "TargetLabelLeakage", f"claim contains a target label: {claim[:120]!r}"
+            rejected.append(
+                (
+                    "TargetLabelLeakage",
+                    f"claim contains a target label: {claim[:120]!r}",
+                )
+            )
+            continue
         # Numeric category identifiers are names, not quantitative evidence.
         without_category_ids = re.sub(
             r"\boperation group \d+\b", "operation group", claim, flags=re.I
         )
         if re.search(r"\d", without_category_ids):
-            return [], "NumericClaim", f"claim contains an exact number: {claim[:120]!r}"
+            rejected.append(
+                ("NumericClaim", f"claim contains an exact number: {claim[:120]!r}")
+            )
+            continue
         if not re.match(r"^The client(?:'s|\b)", claim, flags=re.I):
-            return [], "InvalidClaimSubject", f"claim must use 'The client': {claim[:120]!r}"
-    return claims, None, None
+            rejected.append(
+                (
+                    "InvalidClaimSubject",
+                    f"claim must use 'The client': {claim[:120]!r}",
+                )
+            )
+            continue
+        valid_claims.append(claim)
+    if valid_claims:
+        return valid_claims, None, None
+    if rejected:
+        error_type, error = rejected[0]
+        return [], error_type, error
+    return [], "EmptyClaims", "response did not contain a valid claim"
 
 
 def _parse_claim_result(
@@ -255,6 +281,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
         inputs={
             "system_prompt": claims_sys,
             "user_prompt": claims_usr_t,
+            "forbidden_labels": sorted(forbidden_labels),
         },
         configuration={
             "model": model,
@@ -360,7 +387,12 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
             continue
         for rec in selected:
             rationale = _behavioral_text(rec.get("explanation", ""))
-            user_prompt = claims_usr_t.format(COT=rationale)
+            user_prompt = claims_usr_t.format(
+                COT=rationale,
+                FORBIDDEN_LABELS="\n".join(
+                    f"- {label}" for label in sorted(forbidden_labels)
+                ),
+            )
             assert_english_model_text(
                 user_prompt, context=f"claims user prompt {rec['customer_id']}"
             )

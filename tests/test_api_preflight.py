@@ -69,7 +69,7 @@ def _fixture_configs(tmp_path: Path) -> tuple[list[Path], dict[str, dict[str, in
                 "{FEW_SHOT_SECTION}\n{CLIENT_STATS}"
             ),
             "claims_system": "Extract English claims.",
-            "claims_user": "{COT}",
+            "claims_user": "{FORBIDDEN_LABELS}\n{COT}",
         }
         prompt_names = {}
         for key, text in prompt_text.items():

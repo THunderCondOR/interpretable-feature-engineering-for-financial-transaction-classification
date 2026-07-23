@@ -1,5 +1,11 @@
 Extract atomic behavioral claims from the rationale below. The final predicted label has already been removed.
 
+FORBIDDEN TARGET-LABEL TERMS
+
+{FORBIDDEN_LABELS}
+
+Do not output a claim that contains one of these terms or merely states that the client resembles a predicted class. Keep only the underlying transaction behavior.
+
 RATIONALE
 
 {COT}

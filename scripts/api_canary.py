@@ -60,6 +60,17 @@ def _completion_kwargs(config: dict[str, Any], section: str) -> dict[str, Any]:
     return kwargs
 
 
+def _forbidden_labels(config: dict[str, Any]) -> set[str]:
+    return {
+        str(value)
+        for value in (
+            list(config["dataset"]["label_names"].values())
+            + list(config["dataset"].get("claim_forbidden_terms", []))
+        )
+        if str(value).strip()
+    }
+
+
 def _claims_dialogue(config: dict[str, Any], explanation: str) -> list[dict[str, str]]:
     prompt_config = config["prompts"]
     base_dir = Path(prompt_config["base_dir"])
@@ -71,7 +82,12 @@ def _claims_dialogue(config: dict[str, Any], explanation: str) -> list[dict[str,
         {"role": "system", "content": system},
         {
             "role": "user",
-            "content": user_template.format(COT=_behavioral_text(explanation)),
+            "content": user_template.format(
+                COT=_behavioral_text(explanation),
+                FORBIDDEN_LABELS="\n".join(
+                    f"- {label}" for label in sorted(_forbidden_labels(config))
+                ),
+            ),
         },
     ]
 
@@ -115,13 +131,7 @@ def run_model_canary(
     if explanation_record is None or not _is_successful(explanation_record):
         raise RuntimeError(f"Explanation canary failed: {explanation_error}")
 
-    forbidden = {
-        str(value)
-        for value in (
-            list(config["dataset"]["label_names"].values())
-            + list(config["dataset"].get("claim_forbidden_terms", []))
-        )
-    }
+    forbidden = _forbidden_labels(config)
     claims: list[str] = []
     claim_error = "no attempt"
     for _ in range(repair_attempts):

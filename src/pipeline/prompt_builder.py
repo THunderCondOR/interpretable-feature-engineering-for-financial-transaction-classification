@@ -139,6 +139,8 @@ def validate_prompt_contract(config: dict) -> None:
             raise ValueError(f"User template is missing placeholder: {placeholder}")
     if "{COT}" not in claims_user:
         raise ValueError("Claims user template is missing {COT}")
+    if "{FORBIDDEN_LABELS}" not in claims_user:
+        raise ValueError("Claims user template is missing {FORBIDDEN_LABELS}")
 
 
 def build_few_shot_str(

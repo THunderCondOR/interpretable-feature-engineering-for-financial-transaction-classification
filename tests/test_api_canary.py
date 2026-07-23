@@ -102,7 +102,8 @@ def test_canary_validates_real_explanation_to_claims_contract():
     assert result["claims_parsed"] == 2
     claims_prompt = completions.calls[1]["messages"][1]["content"]
     assert "Final:" not in claims_prompt
-    assert "retained_client" not in claims_prompt
+    assert "- retained_client" in claims_prompt
+    assert "retained_client" not in claims_prompt.split("RATIONALE", 1)[1]
     assert completions.calls[1]["extra_body"] == {
         "chat_template_kwargs": {"enable_thinking": False}
     }

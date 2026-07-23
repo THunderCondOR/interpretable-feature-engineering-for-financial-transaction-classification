@@ -57,6 +57,20 @@ def test_claim_contract_rejects_target_labels_numbers_cyrillic_and_bad_subjects(
         assert error_type == expected
 
 
+def test_claim_contract_discards_invalid_items_but_keeps_valid_atomic_claims():
+    values, error_type, error = _validate_claims(
+        [
+            "The client resembles the retained class.",
+            "The client has sustained transaction activity.",
+            "The client made 12 transactions.",
+        ],
+        forbidden_labels={"retained"},
+    )
+    assert values == ["The client has sustained transaction activity."]
+    assert error_type is None
+    assert error is None
+
+
 def test_claim_parser_rejects_truncation_and_non_string_schema():
     claims, error_type, _ = _parse_claim_result(
         _result('["The client is active."]', finish_reason="length")

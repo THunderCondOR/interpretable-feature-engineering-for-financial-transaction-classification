@@ -72,7 +72,7 @@ def test_long_prompts_are_not_blocked_or_truncated_and_have_telemetry(tmp_path):
         "Extract English claims.", encoding="utf-8"
     )
     (tmp_path / "claims_user.txt").write_text(
-        "Rationale:\n{COT}", encoding="utf-8"
+        "Forbidden:\n{FORBIDDEN_LABELS}\nRationale:\n{COT}", encoding="utf-8"
     )
     settings = config(few_shot_per_class=0)
     settings["dataset"].update(
