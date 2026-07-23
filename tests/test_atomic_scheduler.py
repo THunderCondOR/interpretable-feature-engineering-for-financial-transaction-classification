@@ -17,6 +17,7 @@ def limited():
 def config(tmp_path, name="worker"):
     return {
         "initial_concurrency": 64, "fallback_concurrency": 10,
+        "minimum_concurrency": 1, "fallback_rate_limit_attempts": 3,
         "recovery_clean_batches": 10, "cooldown_seconds": 60,
         "generation_signature": name,
         "scheduler_state_dir": str(tmp_path / name),
@@ -243,3 +244,90 @@ def test_until_complete_is_not_limited_by_default_window_attempt_cap(tmp_path):
     result = asyncio.run(scheduler.run([1], execute))
     assert attempts == 22
     assert result[0]["response"] == "ok-0"
+
+
+def test_scheduler_recovers_64_to_10_to_1_to_10_to_64(tmp_path):
+    calls = []
+
+    async def execute(window, concurrency):
+        calls.append(concurrency)
+        if len(calls) <= 4:
+            return [(window[0][0], limited())]
+        return [(index, ok(index)) for index, _ in window]
+
+    scheduler = AtomicAdaptiveScheduler(
+        config(tmp_path), sleep=lambda _: asyncio.sleep(0)
+    )
+    asyncio.run(scheduler.run(list(range(174)), execute))
+    assert calls[:4] == [64, 10, 10, 10]
+    assert calls[4:14] == [1] * 10
+    assert calls[14:24] == [10] * 10
+    assert calls[24] == 64
+
+
+def test_crash_resume_preserves_fallback_mode_and_counters(tmp_path):
+    state = config(tmp_path)
+    calls = 0
+
+    async def fail_then_crash(window, concurrency):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [(window[0][0], limited())]
+        assert concurrency == 10
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            AtomicAdaptiveScheduler(
+                state, sleep=lambda _: asyncio.sleep(0)
+            ).run(list(range(20)), fail_then_crash)
+        )
+
+    resumed = []
+
+    async def recover(window, concurrency):
+        resumed.append(concurrency)
+        return [(index, ok(index)) for index, _ in window]
+
+    asyncio.run(
+        AtomicAdaptiveScheduler(
+            state, sleep=lambda _: asyncio.sleep(0)
+        ).run(list(range(20)), recover)
+    )
+    assert resumed[0] == 10
+
+
+def test_crash_during_rate_limit_cooldown_resumes_new_mode(tmp_path):
+    state = config(tmp_path)
+
+    async def limited_window(window, _concurrency):
+        return [(window[0][0], limited())]
+
+    async def crash_during_cooldown(_seconds):
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            AtomicAdaptiveScheduler(
+                state, sleep=crash_during_cooldown
+            ).run(list(range(12)), limited_window)
+        )
+    pending = json.loads(
+        (tmp_path / "worker" / "pending_batch.json").read_text()
+    )
+    assert pending["mode"] == "fallback"
+    assert pending["concurrency"] == 10
+
+    resumed = []
+
+    async def recover(window, concurrency):
+        resumed.append(concurrency)
+        return [(index, ok(index)) for index, _ in window]
+
+    asyncio.run(
+        AtomicAdaptiveScheduler(
+            state, sleep=lambda _: asyncio.sleep(0)
+        ).run(list(range(12)), recover)
+    )
+    assert resumed[0] == 10

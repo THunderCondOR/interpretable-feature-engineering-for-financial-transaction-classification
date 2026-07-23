@@ -22,9 +22,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.run_gender_v2 import PILOT_SIZE, PILOT_SAMPLING_SEED, PILOT_VARIANTS, stratified_pilot_ids
+from scripts.run_prompt_pilot import (
+    PILOT_SIZE,
+    PILOT_SAMPLING_SEED,
+    PILOT_VARIANTS,
+    stratified_pilot_ids,
+)
 from scripts.run_model_queue import default_jobs
-from src.experiments.artifacts import build_run_manifest
+from src.experiments.artifacts import build_run_manifest, fingerprint
 from src.experiments.config_builder import build_runtime_config
 
 
@@ -211,79 +216,64 @@ def validate_datasets(
     return observed
 
 
-def validate_gender_legacy_pilot(
+def validate_prompt_pilot_samples(
     repo_root: Path,
-    gender_config_path: Path,
-) -> dict[str, Any]:
-    """Prove exact legacy coverage for the deterministic 400-client pilot."""
+    dataset_config_paths: list[Path],
+) -> dict[str, dict[str, Any]]:
+    """Materialize all three deterministic validation ID sets in memory only."""
     pandas = importlib.import_module("pandas")
-    config = _load_yaml(gender_config_path)
-    dataset = config["dataset"]
-    columns = dataset["columns"]
-    validation_path = _resolve_repo_path(repo_root, dataset["splits"]["val"])
-    frame = pandas.read_csv(
-        validation_path,
-        usecols=[columns["customer_id"], columns["amount"], columns["label"]],
-    ).rename(
-        columns={
-            columns["customer_id"]: "customer_id",
-            columns["amount"]: "amount",
-            columns["label"]: "label",
+    result: dict[str, dict[str, Any]] = {}
+    for config_path in dataset_config_paths:
+        config = _load_yaml(config_path)
+        dataset = str(config["dataset"]["name"])
+        columns = config["dataset"]["columns"]
+        validation_path = _resolve_repo_path(
+            repo_root, config["dataset"]["splits"]["val"]
+        )
+        frame = pandas.read_csv(
+            validation_path,
+            usecols=[
+                columns["customer_id"],
+                columns["amount"],
+                columns["label"],
+            ],
+        ).rename(
+            columns={
+                columns["customer_id"]: "customer_id",
+                columns["amount"]: "amount",
+                columns["label"]: "label",
+            }
+        )
+        identifiers = stratified_pilot_ids(
+            frame,
+            n_clients=PILOT_SIZE,
+            seed=PILOT_SAMPLING_SEED,
+        )
+        if len(identifiers) != PILOT_SIZE or len(set(identifiers)) != PILOT_SIZE:
+            raise PreflightError(
+                f"{dataset} pilot selected {len(identifiers)} rows / "
+                f"{len(set(identifiers))} unique IDs, expected {PILOT_SIZE}"
+            )
+        labels = (
+            frame[frame["customer_id"].isin(identifiers)]
+            .groupby("customer_id")["label"]
+            .first()
+        )
+        if set(labels.unique()) != set(frame["label"].unique()):
+            raise PreflightError(
+                f"{dataset} pilot does not cover every validation class"
+            )
+        result[dataset] = {
+            "sampling_seed": PILOT_SAMPLING_SEED,
+            "selected": len(identifiers),
+            "client_ids_sha256": fingerprint(identifiers),
+            "variants": list(PILOT_VARIANTS),
         }
-    )
-    pilot_ids = stratified_pilot_ids(
-        frame,
-        n_clients=PILOT_SIZE,
-        seed=PILOT_SAMPLING_SEED,
-    )
-    if len(pilot_ids) != PILOT_SIZE or len(set(pilot_ids)) != PILOT_SIZE:
+    if set(result) != set(EXPECTED_CLIENT_COUNTS):
         raise PreflightError(
-            f"Gender pilot selected {len(pilot_ids)} rows / {len(set(pilot_ids))} "
-            f"unique IDs, expected {PILOT_SIZE}"
+            f"Prompt pilot datasets mismatch: {sorted(result)}"
         )
-
-    explanations = _resolve_repo_path(
-        repo_root,
-        Path(config["output"]["base_dir"]) / "explanations_val.jsonl",
-    )
-    if not explanations.is_file():
-        raise PreflightError(f"Missing legacy gender predictions: {explanations}")
-    expected = set(pilot_ids)
-    observed: dict[int, dict[str, Any]] = {}
-    with explanations.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-                client_id = int(row["customer_id"])
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-                raise PreflightError(
-                    f"Malformed legacy prediction at {explanations}:{line_number}: {exc}"
-                ) from exc
-            if client_id not in expected:
-                continue
-            if client_id in observed:
-                raise PreflightError(
-                    f"Duplicate legacy gender prediction for pilot client {client_id}"
-                )
-            observed[client_id] = row
-    missing = expected - set(observed)
-    failed = [
-        client_id
-        for client_id, row in observed.items()
-        if row.get("error") or row.get("predicted") is None
-    ]
-    if missing or failed:
-        raise PreflightError(
-            "Legacy gender pilot coverage is incomplete: "
-            f"missing={len(missing)}, failed_or_unparsed={len(failed)}"
-        )
-    return {
-        "sampling_seed": PILOT_SAMPLING_SEED,
-        "selected": len(pilot_ids),
-        "covered": len(observed),
-    }
+    return result
 
 
 def planned_runtime_configs(
@@ -304,35 +294,19 @@ def planned_runtime_configs(
         for base in (_load_yaml(path) for path in dataset_configs)
     }
     configs: list[dict[str, Any]] = []
-    for dataset in ("age", "rosbank"):
-        for profile in profiles.values():
-            config = build_runtime_config(
-                bases[dataset],
-                profile,
-                run_id=run_id,
-                variant="robust_zero_shot_v2",
-                sampling_seed=137,
-                generation_seed=17,
-                claims_seed=17,
-                ml_seed=17,
-                results_root=Path("results/v2"),
-                expected_client_counts=EXPECTED_CLIENT_COUNTS[dataset],
-            )
-            model_slug = config["experiment"]["model_slug"]
-            config["output"]["completion_marker"] = str(
-                Path("logs/runs")
-                / run_id
-                / "completion"
-                / f"{model_slug}_{dataset}.json"
-            )
-            configs.append(config)
-    # Selection may choose any pilot variant; validate every possible final
-    # output root for both models before the first paid request.
-    for variant in PILOT_VARIANTS:
-        for profile in profiles.values():
-            configs.append(
-                build_runtime_config(
-                    bases["gender"],
+    # Every dataset may select any of the three variants.  Validate both final
+    # model roots and the Qwen pilot root for every possible selection.
+    for dataset in ("gender", "age", "rosbank"):
+        pilot_ids_path = (
+            Path("logs/runs")
+            / run_id
+            / "generated"
+            / f"{dataset}_pilot_client_ids.json"
+        )
+        for variant in PILOT_VARIANTS:
+            for profile in profiles.values():
+                config = build_runtime_config(
+                    bases[dataset],
                     profile,
                     run_id=run_id,
                     variant=variant,
@@ -341,29 +315,27 @@ def planned_runtime_configs(
                     claims_seed=17,
                     ml_seed=17,
                     results_root=Path("results/v2"),
-                    expected_client_counts=EXPECTED_CLIENT_COUNTS["gender"],
+                    expected_client_counts=EXPECTED_CLIENT_COUNTS[dataset],
+                )
+                configs.append(config)
+            configs.append(
+                build_runtime_config(
+                    bases[dataset],
+                    profiles["qwen"],
+                    run_id=run_id,
+                    variant=variant,
+                    sampling_seed=PILOT_SAMPLING_SEED,
+                    generation_seed=17,
+                    claims_seed=17,
+                    ml_seed=17,
+                    results_root=Path("results/v2/pilot"),
+                    client_ids_by_split={"val": str(pilot_ids_path)},
+                    expected_client_counts={
+                        **EXPECTED_CLIENT_COUNTS[dataset],
+                        "val": PILOT_SIZE,
+                    },
                 )
             )
-        pilot_ids_path = Path("logs/runs") / run_id / "generated/gender_pilot_client_ids.json"
-        configs.append(
-            build_runtime_config(
-                bases["gender"],
-                profiles["qwen"],
-                run_id=run_id,
-                variant=variant,
-                sampling_seed=PILOT_SAMPLING_SEED,
-                generation_seed=17,
-                claims_seed=17,
-                ml_seed=17,
-                results_root=Path("results/v2/pilot"),
-                client_ids_by_split={"val": str(pilot_ids_path)},
-                expected_client_counts={
-                    "train": EXPECTED_CLIENT_COUNTS["gender"]["train"],
-                    "val": PILOT_SIZE,
-                    "test": EXPECTED_CLIENT_COUNTS["gender"]["test"],
-                },
-            )
-        )
     return configs
 
 
@@ -425,9 +397,23 @@ def validate_queue_matrix(
         if {job.get("dataset") for job in full} != set(EXPECTED_CLIENT_COUNTS):
             raise PreflightError(f"Queue does not cover all datasets for {model}")
     pilot = [job for job in jobs_by_model["qwen"] if job.get("stage") == "pilot"]
-    if len(pilot) != 1 or pilot[0].get("expected_client_counts") != {"val": PILOT_SIZE}:
-        raise PreflightError("Qwen queue does not contain the exact gender pilot")
-    return {"models": 2, "full_jobs": 6, "split_cells_per_model": 9}
+    if (
+        len(pilot) != 3
+        or {job.get("dataset") for job in pilot} != set(EXPECTED_CLIENT_COUNTS)
+        or any(
+            job.get("expected_client_counts") != {"val": PILOT_SIZE}
+            for job in pilot
+        )
+    ):
+        raise PreflightError(
+            "Qwen queue must contain exact 400-client pilots for all datasets"
+        )
+    return {
+        "models": 2,
+        "full_jobs": 6,
+        "pilot_jobs": 3,
+        "split_cells_per_model": 9,
+    }
 
 
 def probe_models(
@@ -477,11 +463,7 @@ def run_preflight(
     counts = validate_datasets(repo_root, dataset_configs, expected_counts)
     production_contract = expected_counts == EXPECTED_CLIENT_COUNTS
     if production_contract:
-        config_by_name = {
-            str(_load_yaml(path)["dataset"]["name"]): path
-            for path in dataset_configs
-        }
-        pilot = validate_gender_legacy_pilot(repo_root, config_by_name["gender"])
+        pilot = validate_prompt_pilot_samples(repo_root, dataset_configs)
         runtime_configs = planned_runtime_configs(
             repo_root=repo_root,
             run_id=run_id,
@@ -518,8 +500,8 @@ def run_preflight(
         "models": [profile["slug"] for profile in profiles],
         "datasets": counts,
         "clients_per_model": sum(sum(splits.values()) for splits in counts.values()),
-        "estimated_api_requests": 174_800,
-        "gender_legacy_pilot": pilot,
+        "estimated_api_requests": 177_200,
+        "prompt_pilots": pilot,
         "runtime_outputs": outputs,
         "queue": queue,
         "probed_models": probed,

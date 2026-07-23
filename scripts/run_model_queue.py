@@ -24,8 +24,9 @@ EXPECTED_CLIENT_COUNTS = {
 }
 
 
-def _gender_command(
+def _pilot_command(
     *,
+    dataset: str,
     run_id: str,
     model_config: Path,
     stage: str,
@@ -33,7 +34,9 @@ def _gender_command(
 ) -> list[str]:
     command = [
         sys.executable,
-        "scripts/run_gender_v2.py",
+        "scripts/run_prompt_pilot.py",
+        "--dataset",
+        dataset,
         "--run-id",
         run_id,
         "--stage",
@@ -52,6 +55,8 @@ def _full_generation_command(
     run_id: str,
     model_config: Path,
     dataset: str,
+    selected_config: Path,
+    selection: Path,
 ) -> list[str]:
     return [
         sys.executable,
@@ -62,8 +67,10 @@ def _full_generation_command(
         dataset,
         "--model-config",
         str(model_config),
-        "--variant",
-        "robust_zero_shot_v2",
+        "--selected-config",
+        str(selected_config),
+        "--selection",
+        str(selection),
         "--splits",
         "train,val,test",
         "--execute",
@@ -80,147 +87,96 @@ def default_jobs(
 ) -> list[dict[str, Any]]:
     model = profile["experiment"]["model_slug"]
     run_root = Path("logs/runs") / run_id
-    selection = str(run_root / "generated" / "gender_selection.json")
     completion = run_root / "completion"
+    generated = run_root / "generated"
+
+    def selection_path(dataset: str) -> Path:
+        return generated / f"{dataset}_selection.json"
+
+    def selected_config(dataset: str, model_slug: str) -> Path:
+        return generated / f"{dataset}_selected_{model_slug}.yaml"
+
+    def pilot_job(dataset: str) -> dict[str, Any]:
+        marker = completion / f"qwen_{dataset}_pilot.json"
+        return {
+            "id": f"{dataset}_pilot",
+            "dataset": dataset,
+            "model": model,
+            "variant": "controlled_prompt_pilot_v3",
+            "stage": "pilot",
+            "api": True,
+            "expected_splits": ["val"],
+            "expected_client_counts": {"val": 400},
+            "expected_outputs": [str(marker)],
+            "command": _pilot_command(
+                dataset=dataset,
+                run_id=run_id,
+                model_config=model_config,
+                stage="pilot",
+                api=True,
+            ),
+        }
+
+    def selection_job(dataset: str) -> dict[str, Any]:
+        marker = completion / f"qwen_{dataset}_pilot.json"
+        return {
+            "id": f"{dataset}_select",
+            "dataset": dataset,
+            "model": model,
+            "variant": "selected_by_validation_v3",
+            "stage": "select",
+            "api": False,
+            "wait_for": str(marker),
+            "expected_outputs": [str(selection_path(dataset))],
+            "command": _pilot_command(
+                dataset=dataset,
+                run_id=run_id,
+                model_config=model_config,
+                stage="select",
+                api=False,
+            ),
+        }
+
+    def full_job(dataset: str, model_slug: str) -> dict[str, Any]:
+        return {
+            "id": f"{dataset}_{model_slug}_full",
+            "dataset": dataset,
+            "model": model_slug,
+            "variant": "selected_by_validation_v3",
+            "stage": "full",
+            "api": True,
+            "expected_splits": ["train", "val", "test"],
+            "expected_client_counts": EXPECTED_CLIENT_COUNTS[dataset],
+            "wait_for": str(selection_path(dataset)),
+            "expected_outputs": [
+                str(completion / f"{model_slug}_{dataset}.json")
+            ],
+            "command": _full_generation_command(
+                run_id=run_id,
+                model_config=model_config,
+                dataset=dataset,
+                selected_config=selected_config(dataset, model_slug),
+                selection=selection_path(dataset),
+            ),
+        }
+
     if model == "qwen":
-        pilot_completion = str(completion / "qwen_gender_pilot.json")
         return [
-            {
-                "id": "gender_pilot",
-                "dataset": "gender",
-                "model": model,
-                "variant": "gender_pilot",
-                "stage": "pilot",
-                "api": True,
-                "expected_splits": ["val"],
-                "expected_client_counts": {"val": 400},
-                "expected_outputs": [pilot_completion],
-                "command": _gender_command(
-                    run_id=run_id,
-                    model_config=model_config,
-                    stage="pilot",
-                    api=True,
-                ),
-            },
-            {
-                "id": "gender_select",
-                "dataset": "gender",
-                "model": model,
-                "variant": "selected_by_validation",
-                "stage": "select",
-                "api": False,
-                "wait_for": pilot_completion,
-                "expected_outputs": [selection],
-                "command": _gender_command(
-                    run_id=run_id,
-                    model_config=model_config,
-                    stage="select",
-                    api=False,
-                ),
-            },
-            {
-                "id": "gender_full",
-                "dataset": "gender",
-                "model": model,
-                "variant": "selected_by_validation",
-                "stage": "full",
-                "api": True,
-                "expected_splits": ["train", "val", "test"],
-                "expected_client_counts": EXPECTED_CLIENT_COUNTS["gender"],
-                "wait_for": selection,
-                "expected_outputs": [str(completion / "qwen_gender.json")],
-                "command": _gender_command(
-                    run_id=run_id,
-                    model_config=model_config,
-                    stage="full",
-                    api=True,
-                ),
-            },
-            {
-                "id": "rosbank_qwen_full",
-                "dataset": "rosbank",
-                "model": model,
-                "variant": "robust_zero_shot_v2",
-                "stage": "full",
-                "api": True,
-                "expected_splits": ["train", "val", "test"],
-                "expected_client_counts": EXPECTED_CLIENT_COUNTS["rosbank"],
-                "expected_outputs": [str(completion / "qwen_rosbank.json")],
-                "command": _full_generation_command(
-                    run_id=run_id,
-                    model_config=model_config,
-                    dataset="rosbank",
-                ),
-            },
-            {
-                "id": "age_qwen_full",
-                "dataset": "age",
-                "model": model,
-                "variant": "robust_zero_shot_v2",
-                "stage": "full",
-                "api": True,
-                "expected_splits": ["train", "val", "test"],
-                "expected_client_counts": EXPECTED_CLIENT_COUNTS["age"],
-                "expected_outputs": [str(completion / "qwen_age.json")],
-                "command": _full_generation_command(
-                    run_id=run_id,
-                    model_config=model_config,
-                    dataset="age",
-                ),
-            },
+            pilot_job("rosbank"),
+            selection_job("rosbank"),
+            pilot_job("gender"),
+            selection_job("gender"),
+            pilot_job("age"),
+            selection_job("age"),
+            full_job("gender", model),
+            full_job("rosbank", model),
+            full_job("age", model),
         ]
     if model == "gpt_oss":
         return [
-            {
-                "id": "rosbank_gpt_oss_full",
-                "dataset": "rosbank",
-                "model": model,
-                "variant": "robust_zero_shot_v2",
-                "stage": "full",
-                "api": True,
-                "expected_splits": ["train", "val", "test"],
-                "expected_client_counts": EXPECTED_CLIENT_COUNTS["rosbank"],
-                "expected_outputs": [str(completion / "gpt_oss_rosbank.json")],
-                "command": _full_generation_command(
-                    run_id=run_id,
-                    model_config=model_config,
-                    dataset="rosbank",
-                ),
-            },
-            {
-                "id": "gender_gpt_oss_full",
-                "dataset": "gender",
-                "model": model,
-                "variant": "selected_by_validation",
-                "stage": "full",
-                "api": True,
-                "expected_splits": ["train", "val", "test"],
-                "expected_client_counts": EXPECTED_CLIENT_COUNTS["gender"],
-                "wait_for": selection,
-                "expected_outputs": [str(completion / "gpt_oss_gender.json")],
-                "command": _gender_command(
-                    run_id=run_id,
-                    model_config=model_config,
-                    stage="gpt",
-                    api=True,
-                ),
-            },
-            {
-                "id": "age_gpt_oss_full",
-                "dataset": "age",
-                "model": model,
-                "variant": "robust_zero_shot_v2",
-                "stage": "full",
-                "api": True,
-                "expected_splits": ["train", "val", "test"],
-                "expected_client_counts": EXPECTED_CLIENT_COUNTS["age"],
-                "expected_outputs": [str(completion / "gpt_oss_age.json")],
-                "command": _full_generation_command(
-                    run_id=run_id,
-                    model_config=model_config,
-                    dataset="age",
-                ),
-            },
+            full_job("rosbank", model),
+            full_job("gender", model),
+            full_job("age", model),
         ]
     raise ValueError(f"Unsupported model_slug: {model}")
 

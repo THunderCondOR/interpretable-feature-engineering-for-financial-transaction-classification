@@ -120,7 +120,7 @@ def test_preflight_can_be_tested_without_git_or_network(tmp_path):
         probe=False,
     )
     assert result["clients_per_model"] == 18
-    assert result["estimated_api_requests"] == 174_800
+    assert result["estimated_api_requests"] == 177_200
     assert result["probed_models"] == []
 
 
@@ -203,7 +203,7 @@ def test_launcher_dry_run_has_no_writes_and_prints_guards_and_scope():
         text=True,
         env=os.environ.copy(),
     )
-    assert "estimated API requests: 174,800" in result.stdout
+    assert "estimated API requests: 177,200" in result.stdout
     assert result.stdout.count("DRY RUN: tmux new-session") == 3
     assert result.stdout.count("--execute-api") == 2
     assert "bash\\ -o\\ pipefail" in result.stdout

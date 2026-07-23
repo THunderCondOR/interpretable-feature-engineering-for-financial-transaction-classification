@@ -328,6 +328,19 @@ def main() -> None:
     parser.add_argument("--run-id")
     parser.add_argument("--results-root", type=Path, default=Path("results/v2"))
     parser.add_argument("--runtime-config", type=Path)
+    parser.add_argument(
+        "--selected-config",
+        type=Path,
+        help=(
+            "Use the content-addressed full config produced by run_prompt_pilot.py "
+            "instead of constructing a variant directly."
+        ),
+    )
+    parser.add_argument(
+        "--selection",
+        type=Path,
+        help="Content-addressed pilot selection artifact that owns --selected-config.",
+    )
     parser.add_argument("--completion-marker", type=Path)
     parser.add_argument("--sampling-seed", type=int, default=137)
     parser.add_argument("--generation-seed", type=int, default=17)
@@ -349,26 +362,91 @@ def main() -> None:
     profile = load_yaml(args.model_config)
     run_id = args.run_id or str(profile.get("experiment", {}).get("run_id", "reviewer-v2"))
     model_slug = slug(profile["experiment"]["model_slug"])
-    config = build_runtime_config(
-        base,
-        profile,
-        run_id=run_id,
-        variant=args.variant,
-        sampling_seed=args.sampling_seed,
-        generation_seed=args.generation_seed,
-        claims_seed=args.claims_seed,
-        ml_seed=args.ml_seed,
-        results_root=args.results_root,
-        expected_client_counts=EXPECTED_CLIENT_COUNTS[args.dataset],
-    )
+    if args.selected_config:
+        if (
+            args.runtime_config is not None
+            and args.runtime_config.resolve() != args.selected_config.resolve()
+        ):
+            raise RuntimeError(
+                "--runtime-config cannot differ from --selected-config"
+            )
+        if not args.selection or not args.selection.is_file():
+            raise RuntimeError(
+                "--selected-config requires an existing --selection artifact"
+            )
+        selection = json.loads(args.selection.read_text(encoding="utf-8"))
+        claimed_selection_hash = selection.get("selection_sha256")
+        unsigned_selection = {
+            key: value
+            for key, value in selection.items()
+            if key != "selection_sha256"
+        }
+        if (
+            selection.get("status") != "completed"
+            or selection.get("run_id") != run_id
+            or selection.get("dataset") != args.dataset
+            or not claimed_selection_hash
+            or fingerprint(unsigned_selection) != claimed_selection_hash
+        ):
+            raise RuntimeError(
+                f"Stale or incompatible selection artifact: {args.selection}"
+            )
+        selected_entry = selection.get("selected_configs", {}).get(model_slug, {})
+        if (
+            Path(str(selected_entry.get("path", ""))).resolve()
+            != args.selected_config.resolve()
+            or selected_entry.get("sha256") != file_sha256(args.selected_config)
+        ):
+            raise RuntimeError(
+                f"Selected config is not owned by {args.selection}: "
+                f"{args.selected_config}"
+            )
+        config = load_yaml(args.selected_config)
+        expected_identity = {
+            "run_id": run_id,
+            "dataset": args.dataset,
+            "model_slug": model_slug,
+        }
+        observed_identity = {
+            "run_id": config.get("experiment", {}).get("run_id"),
+            "dataset": config.get("dataset", {}).get("name"),
+            "model_slug": config.get("experiment", {}).get("model_slug"),
+        }
+        if observed_identity != expected_identity:
+            raise RuntimeError(
+                "Selected config identity mismatch: "
+                f"observed={observed_identity}, expected={expected_identity}"
+            )
+        declared_counts = config.get("dataset", {}).get(
+            "expected_client_counts", {}
+        )
+        if declared_counts != EXPECTED_CLIENT_COUNTS[args.dataset]:
+            raise RuntimeError(
+                f"Selected config client counts are incompatible: {declared_counts}"
+            )
+        selected_variant = str(config["experiment"]["variant"])
+    else:
+        config = build_runtime_config(
+            base,
+            profile,
+            run_id=run_id,
+            variant=args.variant,
+            sampling_seed=args.sampling_seed,
+            generation_seed=args.generation_seed,
+            claims_seed=args.claims_seed,
+            ml_seed=args.ml_seed,
+            results_root=args.results_root,
+            expected_client_counts=EXPECTED_CLIENT_COUNTS[args.dataset],
+        )
+        selected_variant = args.variant
     if int(config.get("pipeline", {}).get("n_explanation_samples", 1)) != 1:
         raise ValueError("Full LLM generation requires exactly one explanation per client")
     if int(config.get("pipeline", {}).get("n_claims_samples", 1)) != 1:
         raise ValueError("Full LLM generation requires exactly one claims response per client")
 
     generated_dir = Path("logs/runs") / run_id / "generated"
-    runtime_config = args.runtime_config or (
-        generated_dir / f"{args.dataset}_{slug(args.variant)}_{model_slug}.yaml"
+    runtime_config = args.runtime_config or args.selected_config or (
+        generated_dir / f"{args.dataset}_{slug(selected_variant)}_{model_slug}.yaml"
     )
     completion_marker = args.completion_marker or (
         Path("logs/runs")
@@ -383,7 +461,7 @@ def main() -> None:
         "run_id": run_id,
         "dataset": args.dataset,
         "model_slug": model_slug,
-        "variant": args.variant,
+        "variant": selected_variant,
         "splits": splits,
         "steps": list(LLM_STEPS),
         "seeds": config["experiment"]["seeds"],
@@ -401,6 +479,7 @@ def main() -> None:
         },
         "runtime_config": str(runtime_config),
         "completion_marker": str(completion_marker),
+        "selection": str(args.selection) if args.selection else None,
         "pipeline_command": command,
     }
     print(json.dumps(plan, indent=2, ensure_ascii=False))
@@ -415,7 +494,8 @@ def main() -> None:
     expected_ids = expected_ids_by_split(config, splits)
     # A failed rerun must not leave a stale success signal for the queue.
     completion_marker.unlink(missing_ok=True)
-    write_runtime_config(runtime_config, config)
+    if not args.selected_config:
+        write_runtime_config(runtime_config, config)
     subprocess.run(command, cwd=REPO_ROOT, check=True)
     evidence = validate_completion(config, splits, expected_ids)
     marker = completion_payload(config, splits, evidence)

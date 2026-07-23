@@ -315,7 +315,9 @@ async def _batched_query_atomic(dialogues, model, llm_config, on_batch_complete)
     scheduler = AtomicAdaptiveScheduler(llm_config)
     _log(
         f"[ATOMIC API CONFIG] requests={len(dialogues)} high={scheduler.high} "
-        f"fallback={scheduler.low} recovery_windows={scheduler.recovery_windows} "
+        f"fallback={scheduler.low} minimum={scheduler.serial} "
+        f"fallback_429_attempts={scheduler.low_rate_limit_attempts} "
+        f"recovery_windows={scheduler.recovery_windows} "
         f"cooldown={scheduler.cooldown}s"
     )
 

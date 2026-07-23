@@ -15,6 +15,8 @@ claims_generation:
 execution:
   initial_concurrency: 64
   fallback_concurrency: 10
+  minimum_concurrency: 1
+  fallback_rate_limit_attempts: 3
   recovery_clean_batches: 10
   cooldown_seconds: 60
   atomic_windows: true

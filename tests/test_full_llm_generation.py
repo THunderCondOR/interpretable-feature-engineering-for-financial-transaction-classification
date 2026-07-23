@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts.run_full_llm_generation import (
     LLM_STEPS,
@@ -11,7 +12,11 @@ from scripts.run_full_llm_generation import (
     pipeline_command,
     validate_completion,
 )
-from src.experiments.config_builder import build_runtime_config
+from src.experiments.artifacts import file_sha256, fingerprint
+from src.experiments.config_builder import (
+    build_runtime_config,
+    load_yaml,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -151,6 +156,82 @@ def test_full_runner_requires_all_api_guards_before_any_write(tmp_path):
     assert result.returncode != 0
     assert "--execute-api" in result.stderr
     assert not runtime_config.exists()
+
+
+def test_full_runner_accepts_only_content_addressed_selected_config(tmp_path):
+    config = build_runtime_config(
+        load_yaml(ROOT / "configs/age.yaml"),
+        load_yaml(ROOT / "configs/v2/qwen.yaml"),
+        run_id="selected-dry",
+        variant="guided_zero_shot_v3",
+        results_root=tmp_path / "results",
+        expected_client_counts={"train": 24_000, "val": 3_000, "test": 3_000},
+    )
+    selected = tmp_path / "age_selected_qwen.yaml"
+    selected.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    selection = {
+        "status": "completed",
+        "run_id": "selected-dry",
+        "dataset": "age",
+        "selected_variant": "guided_zero_shot_v3",
+        "selected_configs": {
+            "qwen": {
+                "path": str(selected),
+                "sha256": file_sha256(selected),
+            }
+        },
+    }
+    selection["selection_sha256"] = fingerprint(selection)
+    selection_path = tmp_path / "age_selection.json"
+    selection_path.write_text(json.dumps(selection), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_full_llm_generation.py",
+            "--dataset",
+            "age",
+            "--model-config",
+            "configs/v2/qwen.yaml",
+            "--run-id",
+            "selected-dry",
+            "--selected-config",
+            str(selected),
+            "--selection",
+            str(selection_path),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout)["variant"] == "guided_zero_shot_v3"
+
+    selected.write_text(selected.read_text() + "\n# tampered\n", encoding="utf-8")
+    failed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_full_llm_generation.py",
+            "--dataset",
+            "age",
+            "--model-config",
+            "configs/v2/qwen.yaml",
+            "--run-id",
+            "selected-dry",
+            "--selected-config",
+            str(selected),
+            "--selection",
+            str(selection_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode != 0
+    assert "not owned" in failed.stderr
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:

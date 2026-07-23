@@ -103,7 +103,7 @@ Overnight LLM scope:
   datasets: 3 (gender, age, rosbank)
   split cells: 9 per model
   clients: 43,400 per model
-  estimated API requests: 174,800 including gender pilot
+  estimated API requests: 177,200 including three prompt pilots
   tmux socket: ${SOCKET_NAME}
 EOF
 }

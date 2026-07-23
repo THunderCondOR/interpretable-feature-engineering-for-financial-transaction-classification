@@ -16,22 +16,22 @@ def test_qwen_queue_covers_all_datasets_and_excludes_offline_jobs():
         run_id="nightly",
     )
     assert [job["id"] for job in jobs] == [
+        "rosbank_pilot",
+        "rosbank_select",
         "gender_pilot",
         "gender_select",
-        "gender_full",
+        "age_pilot",
+        "age_select",
+        "gender_qwen_full",
         "rosbank_qwen_full",
         "age_qwen_full",
     ]
     assert {job["dataset"] for job in jobs} == {"gender", "rosbank", "age"}
     assert all(job["stage"] != "robustness" for job in jobs)
-    assert jobs[1]["wait_for"].endswith("qwen_gender_pilot.json")
+    assert jobs[1]["wait_for"].endswith("qwen_rosbank_pilot.json")
     full_commands = [job["command"] for job in jobs if job["stage"] == "full"]
     assert all("--execute-api" in command for command in full_commands)
-    generic_commands = [
-        job["command"] for job in jobs
-        if job["stage"] == "full" and job["dataset"] != "gender"
-    ]
-    assert all("train,val,test" in command for command in generic_commands)
+    assert all("--selected-config" in command for command in full_commands)
 
 
 def test_gpt_queue_runs_rosbank_then_selected_gender_then_age():
@@ -41,11 +41,11 @@ def test_gpt_queue_runs_rosbank_then_selected_gender_then_age():
         run_id="nightly",
     )
     assert [job["dataset"] for job in jobs] == ["rosbank", "gender", "age"]
-    assert "wait_for" not in jobs[0]
+    assert jobs[0]["wait_for"].endswith("rosbank_selection.json")
     assert jobs[1]["wait_for"].endswith("gender_selection.json")
-    assert "wait_for" not in jobs[2]
+    assert jobs[2]["wait_for"].endswith("age_selection.json")
     assert "scripts/run_full_llm_generation.py" in jobs[0]["command"]
-    assert "scripts/run_gender_v2.py" in jobs[1]["command"]
+    assert "scripts/run_full_llm_generation.py" in jobs[1]["command"]
 
 
 def test_completion_evidence_must_match_run_model_dataset(tmp_path):
