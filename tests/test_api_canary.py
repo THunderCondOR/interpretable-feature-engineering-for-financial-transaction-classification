@@ -65,7 +65,10 @@ def _config() -> dict:
             "top_p": 1.0,
             "seed": 17,
         },
-        "llm": {"max_tokens": 1024},
+        "llm": {
+            "max_tokens": 1024,
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        },
         "pipeline": {
             "claims_max_tokens": 256,
             "min_behavioral_explanation_chars": 80,
@@ -100,6 +103,9 @@ def test_canary_validates_real_explanation_to_claims_contract():
     claims_prompt = completions.calls[1]["messages"][1]["content"]
     assert "Final:" not in claims_prompt
     assert "retained_client" not in claims_prompt
+    assert completions.calls[1]["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
 
 
 def test_canary_dry_run_does_not_read_configs_or_call_api(tmp_path):

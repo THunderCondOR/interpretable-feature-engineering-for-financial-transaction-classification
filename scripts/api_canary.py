@@ -55,7 +55,7 @@ def _completion_kwargs(config: dict[str, Any], section: str) -> dict[str, Any]:
         kwargs["seed"] = int(generation["seed"])
     if generation.get("extra_body"):
         kwargs["extra_body"] = generation["extra_body"]
-    elif section == "generation" and config["llm"].get("extra_body"):
+    elif config["llm"].get("extra_body"):
         kwargs["extra_body"] = config["llm"]["extra_body"]
     return kwargs
 
