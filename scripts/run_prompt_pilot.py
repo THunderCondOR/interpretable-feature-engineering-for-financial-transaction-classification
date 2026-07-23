@@ -23,10 +23,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.data.loader import add_features, load_dataset
 from src.evaluation.prompt_pilot import (
+    AGE_LABEL_SEMANTICS,
     PILOT_VARIANTS,
     ZERO_SHOT,
+    age_interpretation_diagnostics,
     paired_balanced_accuracy_delta,
     rationale_diagnostics,
+    select_age_label_semantics,
     select_prompt_variant,
 )
 from src.experiments.artifacts import (
@@ -220,24 +223,40 @@ def materialize(
     atomic_write_json(ids_path, pilot_ids)
     configs: dict[str, str] = {}
     hashes: dict[str, str] = {}
-    for variant in PILOT_VARIANTS:
-        config = build_runtime_config(
-            base,
-            profile,
-            run_id=run_id,
-            variant=variant,
-            sampling_seed=sampling_seed,
-            results_root=results_root / "pilot",
-            client_ids_by_split={"val": str(ids_path)},
-            expected_client_counts={
-                **EXPECTED_CLIENT_COUNTS[dataset],
-                "val": sample_size,
-            },
-        )
-        path = generated_dir / f"{dataset}_{variant}_qwen.yaml"
-        write_runtime_config(path, config)
-        configs[variant] = str(path)
-        hashes[variant] = file_sha256(path)
+    semantics_values = AGE_LABEL_SEMANTICS if dataset == "age" else ("standard",)
+    cells: dict[str, dict[str, str]] = {}
+    for label_semantics in semantics_values:
+        for variant in PILOT_VARIANTS:
+            cell = (
+                variant
+                if label_semantics == "standard"
+                else f"{label_semantics}::{variant}"
+            )
+            config = build_runtime_config(
+                base,
+                profile,
+                run_id=run_id,
+                variant=variant,
+                label_semantics=label_semantics,
+                sampling_seed=sampling_seed,
+                results_root=results_root / "pilot",
+                client_ids_by_split={"val": str(ids_path)},
+                expected_client_counts={
+                    **EXPECTED_CLIENT_COUNTS[dataset],
+                    "val": sample_size,
+                },
+            )
+            path = (
+                generated_dir
+                / f"{dataset}_{label_semantics}_{variant}_qwen.yaml"
+            )
+            write_runtime_config(path, config)
+            configs[cell] = str(path)
+            hashes[cell] = file_sha256(path)
+            cells[cell] = {
+                "prompt_format": variant,
+                "label_semantics": label_semantics,
+            }
     payload = {
         "run_id": run_id,
         "dataset": dataset,
@@ -246,6 +265,8 @@ def materialize(
         "pilot_ids": str(ids_path),
         "pilot_ids_sha256": file_sha256(ids_path),
         "variants": list(PILOT_VARIANTS),
+        "label_semantics": list(semantics_values),
+        "pilot_cells": cells,
         "pilot_configs": configs,
         "pilot_config_sha256": hashes,
         "model_config": str(model_config),
@@ -281,8 +302,8 @@ def run_pilot(materialized: dict[str, Any]) -> Path:
         Path(materialized["pilot_ids"]).read_text(encoding="utf-8")
     )
     manifests: dict[str, str] = {}
-    for variant, config_path in materialized["pilot_configs"].items():
-        if file_sha256(config_path) != materialized["pilot_config_sha256"][variant]:
+    for cell, config_path in materialized["pilot_configs"].items():
+        if file_sha256(config_path) != materialized["pilot_config_sha256"][cell]:
             raise RuntimeError(f"Pilot config changed: {config_path}")
         subprocess.run(
             _pipeline_command(config_path),
@@ -290,13 +311,15 @@ def run_pilot(materialized: dict[str, Any]) -> Path:
             check=True,
         )
         evidence = validate_pilot_outputs(load_yaml(config_path), ids)
-        manifests[variant] = str(evidence["manifest_sha256"])
+        manifests[cell] = str(evidence["manifest_sha256"])
     marker = {
         "run_id": materialized["run_id"],
         "dataset": materialized["dataset"],
         "model_slug": "qwen",
-        "variant": "controlled_prompt_pilot_v3",
+        "variant": "controlled_prompt_pilot_v4",
         "variants": list(PILOT_VARIANTS),
+        "label_semantics": materialized["label_semantics"],
+        "pilot_cells": materialized["pilot_cells"],
         "splits": ["val"],
         "expected_counts": {"val": materialized["sample_size"]},
         "pilot_ids_sha256": materialized["pilot_ids_sha256"],
@@ -337,30 +360,85 @@ def select_variant(
         Path(materialized["pilot_ids"]).read_text(encoding="utf-8")
     )
     evidence: dict[str, dict[str, Any]] = {}
-    for variant, config_path in materialized["pilot_configs"].items():
-        if file_sha256(config_path) != materialized["pilot_config_sha256"][variant]:
+    for cell, config_path in materialized["pilot_configs"].items():
+        if file_sha256(config_path) != materialized["pilot_config_sha256"][cell]:
             raise RuntimeError(f"Pilot config changed: {config_path}")
-        evidence[variant] = validate_pilot_outputs(load_yaml(config_path), ids)
-    metrics = {
-        variant: item["metrics"] for variant, item in evidence.items()
-    }
-    deltas = {
-        variant: paired_balanced_accuracy_delta(
-            evidence[ZERO_SHOT]["explanations"],
-            evidence[variant]["explanations"],
-            seed=materialized["sampling_seed"],
-        )
-        for variant in PILOT_VARIANTS
-        if variant != ZERO_SHOT
-    }
+        evidence[cell] = validate_pilot_outputs(load_yaml(config_path), ids)
+    metrics = {cell: item["metrics"] for cell, item in evidence.items()}
     diagnostics = {
-        variant: rationale_diagnostics(
+        cell: rationale_diagnostics(
             item["explanations"], item["prompts"]
         )
-        for variant, item in evidence.items()
+        for cell, item in evidence.items()
     }
-    decision = select_prompt_variant(metrics, deltas)
-    selected = decision["selected_variant"]
+    if materialized["dataset"] == "age":
+        format_decisions: dict[str, dict[str, Any]] = {}
+        format_deltas: dict[str, dict[str, dict[str, Any]]] = {}
+        for semantics in AGE_LABEL_SEMANTICS:
+            zero_cell = f"{semantics}::{ZERO_SHOT}"
+            semantics_metrics = {
+                variant: metrics[f"{semantics}::{variant}"]
+                for variant in PILOT_VARIANTS
+            }
+            semantics_deltas = {
+                variant: paired_balanced_accuracy_delta(
+                    evidence[zero_cell]["explanations"],
+                    evidence[f"{semantics}::{variant}"]["explanations"],
+                    seed=materialized["sampling_seed"],
+                )
+                for variant in PILOT_VARIANTS
+                if variant != ZERO_SHOT
+            }
+            format_deltas[semantics] = semantics_deltas
+            format_decisions[semantics] = select_prompt_variant(
+                semantics_metrics, semantics_deltas
+            )
+        opaque_variant = format_decisions["age_opaque"]["selected_variant"]
+        ordered_variant = format_decisions["age_ordered"]["selected_variant"]
+        opaque_cell = f"age_opaque::{opaque_variant}"
+        ordered_cell = f"age_ordered::{ordered_variant}"
+        semantics_delta = paired_balanced_accuracy_delta(
+            evidence[opaque_cell]["explanations"],
+            evidence[ordered_cell]["explanations"],
+            seed=materialized["sampling_seed"],
+        )
+        semantics_decision = select_age_label_semantics(
+            opaque_variant=opaque_cell,
+            ordered_variant=ordered_cell,
+            metrics=metrics,
+            ordered_vs_opaque=semantics_delta,
+        )
+        selected_cell = semantics_decision["selected_variant"]
+        selected_semantics, selected = selected_cell.split("::", 1)
+        decision = {
+            "selected_variant": selected,
+            "selected_label_semantics": selected_semantics,
+            "format_decisions": format_decisions,
+            "format_paired_balanced_accuracy_deltas": format_deltas,
+            "label_semantics_decision": semantics_decision,
+            "ordered_vs_opaque_paired_delta": semantics_delta,
+        }
+        age_diagnostics = {
+            cell: age_interpretation_diagnostics(item["explanations"])
+            for cell, item in evidence.items()
+        }
+    else:
+        deltas = {
+            variant: paired_balanced_accuracy_delta(
+                evidence[ZERO_SHOT]["explanations"],
+                evidence[variant]["explanations"],
+                seed=materialized["sampling_seed"],
+            )
+            for variant in PILOT_VARIANTS
+            if variant != ZERO_SHOT
+        }
+        decision = select_prompt_variant(metrics, deltas)
+        selected = decision["selected_variant"]
+        selected_semantics = "standard"
+        selected_cell = selected
+        decision["selected_label_semantics"] = selected_semantics
+        decision["format_paired_balanced_accuracy_deltas"] = deltas
+        age_diagnostics = {}
     base = load_yaml(materialized["base_config"])
     selected_configs: dict[str, dict[str, str]] = {}
     for model_path in (
@@ -374,6 +452,7 @@ def select_variant(
             profile,
             run_id=materialized["run_id"],
             variant=selected,
+            label_semantics=selected_semantics,
             sampling_seed=materialized["sampling_seed"],
             results_root=results_root,
             expected_client_counts=EXPECTED_CLIENT_COUNTS[
@@ -400,8 +479,8 @@ def select_variant(
         "pilot_ids": materialized["pilot_ids"],
         "pilot_ids_sha256": materialized["pilot_ids_sha256"],
         "metrics": metrics,
-        "paired_balanced_accuracy_deltas": deltas,
         "diagnostics": diagnostics,
+        "age_interpretation_diagnostics": age_diagnostics,
         "prompt_length_telemetry": {
             variant: item["prompt_length_telemetry"]
             for variant, item in evidence.items()
@@ -418,6 +497,7 @@ def select_variant(
 
 
 def build_plan(args: argparse.Namespace) -> dict[str, Any]:
+    semantics_count = 2 if args.dataset == "age" else 1
     return {
         "mode": "execute" if args.execute else "dry-run",
         "run_id": args.run_id,
@@ -426,11 +506,14 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "sample_size": args.sample_size,
         "sampling_seed": args.sampling_seed,
         "variants": list(args.variants),
+        "label_semantics": (
+            list(AGE_LABEL_SEMANTICS) if args.dataset == "age" else ["standard"]
+        ),
         "selection_rule": (
             "FS must improve balanced accuracy by strictly more than 0.02 "
             "and have paired bootstrap CI lower bound > 0; FS1 wins ties <= 0.005"
         ),
-        "api_requests": args.sample_size * len(args.variants),
+        "api_requests": args.sample_size * len(args.variants) * semantics_count,
     }
 
 
@@ -443,7 +526,7 @@ def main() -> None:
         type=Path,
         default=Path("configs/v2/gpt_oss.yaml"),
     )
-    parser.add_argument("--run-id", default="reviewer-v3")
+    parser.add_argument("--run-id", default="reviewer-v4-english-20260723")
     parser.add_argument("--sample-size", type=int, default=PILOT_SIZE)
     parser.add_argument("--sampling-seed", type=int, default=PILOT_SAMPLING_SEED)
     parser.add_argument(
@@ -465,7 +548,7 @@ def main() -> None:
 
     if tuple(args.variants) != PILOT_VARIANTS:
         raise ValueError(
-            "Controlled v3 pilot requires exactly: " + ",".join(PILOT_VARIANTS)
+            "Controlled v4 pilot requires exactly: " + ",".join(PILOT_VARIANTS)
         )
     if args.sample_size < 1:
         raise ValueError("--sample-size must be positive")

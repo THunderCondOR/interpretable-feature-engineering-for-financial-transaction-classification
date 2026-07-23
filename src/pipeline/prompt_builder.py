@@ -19,14 +19,24 @@ import pandas as pd
 from tqdm import tqdm
 
 from src.data.aggregator import get_summary_fn
+from src.data.prompt_locale import (
+    CATEGORY_MAPPING_VERSION,
+    PROMPT_LANGUAGE,
+    assert_english_model_text,
+)
 from src.data.profiles import client_feature_frame
 from src.experiments.artifacts import fingerprint
 
 
 KNOWN_PLACEHOLDERS = {
     "SUMMARY_TRANSACTIONAL_STATS",
-    "FEW_SHOT_EXAMPLES",
+    "FEW_SHOT_SECTION",
     "CLIENT_STATS",
+}
+SYSTEM_PLACEHOLDERS = {
+    "TASK_DESCRIPTION",
+    "DATASET_GUIDANCE",
+    "ALLOWED_LABELS",
 }
 
 
@@ -48,15 +58,87 @@ def _fill_prompt_template(
     Fill only our three supported placeholders.
 
     This is intentionally not implemented with str.format(), because prompt text
-    contains literal braces in strings such as ``\\boxed{отток}``. str.format()
-    would interpret ``{отток}`` as a missing formatting key and raise KeyError.
+    contains literal braces in strings such as ``\\boxed{retained_client}``.
+    str.format() would interpret ``{retained_client}`` as a missing formatting
+    key and raise KeyError.
     """
     return (
         template
         .replace("{SUMMARY_TRANSACTIONAL_STATS}", summary_stats_str)
+        .replace(
+            "{FEW_SHOT_SECTION}",
+            (
+                "\n\nTRAINING EXAMPLES\n\n" + few_shot_str.strip()
+                if few_shot_str.strip()
+                else ""
+            ),
+        )
+        # Backwards-compatible replacement for historical templates. New v4
+        # templates use FEW_SHOT_SECTION so the heading disappears entirely in
+        # zero-shot runs.
         .replace("{FEW_SHOT_EXAMPLES}", few_shot_str)
         .replace("{CLIENT_STATS}", client_stats)
     )
+
+
+def _fill_system_template(template: str, config: dict) -> str:
+    dataset = config["dataset"]
+    labels = [
+        str(value)
+        for _, value in sorted(
+            dataset["label_names"].items(), key=lambda item: int(item[0])
+        )
+    ]
+    rendered = (
+        template.replace(
+            "{TASK_DESCRIPTION}", str(dataset["prompt_task_description"]).strip()
+        )
+        .replace(
+            "{DATASET_GUIDANCE}", str(dataset["prompt_dataset_guidance"]).strip()
+        )
+        .replace(
+            "{ALLOWED_LABELS}", "\n".join(f"- {label}" for label in labels)
+        )
+    )
+    for placeholder in SYSTEM_PLACEHOLDERS:
+        if "{" + placeholder + "}" in rendered:
+            raise ValueError(f"Unresolved system-prompt placeholder: {placeholder}")
+    return rendered
+
+
+def validate_prompt_contract(config: dict) -> None:
+    """Fail before API materialization if the English v4 contract is incomplete."""
+    prompts = config["prompts"]
+    if prompts.get("language") != PROMPT_LANGUAGE:
+        raise ValueError(
+            f"Expected prompt language {PROMPT_LANGUAGE!r}, got "
+            f"{prompts.get('language')!r}"
+        )
+    if prompts.get("category_mapping_version") != CATEGORY_MAPPING_VERSION:
+        raise ValueError(
+            "Prompt category mapping version does not match the renderer: "
+            f"{prompts.get('category_mapping_version')!r} != "
+            f"{CATEGORY_MAPPING_VERSION!r}"
+        )
+    base_dir = prompts["base_dir"]
+    system = _fill_system_template(
+        _load_template(base_dir, prompts["system"]), config
+    )
+    user = _load_template(base_dir, prompts["user"])
+    claims_system = _load_template(base_dir, prompts["claims_system"])
+    claims_user = _load_template(base_dir, prompts["claims_user"])
+    for name, text in (
+        ("system prompt", system),
+        ("user template", user),
+        ("claims system prompt", claims_system),
+        ("claims user template", claims_user),
+    ):
+        assert_english_model_text(text, context=name)
+    for placeholder in KNOWN_PLACEHOLDERS:
+        if "{" + placeholder + "}" not in user:
+            raise ValueError(f"User template is missing placeholder: {placeholder}")
+    if "{COT}" not in claims_user:
+        raise ValueError("Claims user template is missing {COT}")
 
 
 def build_few_shot_str(
@@ -69,7 +151,9 @@ def build_few_shot_str(
     seed = int(config.get("pipeline", {}).get("few_shot_seed", seed))
     rng = random.Random(seed)
     label_names = config["dataset"]["label_names"]
-    category_label = config["dataset"].get("category_label", "категории трат")
+    category_label = config["dataset"].get(
+        "category_label", "transaction categories"
+    )
     summary_fn = get_summary_fn(config)
     if n_per_class is None:
         n_per_class = config.get("pipeline", {}).get("few_shot_per_class", 1)
@@ -77,7 +161,7 @@ def build_few_shot_str(
         return ""
     strategy = config.get("pipeline", {}).get("few_shot_strategy", "random")
 
-    parts = ["Примеры клиентов из обучающей выборки:\n"]
+    parts: list[str] = []
     i = 1
     labeled_df = df[df["label"] >= 0]
 
@@ -100,10 +184,16 @@ def build_few_shot_str(
         for cid in sampled:
             client_df = labeled_df[labeled_df["customer_id"] == cid]
             summary = summary_fn(client_df, category_label)
-            parts.append(f"\nКлиент {i} — {label_name}:\n{summary}\n")
+            parts.append(
+                f"Example {i}\n"
+                f"Client transaction profile:\n{summary}\n\n"
+                f"Correct label: {label_name}"
+            )
             i += 1
 
-    return "\n".join(parts)
+    rendered = "\n\n".join(parts)
+    assert_english_model_text(rendered, context="few-shot demonstrations")
+    return rendered
 
 
 def representative_medoid_ids(
@@ -177,12 +267,21 @@ def build_prompts(
     Blind test rows may have label = -1.
     """
     cfg_prompts = config["prompts"]
-    system_prompt = _load_template(cfg_prompts["base_dir"], cfg_prompts["system"])
+    validate_prompt_contract(config)
+    system_prompt = _fill_system_template(
+        _load_template(cfg_prompts["base_dir"], cfg_prompts["system"]), config
+    )
     user_template = _load_template(cfg_prompts["base_dir"], cfg_prompts["user"])
 
     label_names = config["dataset"]["label_names"]
-    category_label = config["dataset"].get("category_label", "категории трат")
+    category_label = config["dataset"].get(
+        "category_label", "transaction categories"
+    )
     summary_fn = get_summary_fn(config)
+    assert_english_model_text(
+        summary_stats_str, context="training-split class reference"
+    )
+    assert_english_model_text(few_shot_str, context="few-shot demonstrations")
 
     records = []
     for cid in tqdm(df["customer_id"].unique(), desc="Building prompts"):
@@ -195,6 +294,11 @@ def build_prompts(
             few_shot_str=few_shot_str,
             client_stats=client_stats,
         )
+        assert_english_model_text(client_stats, context=f"client profile {cid}")
+        assert_english_model_text(
+            system_prompt, context=f"rendered system prompt {cid}"
+        )
+        assert_english_model_text(user_prompt, context=f"rendered user prompt {cid}")
         label_name = label_names.get(str(label), "unknown") if label >= 0 else "unknown"
         prompt_hash = fingerprint(
             {

@@ -6,7 +6,7 @@ from src.data.profiles import client_numeric_profile, export_robust_statistics, 
 
 
 def _config(name: str, semantics: str, **dataset):
-    return {"dataset": {"name": name, "amount_semantics": semantics, "category_label": "категории операций", "label_names": {"0": "zero", "1": "one"}, **dataset}}
+    return {"dataset": {"name": name, "amount_semantics": semantics, "category_label": "transaction categories", "label_names": {"0": "zero", "1": "one"}, **dataset}}
 
 
 def _frame(rows):
@@ -28,7 +28,7 @@ def test_gender_outflow_is_positive_and_sorted_by_absolute_magnitude():
     assert profile["active_days"] == 2
     assert profile["calendar_span_days"] == 3
     assert text.index("large: 100.00") < text.index("small: 10.00")
-    assert "Общий отток (положительная величина): 110.00" in text
+    assert "Total outflow (positive magnitude): 110.00" in text
 
 
 def test_age_uses_neutral_transaction_value_language():
@@ -37,9 +37,9 @@ def test_age_uses_neutral_transaction_value_language():
         {"customer_id": 3, "label": 1, "tr_datetime": "2024-01-02", "amount": 30, "mcc_code_desc": "B"},
     ])
     text = format_client_profile(frame, _config("age", "unsigned_transaction_value"))
-    assert "Общая величина операций" in text
-    assert "доход" not in text.lower()
-    assert "расход" not in text.lower()
+    assert "Total transaction value" in text
+    assert "income" not in text.lower()
+    assert "expense" not in text.lower()
 
 
 def test_rosbank_recency_uses_fixed_observation_end_and_operation_types():

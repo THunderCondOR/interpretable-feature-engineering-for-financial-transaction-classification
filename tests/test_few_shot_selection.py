@@ -32,7 +32,7 @@ def test_representative_few_shot_uses_class_medoids_deterministically():
     first=build_few_shot_str(frame(),settings)
     second=build_few_shot_str(frame(),settings)
     assert first==second
-    assert first.count("* Всего операций: 3")==2
+    assert first.count("* Total transactions: 3")==2
     assert "reasoning" not in first.lower()
     assert "cot" not in first.lower()
 
@@ -60,16 +60,35 @@ def test_neutral_only_legacy_summary_is_train_scoped_and_has_no_tail_std():
 
 
 def test_long_prompts_are_not_blocked_or_truncated_and_have_telemetry(tmp_path):
-    (tmp_path / "system.txt").write_text("system", encoding="utf-8")
-    (tmp_path / "user.txt").write_text(
-        "{SUMMARY_TRANSACTIONAL_STATS}\n{FEW_SHOT_EXAMPLES}\n{CLIENT_STATS}",
+    (tmp_path / "system.txt").write_text(
+        "{TASK_DESCRIPTION}\n{DATASET_GUIDANCE}\n{ALLOWED_LABELS}",
         encoding="utf-8",
     )
-    settings = config()
+    (tmp_path / "user.txt").write_text(
+        "{SUMMARY_TRANSACTIONAL_STATS}\n{FEW_SHOT_SECTION}\n{CLIENT_STATS}",
+        encoding="utf-8",
+    )
+    (tmp_path / "claims_system.txt").write_text(
+        "Extract English claims.", encoding="utf-8"
+    )
+    (tmp_path / "claims_user.txt").write_text(
+        "Rationale:\n{COT}", encoding="utf-8"
+    )
+    settings = config(few_shot_per_class=0)
+    settings["dataset"].update(
+        {
+            "prompt_task_description": "Predict a test label.",
+            "prompt_dataset_guidance": "Use transaction evidence.",
+        }
+    )
     settings["prompts"] = {
         "base_dir": str(tmp_path),
         "system": "system.txt",
         "user": "user.txt",
+        "claims_system": "claims_system.txt",
+        "claims_user": "claims_user.txt",
+        "language": "en",
+        "category_mapping_version": "en_v1",
     }
     very_long = "summary " * 20_000
     records = build_prompts(frame().query("customer_id == 0"), settings, very_long, "")

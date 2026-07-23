@@ -96,7 +96,7 @@ def test_runtime_config_has_independent_seeds_counts_and_exact_paths(tmp_path):
     assert config["llm"]["events_path"] == config["execution"]["events_path"]
     assert config["evaluation"]["ml_seed"] == 41
     assert config["output"]["base_dir"].endswith(
-        "age/robust_zero_shot_v2/qwen_test/seed_17"
+        "age/robust_zero_shot_v2__age_opaque/qwen_test/seed_17"
     )
     assert config["dataset"]["input_paths_by_split"]["train"].endswith("train.csv")
     assert config["dataset"]["expected_client_counts"]["train"] == 24_000

@@ -18,6 +18,8 @@ EXPECTED_CLIENT_COUNTS: dict[str, dict[str, int]] = {
     "rosbank": {"train": 4_000, "val": 500, "test": 500},
 }
 
+AGE_LABEL_SEMANTICS = ("age_opaque", "age_ordered")
+
 
 def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     """Recursively merge mappings without mutating either input."""
@@ -99,11 +101,70 @@ def _variant_overlay(variant: str) -> dict[str, Any]:
                 "few_shot_per_class": 2,
             },
         },
+        "guided_zero_shot_v4": {
+            "statistics": {"summary_profile": "robust_mean"},
+            "pipeline": {
+                "few_shot_strategy": "representative_medoid",
+                "few_shot_per_class": 0,
+            },
+        },
+        "guided_factual_fs1_v4": {
+            "statistics": {"summary_profile": "robust_mean"},
+            "pipeline": {
+                "few_shot_strategy": "representative_medoid",
+                "few_shot_per_class": 1,
+            },
+        },
+        "guided_factual_fs2_v4": {
+            "statistics": {"summary_profile": "robust_mean"},
+            "pipeline": {
+                "few_shot_strategy": "representative_medoid",
+                "few_shot_per_class": 2,
+            },
+        },
         "legacy_offline": {},
     }
     if variant not in variants:
         raise ValueError(f"Unknown reviewer-v2 variant: {variant}")
     return variants[variant]
+
+
+def _apply_label_semantics(config: dict[str, Any], label_semantics: str) -> None:
+    dataset = str(config["dataset"]["name"])
+    if dataset != "age":
+        if label_semantics != "standard":
+            raise ValueError(
+                f"{dataset} only supports label_semantics='standard', got "
+                f"{label_semantics!r}"
+            )
+        config["dataset"]["label_semantics"] = "standard"
+        return
+    if label_semantics not in AGE_LABEL_SEMANTICS:
+        raise ValueError(
+            f"Age label semantics must be one of {AGE_LABEL_SEMANTICS}, got "
+            f"{label_semantics!r}"
+        )
+    config["dataset"]["label_semantics"] = label_semantics
+    if label_semantics == "age_opaque":
+        config["dataset"]["prompt_dataset_guidance"] = (
+            "The four age-group classes are anonymized. Their exact numerical "
+            "boundaries and their order are not provided. You may formulate "
+            "cautious life-stage interpretations, such as student-like, "
+            "working-age, family-oriented, or retirement-like behavior, only "
+            "when supported by the supplied transaction evidence. Do not "
+            "assign a specific age."
+        )
+    else:
+        config["dataset"]["prompt_dataset_guidance"] = (
+            "The four age-group classes are ordered: age_group_A is the "
+            "youngest group and age_group_D is the oldest group, with B and C "
+            "in between in that order. Their exact numerical boundaries are "
+            "not provided. You may formulate cautious life-stage "
+            "interpretations, such as student-like, working-age, "
+            "family-oriented, or retirement-like behavior, only when "
+            "supported by the supplied transaction evidence. Do not assign a "
+            "specific age."
+        )
 
 
 def build_runtime_config(
@@ -120,12 +181,21 @@ def build_runtime_config(
     results_root: str | Path = "results/v2",
     client_ids_by_split: dict[str, Any] | None = None,
     expected_client_counts: dict[str, int] | None = None,
+    label_semantics: str | None = None,
 ) -> dict[str, Any]:
     """Return one complete, versioned config consumable by run_pipeline.py."""
     dataset = str(base_config["dataset"]["name"])
     model_slug = slug(model_profile["experiment"]["model_slug"])
 
     config = deep_merge(base_config, _variant_overlay(variant))
+    resolved_label_semantics = str(
+        label_semantics
+        if label_semantics is not None
+        else config["dataset"].get(
+            "label_semantics", "age_opaque" if dataset == "age" else "standard"
+        )
+    )
+    _apply_label_semantics(config, resolved_label_semantics)
     generation = model_profile.get("generation", {})
     claims_generation = model_profile.get("claims_generation", generation)
     execution = model_profile.get("execution", {})
@@ -163,10 +233,15 @@ def build_runtime_config(
         if ml_seed is not None
         else profile_experiment.get("ml_seed", 17)
     )
+    variant_output_slug = slug(
+        variant
+        if resolved_label_semantics == "standard"
+        else f"{variant}__{resolved_label_semantics}"
+    )
     output_dir = (
         Path(results_root)
         / dataset
-        / slug(variant)
+        / variant_output_slug
         / model_slug
         / f"seed_{resolved_generation_seed}"
     )
@@ -175,6 +250,8 @@ def build_runtime_config(
         **copy.deepcopy(profile_experiment),
         "run_id": run_id,
         "variant": variant,
+        "variant_output_slug": variant_output_slug,
+        "label_semantics": resolved_label_semantics,
         # Keep seed as a compatibility alias for consumers that have not yet
         # migrated; it always means the generation seed, never sampling.
         "seed": resolved_generation_seed,
@@ -199,6 +276,9 @@ def build_runtime_config(
         int(config.get("pipeline", {}).get("claims_max_tokens", 2048)),
     )
     config["execution"] = copy.deepcopy(execution)
+    prompts = config.setdefault("prompts", {})
+    prompts["format"] = variant
+    prompts["label_semantics"] = resolved_label_semantics
     # Model profiles are reusable templates.  Never retain a profile's old
     # run-specific event path when materialising a new run.
     run_events_path = str(Path("logs/runs") / run_id / f"{model_slug}.events.jsonl")

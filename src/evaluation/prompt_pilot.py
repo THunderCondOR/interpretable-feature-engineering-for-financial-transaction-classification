@@ -9,10 +9,13 @@ import numpy as np
 from sklearn.metrics import balanced_accuracy_score
 
 
-ZERO_SHOT = "guided_zero_shot_v3"
-FS1 = "guided_factual_fs1_v3"
-FS2 = "guided_factual_fs2_v3"
+ZERO_SHOT = "guided_zero_shot_v4"
+FS1 = "guided_factual_fs1_v4"
+FS2 = "guided_factual_fs2_v4"
 PILOT_VARIANTS = (ZERO_SHOT, FS1, FS2)
+AGE_OPAQUE = "age_opaque"
+AGE_ORDERED = "age_ordered"
+AGE_LABEL_SEMANTICS = (AGE_OPAQUE, AGE_ORDERED)
 
 
 def paired_balanced_accuracy_delta(
@@ -111,6 +114,36 @@ def select_prompt_variant(
     }
 
 
+def select_age_label_semantics(
+    *,
+    opaque_variant: str,
+    ordered_variant: str,
+    metrics: dict[str, dict[str, Any]],
+    ordered_vs_opaque: dict[str, Any],
+) -> dict[str, Any]:
+    """Prefer opaque labels unless ordered semantics clears the preregistered bar."""
+    opaque_ba = float(metrics[opaque_variant]["balanced_accuracy"])
+    ordered_ba = float(metrics[ordered_variant]["balanced_accuracy"])
+    observed_delta = ordered_ba - opaque_ba
+    ci_low = float(ordered_vs_opaque["ci_low"])
+    threshold = 0.02
+    passed = observed_delta > threshold + 1e-12 and ci_low > 0.0
+    return {
+        "selected_label_semantics": "age_ordered" if passed else "age_opaque",
+        "selected_variant": ordered_variant if passed else opaque_variant,
+        "opaque_selected_variant": opaque_variant,
+        "ordered_selected_variant": ordered_variant,
+        "ordered_balanced_accuracy_delta": observed_delta,
+        "paired_ci_low": ci_low,
+        "ordered_gain_strictly_over_2pp": observed_delta > threshold + 1e-12,
+        "paired_ci_excludes_zero": ci_low > 0.0,
+        "selection_rule": (
+            "opaque by default; ordered requires balanced-accuracy gain strictly "
+            "> 0.02 and paired 95% CI lower bound > 0"
+        ),
+    }
+
+
 def _behavioral_text(text: str) -> str:
     value = str(text or "")
     position = value.lower().rfind("final:")
@@ -153,13 +186,10 @@ def rationale_diagnostics(
         category_mentions += hits
         clients_with_category_reference += int(hits > 0)
     unsupported_patterns = (
-        r"\bсемь\w*",
-        r"\bпрофесс\w*",
-        r"\bсоциальн\w*\s+(?:роль|статус)",
-        r"\bстиль\s+жизни",
-        r"\bбогат\w*",
-        r"\bбедн\w*",
-        r"\bналичие\s+дет",
+        r"\b(?:the\s+)?client\s+is\s+(?:a|an)\s+(?:student|retiree|pensioner)\b",
+        r"\b(?:the\s+)?client\s+(?:has|have)\s+(?:children|a\s+family)\b",
+        r"\b(?:the\s+)?client\s+(?:works|is\s+employed)\s+as\b",
+        r"\b(?:the\s+)?client\s+is\s+(?:rich|poor|wealthy)\b",
     )
     audited = [
         {
@@ -199,4 +229,55 @@ def rationale_diagnostics(
             "examples": flagged[:20],
             "method": "conservative_rule_based_screen",
         },
+    }
+
+
+def age_interpretation_diagnostics(explanation_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Screen Age rationales for invented boundaries and calibrated hypotheses."""
+    successful = [
+        _behavioral_text(row.get("explanation", ""))
+        for row in explanation_rows
+        if not row.get("error") and row.get("predicted") is not None
+    ]
+    exact_boundary = re.compile(
+        r"(?:\bage[sd]?\s*)?\b\d{1,2}\s*(?:-|–|—|to)\s*\d{1,2}\b|"
+        r"\b(?:under|over|older than|younger than)\s+\d{1,2}\b",
+        re.IGNORECASE,
+    )
+    life_stage = re.compile(
+        r"\b(?:student|student-like|working-age|family-oriented|retiree|"
+        r"retirement-like|pensioner)\b",
+        re.IGNORECASE,
+    )
+    hedge = re.compile(
+        r"\b(?:may|might|could|possibly|suggests?|consistent with|appears? to)\b",
+        re.IGNORECASE,
+    )
+    boundary_rows = [text for text in successful if exact_boundary.search(text)]
+    interpreted = [text for text in successful if life_stage.search(text)]
+    hedged = [text for text in interpreted if hedge.search(text)]
+    categorical = [text for text in interpreted if not hedge.search(text)]
+    total = len(successful)
+    return {
+        "n_successful": total,
+        "invented_exact_boundary": {
+            "count": len(boundary_rows),
+            "share": len(boundary_rows) / total if total else 0.0,
+            "examples": boundary_rows[:20],
+        },
+        "life_stage_interpretation": {
+            "count": len(interpreted),
+            "share": len(interpreted) / total if total else 0.0,
+        },
+        "hedged_life_stage_interpretation": {
+            "count": len(hedged),
+            "share": len(hedged) / total if total else 0.0,
+            "examples": hedged[:20],
+        },
+        "categorical_life_stage_assertion": {
+            "count": len(categorical),
+            "share": len(categorical) / total if total else 0.0,
+            "examples": categorical[:20],
+        },
+        "method": "rule_based_screen_for_manual_review",
     }

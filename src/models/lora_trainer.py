@@ -82,7 +82,9 @@ def _resolve_lora_runs(config: dict, model_names: list[str] | None = None) -> li
 
 def _build_input_text(client_df: pd.DataFrame, config: dict, system_prompt: str) -> str:
     """Build the input text for LoRA from one client's aggregated transaction profile."""
-    category_label = config["dataset"].get("category_label", "категории трат")
+    category_label = config["dataset"].get(
+        "category_label", "transaction categories"
+    )
     summary_fn = get_summary_fn(config)
     summary = summary_fn(client_df, category_label)
 
@@ -91,7 +93,10 @@ def _build_input_text(client_df: pd.DataFrame, config: dict, system_prompt: str)
         f"{k} ({v})" for k, v in sorted(label_names.items(), key=lambda x: int(x[0]))
     )
 
-    return f"{system_prompt}\n\nДанные клиента:\n{summary}\n\nВарианты ответа: {options}."
+    return (
+        f"{system_prompt}\n\nCLIENT TRANSACTION PROFILE\n{summary}\n\n"
+        f"ALLOWED LABELS: {options}."
+    )
 
 
 def _prepare_hf_dataset(

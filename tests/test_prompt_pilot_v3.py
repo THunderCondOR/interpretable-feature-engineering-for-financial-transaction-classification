@@ -7,11 +7,14 @@ import numpy as np
 import pandas as pd
 
 from src.evaluation.prompt_pilot import (
+    AGE_OPAQUE,
+    AGE_ORDERED,
     FS1,
     FS2,
     ZERO_SHOT,
     paired_balanced_accuracy_delta,
     rationale_diagnostics,
+    select_age_label_semantics,
     select_prompt_variant,
 )
 from scripts.run_prompt_pilot import PILOT_VARIANTS, stratified_pilot_ids
@@ -84,15 +87,15 @@ def test_rationale_diversity_and_social_audit_are_reported():
             "predicted": 0,
             "error": None,
             "explanation": (
-                "Частые операции в категории books. "
-                "Предположение о профессии не требуется. Final: label"
+                "Frequent transactions in the books category. "
+                "The client works as a doctor. Final: label"
             ),
         },
         {
             "customer_id": 2,
             "predicted": 1,
             "error": None,
-            "explanation": "Редкие операции и малый объем. Final: label",
+            "explanation": "Infrequent transactions and low value. Final: label",
         },
     ]
     prompts = [
@@ -106,6 +109,29 @@ def test_rationale_diversity_and_social_audit_are_reported():
     assert (
         diagnostics["unsupported_social_claim_audit"]["flagged_rows"] == 1
     )
+
+
+def test_age_ordered_requires_strict_two_point_gain_and_positive_ci():
+    exact = select_age_label_semantics(
+        opaque_variant=AGE_OPAQUE,
+        ordered_variant=AGE_ORDERED,
+        metrics={
+            AGE_OPAQUE: {"balanced_accuracy": 0.70},
+            AGE_ORDERED: {"balanced_accuracy": 0.72},
+        },
+        ordered_vs_opaque={"delta": 0.02, "ci_low": 0.001, "ci_high": 0.04},
+    )
+    above = select_age_label_semantics(
+        opaque_variant=AGE_OPAQUE,
+        ordered_variant=AGE_ORDERED,
+        metrics={
+            AGE_OPAQUE: {"balanced_accuracy": 0.70},
+            AGE_ORDERED: {"balanced_accuracy": 0.721},
+        },
+        ordered_vs_opaque={"delta": 0.021, "ci_low": 0.001, "ci_high": 0.04},
+    )
+    assert exact["selected_label_semantics"] == AGE_OPAQUE
+    assert above["selected_label_semantics"] == AGE_ORDERED
 
 
 def test_validation_ids_are_deterministic_and_shared_by_variants():
@@ -147,5 +173,5 @@ def test_prompt_pilot_is_dry_run_without_api_or_files(tmp_path):
     plan = json.loads(result.stdout)
     assert plan["mode"] == "dry-run"
     assert tuple(plan["variants"]) == PILOT_VARIANTS
-    assert plan["api_requests"] == 1200
+    assert plan["api_requests"] == 2400
     assert not generated.exists()

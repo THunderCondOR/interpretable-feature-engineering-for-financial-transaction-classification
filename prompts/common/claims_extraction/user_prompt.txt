@@ -1,0 +1,7 @@
+Extract atomic behavioral claims from the rationale below. The final predicted label has already been removed.
+
+RATIONALE
+
+{COT}
+
+Return only a valid JSON array of English strings.

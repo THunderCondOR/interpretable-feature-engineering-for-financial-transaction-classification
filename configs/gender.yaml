@@ -10,9 +10,16 @@ dataset:
     category:    mcc_code_desc
     label:       label
   label_names:
-    "0": "женщина"
-    "1": "мужчина"
-  category_label: "категории трат"
+    "0": "female"
+    "1": "male"
+  category_label: "transaction categories"
+  prompt_task_description: "Predict the client's gender label from the supplied transaction evidence."
+  prompt_dataset_guidance: >-
+    Behavioral patterns and tentative lifestyle interpretations may be used
+    when supported by the transactions and training statistics. General
+    beliefs about women or men must not be used as independent evidence.
+  label_semantics: standard
+  claim_forbidden_terms: [female, male, woman, man, gender]
   num_labels: 2
   metric: accuracy
   splits:
@@ -40,10 +47,13 @@ llm:
 
 prompts:
   base_dir: "."
-  system:        prompts/gender/explanation_generation/system_prompt.txt
-  user:          prompts/gender/explanation_generation/user_prompt.txt
-  claims_system: prompts/gender/claims_extraction/system_prompt.txt
-  claims_user:   prompts/gender/claims_extraction/user_prompt.txt
+  language: en
+  contract_version: evidence_bounded_v4
+  category_mapping_version: en_v1
+  system:        prompts/common/explanation_generation/system_prompt.txt
+  user:          prompts/common/explanation_generation/user_prompt.txt
+  claims_system: prompts/common/claims_extraction/system_prompt.txt
+  claims_user:   prompts/common/claims_extraction/user_prompt.txt
 
 lora:
   defaults:

@@ -9,6 +9,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.data.prompt_locale import (
+    amount_semantics_display,
+    english_category,
+    metric_display_name,
+)
+
 
 QUANTILES = (
     (0.05, "p05"),
@@ -120,23 +126,32 @@ def client_feature_frame(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 def _top_categories(client_df: pd.DataFrame, *, n: int = 12) -> list[tuple[str, int, float]]:
     counts = client_df["mcc_code_desc"].value_counts().head(n)
     total = max(len(client_df), 1)
-    return [(str(category), int(count), float(count / total)) for category, count in counts.items()]
+    return [
+        (english_category(category), int(count), float(count / total))
+        for category, count in counts.items()
+    ]
 
 
 def format_client_profile(client_df: pd.DataFrame, config: dict) -> str:
     """Format evidence-only client facts for prompts."""
     p = client_numeric_profile(client_df, config)
-    category_label = config["dataset"].get("category_label", "категории операций")
+    category_label = config["dataset"].get("category_label", "transaction categories")
     lines = [
-        f"* Всего операций: {p['transactions_per_client']}",
-        f"* Активных дней: {p['active_days']}",
-        f"* Календарный охват: {p['calendar_span_days']} дней",
-        f"* Операций на активный день: {p['transactions_per_active_day']:.3f}",
-        f"* Уникальных категорий: {p['unique_categories']}",
-        f"* Наблюдаемые top-{min(12, p['unique_categories'])} {category_label}:",
+        f"* Total transactions: {p['transactions_per_client']}",
+        f"* Active days: {p['active_days']}",
+        f"* Calendar span: {p['calendar_span_days']} days",
+        f"* Transactions per active day: {p['transactions_per_active_day']:.3f}",
+        f"* Unique transaction categories: {p['unique_categories']}",
+        f"* Observed top-{min(12, p['unique_categories'])} {category_label}:",
     ]
-    lines.extend(f"  - {cat}: {count} операций ({share:.1%})" for cat, count, share in _top_categories(client_df))
-    lines.append("* Важно: отсутствие категории в top-k не означает отсутствие таких операций у клиента.")
+    lines.extend(
+        f"  - {cat}: {count} transactions ({share:.1%})"
+        for cat, count, share in _top_categories(client_df)
+    )
+    lines.append(
+        "* Coverage note: this is a top-k list; an omitted category is not "
+        "evidence that the client never used it."
+    )
 
     semantics = amount_semantics(config)
     if semantics == "signed_cashflow":
@@ -144,31 +159,34 @@ def format_client_profile(client_df: pd.DataFrame, config: dict) -> str:
         if not expenses.empty:
             expenses["outflow"] = -expenses["amount"]
             by_category = expenses.groupby("mcc_code_desc")["outflow"].sum().sort_values(ascending=False).head(12)
-            lines.append("* Категории расходов по абсолютной величине оттока:")
-            lines.extend(f"  - {cat}: {float(value):.2f}" for cat, value in by_category.items())
+            lines.append("* Outflow categories by total positive outflow magnitude:")
+            lines.extend(
+                f"  - {english_category(cat)}: {float(value):.2f}"
+                for cat, value in by_category.items()
+            )
         lines.extend([
-            f"* Общий приток: {p['total_inflow']:.2f}",
-            f"* Средний приток на операцию: {p['mean_inflow']:.2f}",
-            f"* Медианный приток на операцию: {p['median_inflow']:.2f}",
-            f"* Общий отток (положительная величина): {p['total_outflow']:.2f}",
-            f"* Средний отток на операцию: {p['mean_outflow']:.2f}",
-            f"* Медианный отток на операцию: {p['median_outflow']:.2f}",
+            f"* Total inflow: {p['total_inflow']:.2f}",
+            f"* Mean inflow per inflow operation: {p['mean_inflow']:.2f}",
+            f"* Median inflow per inflow operation: {p['median_inflow']:.2f}",
+            f"* Total outflow (positive magnitude): {p['total_outflow']:.2f}",
+            f"* Mean outflow per outflow operation: {p['mean_outflow']:.2f}",
+            f"* Median outflow per outflow operation: {p['median_outflow']:.2f}",
         ])
     else:
         lines.extend([
-            f"* Общая величина операций: {p['total_transaction_value']:.2f}",
-            f"* Средняя величина операции: {p['mean_transaction_value']:.2f}",
-            f"* Медианная величина операции: {p['median_transaction_value']:.2f}",
-            f"* 95-й перцентиль величины операции: {p['p95_transaction_value']:.2f}",
+            f"* Total transaction value: {p['total_transaction_value']:.2f}",
+            f"* Mean transaction value: {p['mean_transaction_value']:.2f}",
+            f"* Median transaction value: {p['median_transaction_value']:.2f}",
+            f"* P95 transaction value: {p['p95_transaction_value']:.2f}",
         ])
     if semantics == "typed_transaction_value":
         lines.extend([
-            f"* Доля оплат картой: {p['card_payment_share']:.1%}",
-            f"* Доля снятий наличных: {p['cash_withdrawal_share']:.1%}",
-            f"* Доля пополнений: {p['deposit_share']:.1%}",
-            f"* Доля исходящих переводов: {p['outgoing_transfer_share']:.1%}",
-            f"* Дней от последней операции до конца окна наблюдения: {p['recency_days']:.1f}",
-            f"* Отношение активности второй половины окна к первой: {p['second_to_first_activity_ratio']:.3f}",
+            f"* Share of card payments: {p['card_payment_share']:.1%}",
+            f"* Share of cash withdrawals: {p['cash_withdrawal_share']:.1%}",
+            f"* Share of account deposits: {p['deposit_share']:.1%}",
+            f"* Share of outgoing card-to-card transfers: {p['outgoing_transfer_share']:.1%}",
+            f"* Days from the last transaction to the observation end: {p['recency_days']:.1f}",
+            f"* Second-half / first-half activity ratio: {p['second_to_first_activity_ratio']:.3f}",
         ])
     return "\n".join(lines)
 
@@ -209,7 +227,8 @@ def robust_statistics_payload(df: pd.DataFrame, config: dict) -> dict[str, Any]:
             rows = class_counts[class_counts["mcc_code_desc"] == category].set_index("customer_id")["count"]
             shares = (rows / totals.loc[rows.index]).dropna()
             class_payload["categories"].append({
-                "category": str(category),
+                "category": english_category(category),
+                "category_original": str(category),
                 "client_prevalence": _share(rows.index.nunique(), len(class_ids)),
                 # Missing category rows are real zeros, not missing values.
                 "mean_transaction_count_all_clients": float(
@@ -224,31 +243,33 @@ def robust_statistics_payload(df: pd.DataFrame, config: dict) -> dict[str, Any]:
 
 def format_robust_summary(payload: dict[str, Any]) -> str:
     lines = [
-        "# Train-only mean and robust dataset summary",
-        f"Clients: {payload['n_clients']}",
-        f"Amount semantics: {payload['amount_semantics']}",
+        "# Training-split class reference",
+        f"Total training clients: {payload['n_clients']}",
+        f"Amount semantics: {amount_semantics_display(payload['amount_semantics'])}",
         (
-            "Outliers: observations are not removed. The prompt reports mean, "
-            "median, IQR and P5-P95; SD is retained in paper exports."
+            "Observations are untrimmed. When the mean and median differ "
+            "substantially, use the median, IQR, and P5-P95 range to account "
+            "for heavy tails."
         ),
     ]
     for class_payload in payload["classes"].values():
         lines.extend(["", f"## {class_payload['name']}", f"Clients: {class_payload['n_clients']}"])
         for metric, values in class_payload["metrics"].items():
             lines.append(
-                f"* {metric}: mean={values['mean']:.3f}, "
+                f"* {metric_display_name(metric)}: mean={values['mean']:.3f}, "
                 f"median={values['median']:.3f}, "
                 f"IQR=[{values['q1']:.3f}, {values['q3']:.3f}], "
                 f"P5-P95=[{values['p05']:.3f}, {values['p95']:.3f}]"
             )
         lines.append(
-            "* Category prevalence, mean count across all class clients "
-            "(including zeros), and median within-client share among users:"
+            "* Most prevalent transaction categories. Each row reports client "
+            "prevalence; mean transactions per class client including zeros; "
+            "and median within-client share among clients who used the category:"
         )
         lines.extend(
-            f"  - {row['category']}: prevalence={row['client_prevalence']:.1%}, "
-            f"mean count={row['mean_transaction_count_all_clients']:.3f}, "
-            f"median share={row['median_share_among_users']:.1%}"
+            f"  - {row['category']}: used by {row['client_prevalence']:.1%}; "
+            f"mean count including zeros={row['mean_transaction_count_all_clients']:.3f}; "
+            f"median share among users={row['median_share_among_users']:.1%}"
             for row in class_payload["categories"]
         )
     return "\n".join(lines)
@@ -257,13 +278,16 @@ def format_robust_summary(payload: dict[str, Any]) -> str:
 def format_legacy_mean_category_summary(df: pd.DataFrame, config: dict) -> str:
     """Corrected legacy-format category means used only by the neutral pilot."""
     lines = ["# Training-split category-frequency summary (legacy format)"]
-    category_label = config["dataset"].get("category_label", "категории операций")
+    category_label = config["dataset"].get("category_label", "transaction categories")
     for label, name in config["dataset"].get("label_names", {}).items():
         group = df[df["label"] == int(label)]
         counts = group.groupby(["customer_id", "mcc_code_desc"]).size().reset_index(name="count")
         means = counts.groupby("mcc_code_desc")["count"].mean().sort_values(ascending=False).head(25)
         lines.extend(["", f"## {name}", f"| {category_label} | mean count among clients using category |", "|---|---:|"])
-        lines.extend(f"| {category} | {value:.3f} |" for category, value in means.items())
+        lines.extend(
+            f"| {english_category(category)} | {value:.3f} |"
+            for category, value in means.items()
+        )
     return "\n".join(lines)
 
 

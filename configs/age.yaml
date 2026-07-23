@@ -10,11 +10,22 @@ dataset:
     category:    mcc_code_desc
     label:       label
   label_names:
-    "0": "18-25"
-    "1": "26-35"
-    "2": "36-45"
-    "3": "46+"
-  category_label: "категории операций"
+    "0": "age_group_A"
+    "1": "age_group_B"
+    "2": "age_group_C"
+    "3": "age_group_D"
+  label_order: [0, 1, 2, 3]
+  exact_age_boundaries_available: false
+  category_label: "transaction categories"
+  prompt_task_description: "Predict the anonymized age-group class assigned by the dataset."
+  prompt_dataset_guidance: >-
+    The four age-group classes are anonymized. Their exact numerical
+    boundaries and their order are not provided. You may formulate cautious
+    life-stage interpretations, such as student-like, working-age,
+    family-oriented, or retirement-like behavior, only when supported by the
+    supplied transaction evidence. Do not assign a specific age.
+  label_semantics: age_opaque
+  claim_forbidden_terms: [age_group_A, age_group_B, age_group_C, age_group_D]
   num_labels: 4
   metric: accuracy
   splits:
@@ -42,10 +53,13 @@ llm:
 
 prompts:
   base_dir: "."
-  system:        prompts/age/explanation_generation/system_prompt.txt
-  user:          prompts/age/explanation_generation/user_prompt.txt
-  claims_system: prompts/age/claims_extraction/system_prompt.txt
-  claims_user:   prompts/age/claims_extraction/user_prompt.txt
+  language: en
+  contract_version: evidence_bounded_v4
+  category_mapping_version: en_v1
+  system:        prompts/common/explanation_generation/system_prompt.txt
+  user:          prompts/common/explanation_generation/user_prompt.txt
+  claims_system: prompts/common/claims_extraction/system_prompt.txt
+  claims_user:   prompts/common/claims_extraction/user_prompt.txt
 
 lora:
   defaults:

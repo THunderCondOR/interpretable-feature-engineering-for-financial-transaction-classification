@@ -1,6 +1,6 @@
 *.ipynb
 results/
-data/
+/data/
 logs/runs/
 reports/*/status.html
 # Byte-compiled / optimized / DLL files

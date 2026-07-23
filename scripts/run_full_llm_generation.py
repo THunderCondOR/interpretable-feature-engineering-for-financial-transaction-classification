@@ -305,6 +305,9 @@ def completion_payload(
         "dataset": config["dataset"]["name"],
         "model_slug": config["experiment"]["model_slug"],
         "variant": config["experiment"]["variant"],
+        "label_semantics": config["experiment"].get(
+            "label_semantics", "standard"
+        ),
         "splits": splits,
         "expected_counts": {split: int(expected_counts[split]) for split in splits},
         "manifest_sha256": evidence["manifest_sha256"],
@@ -462,6 +465,9 @@ def main() -> None:
         "dataset": args.dataset,
         "model_slug": model_slug,
         "variant": selected_variant,
+        "label_semantics": config["experiment"].get(
+            "label_semantics", "standard"
+        ),
         "splits": splits,
         "steps": list(LLM_STEPS),
         "seeds": config["experiment"]["seeds"],

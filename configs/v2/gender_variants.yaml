@@ -1,4 +1,4 @@
-# Kept under the historical filename for compatibility.  The v3 pilot contract
+# Kept under the historical filename for compatibility.  The v4 pilot contract
 # now applies identically to gender, age, and rosbank.
 pilot:
   datasets: [rosbank, gender, age]
@@ -11,9 +11,10 @@ pilot:
     - absolute_transaction_volume_quartile
   primary_metric: balanced_accuracy
   variants:
-    - guided_zero_shot_v3
-    - guided_factual_fs1_v3
-    - guided_factual_fs2_v3
+    - guided_zero_shot_v4
+    - guided_factual_fs1_v4
+    - guided_factual_fs2_v4
+  age_label_semantics: [age_opaque, age_ordered]
   shared_settings:
     statistics.summary_profile: robust_mean
     pipeline.few_shot_strategy: representative_medoid

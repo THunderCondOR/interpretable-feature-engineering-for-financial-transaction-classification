@@ -11,12 +11,12 @@ from src.pipeline.explanation_gen import (
 )
 
 
-LABELS = {"0": "женщина", "1": "мужчина"}
-META = {"customer_id": 1, "label": 0, "label_name": "женщина", "sample_id": 0}
+LABELS = {"0": "female", "1": "male"}
+META = {"customer_id": 1, "label": 0, "label_name": "female", "sample_id": 0}
 VALID_RESPONSE = (
-    "Клиент регулярно совершает покупки в нескольких категориях. "
-    "Частота операций и структура расходов устойчивы на протяжении периода.\n"
-    "Final: \\boxed{женщина}"
+    "The client regularly transacts across several categories. "
+    "Activity and spending composition remain stable over the observed period.\n"
+    "Final: \\boxed{female}"
 )
 
 
@@ -53,14 +53,14 @@ def test_complete_boxed_response_is_successful() -> None:
 def test_empty_content_with_reasoning_is_not_successful() -> None:
     record = build_output_record(
         META,
-        api_result("", reasoning_content="Внутреннее рассуждение"),
+        api_result("", reasoning_content="Internal reasoning"),
         LABELS,
     )
 
     assert not _is_successful(record)
     assert record["error"] == "empty response content"
     assert record["error_type"] == "EmptyResponse"
-    assert record["reasoning"] == "Внутреннее рассуждение"
+    assert record["reasoning"] == "Internal reasoning"
     assert record["explanation"] == ""
     assert record["reasoning_chars"] > 0
 
@@ -68,7 +68,7 @@ def test_empty_content_with_reasoning_is_not_successful() -> None:
 def test_truncated_response_is_not_successful() -> None:
     record = build_output_record(
         META,
-        api_result("Незавершённое обоснование", finish_reason="length"),
+        api_result("Incomplete rationale", finish_reason="length"),
         LABELS,
     )
 
@@ -78,7 +78,7 @@ def test_truncated_response_is_not_successful() -> None:
 
 
 def test_response_without_boxed_answer_is_not_successful() -> None:
-    record = build_output_record(META, api_result("Вероятно, женщина."), LABELS)
+    record = build_output_record(META, api_result("Probably female."), LABELS)
 
     assert not _is_successful(record)
     assert record["error"] == "missing or unrecognized boxed final answer"
@@ -108,7 +108,7 @@ def test_summarize_records_counts_error_types() -> None:
     empty = build_output_record(META, api_result(""), LABELS)
     truncated = build_output_record(
         META,
-        api_result("Незавершённое обоснование", finish_reason="length"),
+        api_result("Incomplete rationale", finish_reason="length"),
         LABELS,
     )
 
@@ -131,7 +131,7 @@ def test_resume_is_default_and_reuses_existing_record(tmp_path, monkeypatch) -> 
             {
                 "customer_id": 1,
                 "label": 0,
-                "label_name": "женщина",
+                "label_name": "female",
                 "system_prompt": "system",
                 "user_prompt": "user",
             },
@@ -206,7 +206,7 @@ def test_batch_error_summary_is_saved_by_type(tmp_path, monkeypatch) -> None:
         {
             "customer_id": customer_id,
             "label": 0,
-            "label_name": "женщина",
+            "label_name": "female",
             "system_prompt": "system",
             "user_prompt": "user",
         }

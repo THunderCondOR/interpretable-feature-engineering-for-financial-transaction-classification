@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from src.experiments.artifacts import fingerprint, prompt_signature
+from src.data.prompt_locale import contains_cyrillic
 from src.utils.async_api import batched_query
 from src.utils.prompt_parsing import extract_boxed_answer, normalize_text_label
 
@@ -224,6 +225,9 @@ def build_output_record(meta: dict, result: dict, label_names: dict[str, str]) -
     elif not error and predicted is None:
         error = "missing or unrecognized boxed final answer"
         error_type = "MissingFinalAnswer"
+    elif not error and contains_cyrillic(text):
+        error = "response is not fully English"
+        error_type = "NonEnglishResponse"
     elif error and not error_type:
         error_type = str(error).split(":", 1)[0].strip() or "UnknownAPIError"
 
