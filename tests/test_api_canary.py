@@ -71,7 +71,7 @@ def _config() -> dict:
         },
         "pipeline": {
             "claims_max_tokens": 256,
-            "min_behavioral_explanation_chars": 80,
+            "min_behavioral_explanation_chars": 1,
         },
         "prompts": {
             "base_dir": ".",

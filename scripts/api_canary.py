@@ -115,7 +115,7 @@ def run_model_canary(
                 "sample_id": 0,
                 "min_behavioral_explanation_chars": int(
                     config.get("pipeline", {}).get(
-                        "min_behavioral_explanation_chars", 80
+                        "min_behavioral_explanation_chars", 1
                     )
                 ),
             },

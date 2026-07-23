@@ -39,13 +39,12 @@ def _has_behavioral_explanation(record: dict) -> bool:
     """Reject outputs that contain only a final answer and no usable rationale."""
     explanation = str(record.get("explanation", "") or "")
     behavioral = _behavioral_text(explanation)
-    min_chars = int(record.get("min_behavioral_explanation_chars", 80) or 80)
+    min_chars = int(record.get("min_behavioral_explanation_chars", 1) or 1)
     if len(behavioral) < min_chars:
         return False
-    # Require at least two sentence-like fragments so a short label/list heading
-    # is not treated as a usable behavioral rationale.
-    sentence_marks = sum(behavioral.count(mark) for mark in (".", "!", "?", "\n", ";"))
-    return sentence_marks >= 2
+    # Reject punctuation/whitespace around ``Final`` without imposing a fixed
+    # rationale length or structure.
+    return any(character.isalpha() for character in behavioral)
 
 
 def load_prompts(path: str | Path) -> list[dict]:
@@ -247,7 +246,7 @@ def build_output_record(meta: dict, result: dict, label_names: dict[str, str]) -
         "error_type": error_type,
     }
     if not error:
-        min_chars = int(meta.get("min_behavioral_explanation_chars", 80) or 80)
+        min_chars = int(meta.get("min_behavioral_explanation_chars", 1) or 1)
         record["min_behavioral_explanation_chars"] = min_chars
         if not _has_behavioral_explanation(record):
             record["error"] = (
@@ -291,7 +290,7 @@ def run_explanation_generation(
     model = str(llm_cfg.get("model", llm_cfg["default_model"]))
     label_names = config["dataset"].get("label_names", {})
     min_behavioral_explanation_chars = int(
-        config.get("pipeline", {}).get("min_behavioral_explanation_chars", 80)
+        config.get("pipeline", {}).get("min_behavioral_explanation_chars", 1)
     )
 
     prompt_records = load_prompts(load_path)

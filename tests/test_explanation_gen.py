@@ -85,6 +85,22 @@ def test_response_without_boxed_answer_is_not_successful() -> None:
     assert record["error_type"] == "MissingFinalAnswer"
 
 
+def test_short_behavioral_rationale_is_valid_but_final_only_is_not() -> None:
+    short = build_output_record(
+        META,
+        api_result("Low transaction activity.\nFinal: \\boxed{female}"),
+        LABELS,
+    )
+    final_only = build_output_record(
+        META,
+        api_result("Final: \\boxed{female}"),
+        LABELS,
+    )
+    assert _is_successful(short)
+    assert not _is_successful(final_only)
+    assert final_only["error_type"] == "NoBehavioralExplanation"
+
+
 def test_write_records_is_atomic_and_supports_partial_checkpoint(tmp_path) -> None:
     record = build_output_record(
         META,

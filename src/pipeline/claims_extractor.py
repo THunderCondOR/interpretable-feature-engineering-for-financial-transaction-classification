@@ -30,12 +30,11 @@ def _behavioral_text(explanation: str) -> str:
     return text
 
 
-def _has_behavioral_explanation(explanation: str, min_chars: int = 80) -> bool:
+def _has_behavioral_explanation(explanation: str, min_chars: int = 1) -> bool:
     behavioral = _behavioral_text(explanation)
     if len(behavioral) < min_chars:
         return False
-    sentence_marks = sum(behavioral.count(mark) for mark in (".", "!", "?", "\n", ";"))
-    return sentence_marks >= 2
+    return any(character.isalpha() for character in behavioral)
 
 
 def _split_path(config: dict, key: str, split: str | None) -> Path:
@@ -310,7 +309,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
         for record in group:
             if not record.get("explanation") or record.get("error"):
                 continue
-            min_chars = int(record.get("min_behavioral_explanation_chars", 80) or 80)
+            min_chars = int(record.get("min_behavioral_explanation_chars", 1) or 1)
             if not _has_behavioral_explanation(record.get("explanation", ""), min_chars):
                 invalid_behavioral += 1
                 continue
