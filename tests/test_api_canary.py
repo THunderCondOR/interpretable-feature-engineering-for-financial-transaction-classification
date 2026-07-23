@@ -4,7 +4,10 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from scripts.api_canary import run_model_canary
+import httpx
+import openai
+
+from scripts.api_canary import _create_with_recovery, run_model_canary
 
 
 ROOT = Path(__file__).parents[1]
@@ -125,3 +128,42 @@ def test_canary_dry_run_does_not_read_configs_or_call_api(tmp_path):
     plan = json.loads(result.stdout)
     assert plan["mode"] == "dry-run"
     assert plan["writes_experiment_results"] is False
+
+
+def test_serial_canary_retries_429_after_cooldown():
+    response = SimpleNamespace(choices=[])
+    sleeps = []
+
+    class RateLimitedOnce:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise openai.RateLimitError(
+                    "too many requests",
+                    response=httpx.Response(
+                        429,
+                        request=httpx.Request(
+                            "POST", "https://example.test/v1/chat/completions"
+                        ),
+                    ),
+                    body={"message": "too many requests"},
+                )
+            return response
+
+    completions = RateLimitedOnce()
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions)
+    )
+    observed = _create_with_recovery(
+        client,
+        messages=[{"role": "user", "content": "test"}],
+        completion_kwargs={"model": "test"},
+        sleep=sleeps.append,
+        rate_limit_cooldown=60,
+    )
+    assert observed is response
+    assert completions.calls == 2
+    assert sleeps == [60]

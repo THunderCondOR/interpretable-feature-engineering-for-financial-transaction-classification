@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,53 @@ def _completion_kwargs(config: dict[str, Any], section: str) -> dict[str, Any]:
     return kwargs
 
 
+def _create_with_recovery(
+    client: Any,
+    *,
+    messages: list[dict[str, str]],
+    completion_kwargs: dict[str, Any],
+    sleep: Any = time.sleep,
+    rate_limit_cooldown: float = 60.0,
+) -> Any:
+    """Retry a serial canary on transient failures without masking blockers."""
+    transient_attempt = 0
+    while True:
+        try:
+            return client.chat.completions.create(
+                messages=messages,
+                **completion_kwargs,
+            )
+        except openai.RateLimitError:
+            print(
+                f"Canary rate-limited at concurrency=1; retrying after "
+                f"{rate_limit_cooldown:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            sleep(rate_limit_cooldown)
+        except (openai.APITimeoutError, openai.APIConnectionError):
+            transient_attempt += 1
+            delay = min(60.0, float(2 ** min(transient_attempt, 6)))
+            print(
+                f"Transient canary transport failure; retrying after {delay:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            sleep(delay)
+        except openai.APIStatusError as exc:
+            if int(exc.status_code or 0) < 500:
+                raise
+            transient_attempt += 1
+            delay = min(60.0, float(2 ** min(transient_attempt, 6)))
+            print(
+                f"Canary provider error {exc.status_code}; retrying after "
+                f"{delay:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            sleep(delay)
+
+
 def _forbidden_labels(config: dict[str, Any]) -> set[str]:
     return {
         str(value)
@@ -102,12 +150,13 @@ def run_model_canary(
     explanation_error = "no attempt"
     explanation_record: dict[str, Any] | None = None
     for _ in range(repair_attempts):
-        response = client.chat.completions.create(
+        response = _create_with_recovery(
+            client,
             messages=[
                 {"role": "system", "content": prompt_record["system_prompt"]},
                 {"role": "user", "content": prompt_record["user_prompt"]},
             ],
-            **_completion_kwargs(config, "generation"),
+            completion_kwargs=_completion_kwargs(config, "generation"),
         )
         explanation_record = build_output_record(
             {
@@ -135,9 +184,10 @@ def run_model_canary(
     claims: list[str] = []
     claim_error = "no attempt"
     for _ in range(repair_attempts):
-        response = client.chat.completions.create(
+        response = _create_with_recovery(
+            client,
             messages=_claims_dialogue(config, explanation_record["explanation"]),
-            **_completion_kwargs(config, "claims_generation"),
+            completion_kwargs=_completion_kwargs(config, "claims_generation"),
         )
         claims, error_type, error = _parse_claim_result(
             {"response": response, "error": None},
