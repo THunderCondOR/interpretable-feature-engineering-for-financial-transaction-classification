@@ -2,7 +2,11 @@ import pandas as pd
 import pytest
 
 from scripts.run_fidelity_analysis import load_cell, validate_selected_teacher
-from scripts.run_grounding_judge import judgment_signature
+from scripts.run_grounding_judge import (
+    SYSTEM_PROMPT,
+    judgment_signature,
+    validate_judgment,
+)
 from scripts.summarize_grounding_judges import validate_judge_records
 from src.experiments.artifacts import files_fingerprint
 
@@ -72,3 +76,25 @@ def test_grounding_summary_rejects_duplicate_incomplete_and_mismatched_votes():
     mismatch.loc[1, "evidence_hash"] = "other"
     with pytest.raises(ValueError, match="Evidence hash mismatch"):
         validate_judge_records(mismatch, {"a", "b"})
+
+
+def test_grounding_protocol_keeps_evidence_roles_and_verdicts_disjoint():
+    prompt = " ".join(SYSTEM_PROMPT.split())
+    assert "CLIENT TRANSACTION SUMMARY as the primary evidence" in prompt
+    assert "only to verify explicit comparative claims" in prompt
+    assert "FIELD SEMANTICS" in prompt
+    assert "partially_supported" in prompt
+    assert "not_verifiable" in prompt
+
+
+def test_grounding_judgment_schema_is_strict():
+    valid = {
+        "verdict": "supported",
+        "confidence": 4,
+        "evidence": "The supplied category is present.",
+        "reason": "The claim is a qualitative paraphrase.",
+    }
+    assert validate_judgment(valid) is None
+    assert validate_judgment({**valid, "confidence": 4.0}) == "confidence_not_integer"
+    assert validate_judgment({**valid, "confidence": 6}) == "confidence_out_of_range"
+    assert validate_judgment({**valid, "verdict": "maybe"}) == "invalid_verdict"

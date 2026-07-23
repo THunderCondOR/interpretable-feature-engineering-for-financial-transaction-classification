@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections import Counter
 from pathlib import Path
 
 from src.experiments.artifacts import fingerprint, stage_signature
+from src.data.prompt_locale import assert_english_model_text, contains_cyrillic
 from src.pipeline.semantic_features import normalize_claim
 from src.utils.async_api import batched_query
 from src.utils.prompt_parsing import extract_json_list
@@ -105,7 +107,48 @@ def _load_successful_claims(
     return successful
 
 
-def _parse_claim_result(result: dict) -> tuple[list[str], str | None, str | None]:
+def _validate_claims(
+    values: list,
+    *,
+    forbidden_labels: set[str],
+) -> tuple[list[str], str | None, str | None]:
+    if not values:
+        return [], "EmptyClaims", "response did not contain a non-empty JSON list"
+    if any(not isinstance(value, str) for value in values):
+        return [], "InvalidClaimsSchema", "every claim must be a JSON string"
+    claims = [value.strip() for value in values if value.strip()]
+    if not claims:
+        return [], "EmptyClaims", "response did not contain a non-empty claim"
+    for claim in claims:
+        if contains_cyrillic(claim):
+            return [], "NonEnglishClaims", f"claim contains Cyrillic: {claim[:120]!r}"
+        normalized = re.sub(r"[\s_-]+", " ", claim.lower())
+        if any(
+            re.search(
+                r"(?<!\w)"
+                + re.escape(re.sub(r"[\s_-]+", " ", label.lower()))
+                + r"(?!\w)",
+                normalized,
+            )
+            for label in forbidden_labels
+        ):
+            return [], "TargetLabelLeakage", f"claim contains a target label: {claim[:120]!r}"
+        # Numeric category identifiers are names, not quantitative evidence.
+        without_category_ids = re.sub(
+            r"\boperation group \d+\b", "operation group", claim, flags=re.I
+        )
+        if re.search(r"\d", without_category_ids):
+            return [], "NumericClaim", f"claim contains an exact number: {claim[:120]!r}"
+        if not re.match(r"^The client(?:'s|\b)", claim, flags=re.I):
+            return [], "InvalidClaimSubject", f"claim must use 'The client': {claim[:120]!r}"
+    return claims, None, None
+
+
+def _parse_claim_result(
+    result: dict,
+    *,
+    forbidden_labels: set[str] | None = None,
+) -> tuple[list[str], str | None, str | None]:
     if result.get("error") or result.get("response") is None:
         return (
             [],
@@ -117,10 +160,11 @@ def _parse_claim_result(result: dict) -> tuple[list[str], str | None, str | None
         if choice.finish_reason not in (None, "stop"):
             return [], "IncompleteResponse", f"finish_reason={choice.finish_reason}"
         text = choice.message.content or ""
-        parsed = [str(item).strip() for item in extract_json_list(text) if str(item).strip()]
-        if not parsed:
-            return [], "EmptyClaims", "response did not contain a non-empty JSON list"
-        return parsed, None, None
+        parsed = extract_json_list(text)
+        return _validate_claims(
+            parsed,
+            forbidden_labels=forbidden_labels or set(),
+        )
     except Exception as exc:
         return [], "InvalidAPIResponse", str(exc)
 
@@ -196,6 +240,16 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
     base_dir = Path(cfg_prompts["base_dir"])
     claims_sys = (base_dir / cfg_prompts["claims_system"]).read_text(encoding="utf-8")
     claims_usr_t = (base_dir / cfg_prompts["claims_user"]).read_text(encoding="utf-8")
+    assert_english_model_text(claims_sys, context="claims system prompt")
+    assert_english_model_text(claims_usr_t, context="claims user prompt")
+    forbidden_labels = {
+        str(value).strip()
+        for value in (
+            list(config["dataset"].get("label_names", {}).values())
+            + list(config["dataset"].get("claim_forbidden_terms", []))
+        )
+        if str(value).strip()
+    }
     generation_signature = stage_signature(
         "claims_extraction",
         inputs={
@@ -210,6 +264,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
             "seed": llm_cfg.get("seed"),
             "extra_body": llm_cfg.get("extra_body"),
             "n_claims_samples": n_samples,
+            "output_contract": "english_label_free_claims_v4",
         },
     )
 
@@ -304,7 +359,11 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
             }
             continue
         for rec in selected:
-            user_prompt = claims_usr_t.format(COT=rec.get("explanation", ""))
+            rationale = _behavioral_text(rec.get("explanation", ""))
+            user_prompt = claims_usr_t.format(COT=rationale)
+            assert_english_model_text(
+                user_prompt, context=f"claims user prompt {rec['customer_id']}"
+            )
             all_dialogues.append([
                 {"role": "system", "content": claims_sys},
                 {"role": "user", "content": user_prompt},
@@ -343,7 +402,9 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
         if llm_cfg.get("until_complete"):
             repairable = []
             for idx, result in batch_results:
-                _parsed, error_type, error = _parse_claim_result(result)
+                _parsed, error_type, error = _parse_claim_result(
+                    result, forbidden_labels=forbidden_labels
+                )
                 if error_type:
                     repairable.append((meta[idx]["customer_id"], error_type, error))
             if repairable:
@@ -352,7 +413,9 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
         for idx, result in batch_results:
             item_meta = meta[idx]
             cid = int(item_meta["customer_id"])
-            parsed, error_type, error = _parse_claim_result(result)
+            parsed, error_type, error = _parse_claim_result(
+                result, forbidden_labels=forbidden_labels
+            )
             record = claims_by_client.setdefault(
                 cid,
                 {

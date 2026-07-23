@@ -33,25 +33,31 @@ from src.utils.async_api import batched_query
 from src.experiments.artifacts import fingerprint
 
 
-GROUNDING_PROTOCOL_VERSION = 2
+GROUNDING_PROTOCOL_VERSION = 3
 
 
 SYSTEM_PROMPT = """You are an auditor for claim-level grounding in a financial transaction study.
 
-Your task: decide whether the CLAIM is supported by the CLIENT TRANSACTION SUMMARY.
+Decide whether the CLAIM is supported by the supplied evidence. Treat the CLIENT
+TRANSACTION SUMMARY as the primary evidence. Use the TRAIN-ONLY REFERENCE SUMMARY
+only to verify explicit comparative claims. Always follow FIELD SEMANTICS; never
+assign income, expense, inflow, or outflow meaning that the field semantics do not
+support.
 
-Use only the provided client summary. Do not use demographic stereotypes, common sense,
-or external knowledge. A claim is:
-- supported: directly entailed by the summary, including approximate paraphrases of counts,
-  amounts, categories, frequency, income/expense totals, or explicitly listed absences.
-- partially_supported: related to the summary but stronger, broader, or more interpretive
-  than what the summary strictly shows.
-- unsupported: not present, contradicted, or based on stereotypes/inferences not grounded
-  in the summary.
-- not_verifiable: the supplied evidence is insufficient to verify the claim.
+Do not use demographic stereotypes or unrelated outside assumptions as evidence.
+Limited interpretation is allowed only to assess whether a hypothesis has a
+relevant transaction-based basis. A verdict is:
+- supported: directly entailed by the client evidence, including an accurate
+  qualitative paraphrase of an explicitly supplied value, category, or trend;
+- partially_supported: a plausible interpretation that has relevant transaction
+  evidence but goes beyond what the evidence directly establishes;
+- unsupported: contradicted by the evidence or asserted without any relevant
+  transaction evidence;
+- not_verifiable: the necessary field is genuinely omitted, truncated, or
+  semantically ambiguous, so the claim cannot be assessed.
 
-Return only valid JSON with keys: verdict, confidence, evidence, reason.
-Keep evidence and reason short."""
+Return only valid JSON with keys verdict, confidence, evidence, and reason.
+confidence must be an integer from 1 to 5. Keep evidence and reason short."""
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -154,6 +160,26 @@ def normalize_verdict(value: Any) -> str:
     if text not in {"supported", "partially_supported", "unsupported", "not_verifiable"}:
         return "parse_error"
     return text
+
+
+def validate_judgment(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return "judgment_not_an_object"
+    missing = {"verdict", "confidence", "evidence", "reason"} - set(payload)
+    if missing:
+        return "missing_keys:" + ",".join(sorted(missing))
+    confidence = payload.get("confidence")
+    if not isinstance(confidence, int) or isinstance(confidence, bool):
+        return "confidence_not_integer"
+    if not 1 <= confidence <= 5:
+        return "confidence_out_of_range"
+    if not isinstance(payload.get("evidence"), str) or not isinstance(
+        payload.get("reason"), str
+    ):
+        return "evidence_or_reason_not_string"
+    if normalize_verdict(payload.get("verdict")) == "parse_error":
+        return "invalid_verdict"
+    return None
 
 
 def write_records(path: Path, records: list[dict[str, Any]]) -> None:
@@ -268,7 +294,12 @@ async def main_async() -> None:
             sample = pending[idx]
             content = extract_content(result)
             parsed, parse_error = parse_json_object(content)
+            validation_error = validate_judgment(parsed)
+            if not parse_error and validation_error:
+                parse_error = validation_error
             verdict = normalize_verdict(parsed.get("verdict") if parsed else None)
+            if parse_error:
+                verdict = "parse_error"
             staged.append({
                     **sample,
                     "judge_name": args.judge_name,
