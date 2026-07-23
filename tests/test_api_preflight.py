@@ -42,16 +42,39 @@ def _fixture_configs(tmp_path: Path) -> tuple[list[Path], dict[str, dict[str, in
             next_id += count
             path = tmp_path / "data" / dataset / f"{split}.csv"
             path.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame({"cid": ids, "amount": [1.0] * count}).to_csv(path, index=False)
+            rows = {
+                "cid": ids,
+                "amount": [1.0] * count,
+                "category": ["MCC 5411"] * count,
+            }
+            if dataset == "rosbank":
+                rows.update(
+                    {
+                        "trx_cat_ru": ["card payment"] * count,
+                        "currency_name": ["US dollar"] * count,
+                    }
+                )
+            pd.DataFrame(rows).to_csv(path, index=False)
             split_paths[split] = str(path)
             expected[dataset][split] = count
 
         prompt_dir = tmp_path / "prompts" / dataset
         prompt_dir.mkdir(parents=True)
+        prompt_text = {
+            "system": (
+                "{TASK_DESCRIPTION}\n{DATASET_GUIDANCE}\n{ALLOWED_LABELS}"
+            ),
+            "user": (
+                "{SUMMARY_TRANSACTIONAL_STATS}\n"
+                "{FEW_SHOT_SECTION}\n{CLIENT_STATS}"
+            ),
+            "claims_system": "Extract English claims.",
+            "claims_user": "{COT}",
+        }
         prompt_names = {}
-        for key in ("system", "user", "claims_system", "claims_user"):
+        for key, text in prompt_text.items():
             prompt = prompt_dir / f"{key}.txt"
-            prompt.write_text(key, encoding="utf-8")
+            prompt.write_text(text, encoding="utf-8")
             prompt_names[key] = prompt.name
         configs.append(
             _write_json(
@@ -59,10 +82,21 @@ def _fixture_configs(tmp_path: Path) -> tuple[list[Path], dict[str, dict[str, in
                 {
                     "dataset": {
                         "name": dataset,
-                        "columns": {"customer_id": "cid"},
+                        "columns": {
+                            "customer_id": "cid",
+                            "category": "category",
+                        },
                         "splits": split_paths,
+                        "label_names": {"0": "negative", "1": "positive"},
+                        "prompt_task_description": "Predict a label.",
+                        "prompt_dataset_guidance": "Use transaction evidence.",
                     },
-                    "prompts": {"base_dir": str(prompt_dir), **prompt_names},
+                    "prompts": {
+                        "base_dir": str(prompt_dir),
+                        "language": "en",
+                        "category_mapping_version": "en_v1",
+                        **prompt_names,
+                    },
                 },
             )
         )
@@ -120,7 +154,7 @@ def test_preflight_can_be_tested_without_git_or_network(tmp_path):
         probe=False,
     )
     assert result["clients_per_model"] == 18
-    assert result["estimated_api_requests"] == 177_200
+    assert result["estimated_api_requests"] == 178_400
     assert result["probed_models"] == []
 
 
@@ -203,7 +237,7 @@ def test_launcher_dry_run_has_no_writes_and_prints_guards_and_scope():
         text=True,
         env=os.environ.copy(),
     )
-    assert "estimated API requests: 177,200" in result.stdout
+    assert "estimated API requests: 178,400" in result.stdout
     assert result.stdout.count("DRY RUN: tmux new-session") == 3
     assert result.stdout.count("--execute-api") == 2
     assert "bash\\ -o\\ pipefail" in result.stdout

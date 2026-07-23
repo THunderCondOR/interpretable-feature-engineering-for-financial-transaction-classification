@@ -61,7 +61,7 @@ QWEN_CONFIG="$(resolve_path "$QWEN_CONFIG")"
 GPT_CONFIG="$(resolve_path "$GPT_CONFIG")"
 DISPLAY_PYTHON="${PYTHON_BIN:-python}"
 SESSION_PREFIX="$(printf '%s' "$RUN_ID" | tr -cs 'A-Za-z0-9_' '_' | cut -c1-48)"
-SOCKET_NAME="reviewer_v2_${SESSION_PREFIX}"
+SOCKET_NAME="reviewer_v4_${SESSION_PREFIX}"
 QWEN_SESSION="${SESSION_PREFIX}_qwen"
 GPT_SESSION="${SESSION_PREFIX}_gpt_oss"
 STATUS_SESSION="${SESSION_PREFIX}_status"
@@ -103,7 +103,7 @@ Overnight LLM scope:
   datasets: 3 (gender, age, rosbank)
   split cells: 9 per model
   clients: 43,400 per model
-  estimated API requests: 177,200 including three prompt pilots
+  estimated API requests: 178,400 including the factorial Age prompt pilot
   tmux socket: ${SOCKET_NAME}
 EOF
 }
@@ -155,6 +155,12 @@ done
   --qwen-config "$QWEN_CONFIG" \
   --gpt-config "$GPT_CONFIG" \
   --probe
+"$PYTHON_BIN" "$REPO_ROOT/scripts/api_canary.py" \
+  --run-id "$RUN_ID" \
+  --model-config "$QWEN_CONFIG" \
+  --model-config "$GPT_CONFIG" \
+  --execute-api \
+  --until-complete
 
 mkdir -p "$REPO_ROOT/logs/runs/$RUN_ID"
 

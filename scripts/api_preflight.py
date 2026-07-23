@@ -29,8 +29,14 @@ from scripts.run_prompt_pilot import (
     stratified_pilot_ids,
 )
 from scripts.run_model_queue import default_jobs
+from src.data.prompt_locale import (
+    english_category,
+    english_currency,
+    english_operation_type,
+)
 from src.experiments.artifacts import build_run_manifest, fingerprint
 from src.experiments.config_builder import build_runtime_config
+from src.pipeline.prompt_builder import validate_prompt_contract
 
 
 EXPECTED_CLIENT_COUNTS: dict[str, dict[str, int]] = {
@@ -180,6 +186,12 @@ def validate_datasets(
             prompt_path = prompt_base / str(value) if value else None
             if prompt_path is None or not prompt_path.is_file():
                 raise PreflightError(f"Missing {dataset} prompt {key}: {prompt_path}")
+        contract_config = json.loads(json.dumps(config))
+        contract_config["prompts"]["base_dir"] = str(prompt_base)
+        try:
+            validate_prompt_contract(contract_config)
+        except ValueError as exc:
+            raise PreflightError(f"Invalid {dataset} prompt contract: {exc}") from exc
 
         observed[dataset] = {}
         all_ids[dataset] = {}
@@ -187,7 +199,10 @@ def validate_datasets(
             split_path = _resolve_repo_path(repo_root, str(splits[split]))
             if not split_path.is_file():
                 raise PreflightError(f"Missing {dataset}/{split} split: {split_path}")
-            frame = pandas.read_csv(split_path, usecols=[id_column])
+            display_columns = [id_column, config["dataset"]["columns"]["category"]]
+            if dataset == "rosbank":
+                display_columns.extend(["trx_cat_ru", "currency_name"])
+            frame = pandas.read_csv(split_path, usecols=display_columns)
             if frame[id_column].isna().any():
                 raise PreflightError(f"Null customer IDs in {dataset}/{split}")
             identifiers = set(frame[id_column].tolist())
@@ -200,6 +215,20 @@ def validate_datasets(
                 )
             observed[dataset][split] = count
             all_ids[dataset][split] = identifiers
+            try:
+                for category in frame[
+                    config["dataset"]["columns"]["category"]
+                ].dropna().unique():
+                    english_category(category)
+                if dataset == "rosbank":
+                    for operation in frame["trx_cat_ru"].dropna().unique():
+                        english_operation_type(operation)
+                    for currency in frame["currency_name"].dropna().unique():
+                        english_currency(currency)
+            except ValueError as exc:
+                raise PreflightError(
+                    f"English presentation mapping failed for {dataset}/{split}: {exc}"
+                ) from exc
 
         for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
             overlap = all_ids[dataset][left] & all_ids[dataset][right]
@@ -268,6 +297,11 @@ def validate_prompt_pilot_samples(
             "selected": len(identifiers),
             "client_ids_sha256": fingerprint(identifiers),
             "variants": list(PILOT_VARIANTS),
+            "label_semantics": (
+                ["age_opaque", "age_ordered"]
+                if dataset == "age"
+                else ["standard"]
+            ),
         }
     if set(result) != set(EXPECTED_CLIENT_COUNTS):
         raise PreflightError(
@@ -294,8 +328,8 @@ def planned_runtime_configs(
         for base in (_load_yaml(path) for path in dataset_configs)
     }
     configs: list[dict[str, Any]] = []
-    # Every dataset may select any of the three variants.  Validate both final
-    # model roots and the Qwen pilot root for every possible selection.
+    # Every dataset may select any prompt format; Age additionally selects
+    # opaque or ordered label semantics. Validate every possible output root.
     for dataset in ("gender", "age", "rosbank"):
         pilot_ids_path = (
             Path("logs/runs")
@@ -303,39 +337,45 @@ def planned_runtime_configs(
             / "generated"
             / f"{dataset}_pilot_client_ids.json"
         )
-        for variant in PILOT_VARIANTS:
-            for profile in profiles.values():
-                config = build_runtime_config(
-                    bases[dataset],
-                    profile,
-                    run_id=run_id,
-                    variant=variant,
-                    sampling_seed=PILOT_SAMPLING_SEED,
-                    generation_seed=17,
-                    claims_seed=17,
-                    ml_seed=17,
-                    results_root=Path("results/v2"),
-                    expected_client_counts=EXPECTED_CLIENT_COUNTS[dataset],
+        semantics_values = (
+            ("age_opaque", "age_ordered") if dataset == "age" else ("standard",)
+        )
+        for label_semantics in semantics_values:
+            for variant in PILOT_VARIANTS:
+                for profile in profiles.values():
+                    config = build_runtime_config(
+                        bases[dataset],
+                        profile,
+                        run_id=run_id,
+                        variant=variant,
+                        label_semantics=label_semantics,
+                        sampling_seed=PILOT_SAMPLING_SEED,
+                        generation_seed=17,
+                        claims_seed=17,
+                        ml_seed=17,
+                        results_root=Path("results/v2"),
+                        expected_client_counts=EXPECTED_CLIENT_COUNTS[dataset],
+                    )
+                    configs.append(config)
+                configs.append(
+                    build_runtime_config(
+                        bases[dataset],
+                        profiles["qwen"],
+                        run_id=run_id,
+                        variant=variant,
+                        label_semantics=label_semantics,
+                        sampling_seed=PILOT_SAMPLING_SEED,
+                        generation_seed=17,
+                        claims_seed=17,
+                        ml_seed=17,
+                        results_root=Path("results/v2/pilot"),
+                        client_ids_by_split={"val": str(pilot_ids_path)},
+                        expected_client_counts={
+                            **EXPECTED_CLIENT_COUNTS[dataset],
+                            "val": PILOT_SIZE,
+                        },
+                    )
                 )
-                configs.append(config)
-            configs.append(
-                build_runtime_config(
-                    bases[dataset],
-                    profiles["qwen"],
-                    run_id=run_id,
-                    variant=variant,
-                    sampling_seed=PILOT_SAMPLING_SEED,
-                    generation_seed=17,
-                    claims_seed=17,
-                    ml_seed=17,
-                    results_root=Path("results/v2/pilot"),
-                    client_ids_by_split={"val": str(pilot_ids_path)},
-                    expected_client_counts={
-                        **EXPECTED_CLIENT_COUNTS[dataset],
-                        "val": PILOT_SIZE,
-                    },
-                )
-            )
     return configs
 
 
@@ -451,7 +491,7 @@ def run_preflight(
     gpt_config: Path,
     dataset_configs: list[Path],
     environ: dict[str, str] | os._Environ[str],
-    run_id: str = "reviewer-v2",
+    run_id: str = "reviewer-v4-english-20260723",
     expected_counts: dict[str, dict[str, int]] = EXPECTED_CLIENT_COUNTS,
     check_git: bool = True,
     probe: bool = False,
@@ -500,7 +540,7 @@ def run_preflight(
         "models": [profile["slug"] for profile in profiles],
         "datasets": counts,
         "clients_per_model": sum(sum(splits.values()) for splits in counts.values()),
-        "estimated_api_requests": 177_200,
+        "estimated_api_requests": 178_400,
         "prompt_pilots": pilot,
         "runtime_outputs": outputs,
         "queue": queue,
@@ -511,7 +551,7 @@ def run_preflight(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--run-id", default="reviewer-v2")
+    parser.add_argument("--run-id", default="reviewer-v4-english-20260723")
     parser.add_argument("--qwen-config", type=Path, required=True)
     parser.add_argument("--gpt-config", type=Path, required=True)
     parser.add_argument("--dataset-config", action="append", type=Path, default=[])
