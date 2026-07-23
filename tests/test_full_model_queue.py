@@ -1,7 +1,12 @@
 import json
 from pathlib import Path
 
-from scripts.run_model_queue import _job_signature, _output_evidence, default_jobs
+from scripts.run_model_queue import (
+    _event,
+    _job_signature,
+    _output_evidence,
+    default_jobs,
+)
 from scripts.pipeline_status import normalize_event
 
 
@@ -91,3 +96,9 @@ def test_status_scopes_api_stages_by_split_and_keeps_queue_failures_visible():
     failure = normalize_event({"stage": "full", "event": "job_failed"})
     assert explanation["stage"] == "train_explanations"
     assert failure["stage"] == "queue"
+
+
+def test_dependency_event_can_record_path_without_argument_collision(tmp_path):
+    events = tmp_path / "events.jsonl"
+    _event(events, event="dependency_wait", path="selection.json")
+    assert json.loads(events.read_text())["path"] == "selection.json"

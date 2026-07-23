@@ -242,9 +242,10 @@ def _output_evidence(
                 return None
     return files_fingerprint(outputs)
 
-def _event(path: Path, **payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as file:
+def _event(log_path: Path, **payload: Any) -> None:
+    """Append an event; payload may safely contain its own ``path`` field."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as file:
         file.write(json.dumps({"timestamp": time.time(), **payload}) + "\n")
 
 
