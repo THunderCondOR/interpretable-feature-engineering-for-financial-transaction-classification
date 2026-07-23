@@ -32,7 +32,17 @@ def test_age_prompts_do_not_supply_age_archetypes_or_call_amount_income():
 
 
 def test_user_prompts_explicitly_scope_summaries_to_training_split():
-    for dataset in ("gender", "age"):
+    for dataset in ("gender", "age", "rosbank"):
         text = _read(f"prompts/{dataset}/explanation_generation/user_prompt.txt")
         assert "training split" in text
         assert "по всему датасету" not in text
+
+
+def test_reasoning_guide_is_flexible_not_a_fixed_template():
+    for dataset in ("gender", "age", "rosbank"):
+        text = _read(f"prompts/{dataset}/explanation_generation/system_prompt.txt")
+        assert "структуру и набор рассмотренных признаков выбери самостоятельно" in text
+        assert "evidence —" not in text
+        assert "interpretation —" not in text
+        assert "5–10" not in text
+        assert "сначала обязательно" not in text

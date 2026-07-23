@@ -1,35 +1,36 @@
+# Kept under the historical filename for compatibility.  The v3 pilot contract
+# now applies identically to gender, age, and rosbank.
 pilot:
+  datasets: [rosbank, gender, age]
   split: val
-  clients: 400
+  clients_per_dataset: 400
   sampling_seed: 137
-  stratify_by: [label, transaction_count_quartile, transaction_volume_quartile]
+  stratify_by:
+    - label
+    - transaction_count_quartile
+    - absolute_transaction_volume_quartile
   primary_metric: balanced_accuracy
   variants:
-    - legacy
-    - neutral_only
-    - neutral_robust_fewshot
-    - neutral_robust_zero_shot
+    - guided_zero_shot_v3
+    - guided_factual_fs1_v3
+    - guided_factual_fs2_v3
+  shared_settings:
+    statistics.summary_profile: robust_mean
+    pipeline.few_shot_strategy: representative_medoid
+    prompt.max_chars: null
   variant_settings:
-    legacy:
-      source: immutable_existing_predictions
-    neutral_only:
-      statistics.summary_profile: legacy_mean_categories
-      pipeline.few_shot_strategy: random
-    neutral_robust_fewshot:
-      statistics.summary_profile: robust
-      pipeline.few_shot_strategy: representative
-      pipeline.few_shot_per_class: 2
-      pipeline.few_shot_seed: 137
-    neutral_robust_zero_shot:
-      statistics.summary_profile: robust
+    guided_zero_shot_v3:
       pipeline.few_shot_per_class: 0
+    guided_factual_fs1_v3:
+      pipeline.few_shot_per_class: 1
+    guided_factual_fs2_v3:
+      pipeline.few_shot_per_class: 2
   selection_rule:
-    practical_equivalence_points: 1.0
-    require_overlapping_confidence_intervals: true
-    prefer_when_equivalent: neutral_robust_zero_shot
+    minimum_strict_balanced_accuracy_gain: 0.02
+    paired_bootstrap_ci_lower_bound_must_exceed: 0.0
+    fs1_tie_margin: 0.005
 full_run:
-  qwen_splits: [train, val, test]
-  gpt_oss_direct_splits: [test]
-  gpt_oss_claim_scope: grounding_subset
-  reuse: [majority, lora]
-  reevaluate_with_seeds: [standard, handcrafted]
+  models: [qwen, gpt_oss]
+  datasets: [gender, rosbank, age]
+  splits: [train, val, test]
+  stages: [stats, prompts, explanations, direct_eval, claims]

@@ -15,9 +15,11 @@ import random
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 
 from src.data.aggregator import get_summary_fn
+from src.data.profiles import client_feature_frame
 from src.experiments.artifacts import fingerprint
 
 
@@ -84,18 +86,13 @@ def build_few_shot_str(
         ids = labeled_df.loc[labeled_df["label"] == label_id, "customer_id"].unique().tolist()
         if not ids:
             continue
-        if strategy == "representative":
-            candidates = labeled_df[labeled_df["customer_id"].isin(ids)].groupby("customer_id").agg(
-                transaction_count=("amount", "size"),
-                transaction_volume=("amount", lambda values: values.abs().sum()),
+        if strategy in {"representative", "representative_medoid"}:
+            sampled = representative_medoid_ids(
+                labeled_df,
+                config,
+                label_id=label_id,
+                n_clients=n_per_class,
             )
-            distances = np.zeros(len(candidates), dtype=float)
-            for column in candidates.columns:
-                median = candidates[column].median()
-                scale = candidates[column].quantile(.75) - candidates[column].quantile(.25)
-                distances += np.abs(candidates[column].to_numpy() - median) / max(float(scale), 1.0)
-            candidates = candidates.assign(distance=distances).sort_values(["distance", "customer_id"])
-            sampled = candidates.index[: min(n_per_class, len(candidates))].tolist()
         elif strategy == "random":
             sampled = rng.sample(ids, k=min(n_per_class, len(ids)))
         else:
@@ -107,6 +104,64 @@ def build_few_shot_str(
             i += 1
 
     return "\n".join(parts)
+
+
+def representative_medoid_ids(
+    train_df,
+    config: dict,
+    *,
+    label_id: int,
+    n_clients: int,
+) -> list[int]:
+    """Choose deterministic class representatives in robust-scaled profile space."""
+    profiles = client_feature_frame(train_df, config)
+    numeric = [
+        column
+        for column in profiles.select_dtypes(include=[np.number]).columns
+        if column not in {"customer_id", "label"}
+    ]
+    if not numeric:
+        raise ValueError("Few-shot medoid selection requires numeric client profiles")
+    values = profiles[numeric].replace([np.inf, -np.inf], np.nan)
+    medians = values.median()
+    values = values.fillna(medians).fillna(0.0)
+    scale = values.quantile(0.75) - values.quantile(0.25)
+    scale = scale.mask(scale.abs() < 1e-12, 1.0)
+    scaled = (values - medians) / scale
+    class_mask = profiles["label"].astype(int) == int(label_id)
+    class_values = scaled.loc[class_mask]
+    if class_values.empty:
+        return []
+    class_center = class_values.median()
+    distance = np.sqrt(((class_values - class_center) ** 2).sum(axis=1))
+    ranked = (
+        pd.DataFrame(
+            {
+                "customer_id": profiles.loc[class_mask, "customer_id"].astype(int),
+                "distance": distance,
+            }
+        )
+        .sort_values(["distance", "customer_id"], kind="mergesort")
+    )
+    return ranked["customer_id"].head(int(n_clients)).tolist()
+
+
+def prompt_length_telemetry(records: list[dict]) -> dict:
+    """Summarize prompt component sizes without imposing any validation cap."""
+    components = ("summary", "few_shot", "target_profile", "system", "user", "total")
+    result = {"n_prompts": len(records), "units": "unicode_characters", "components": {}}
+    for component in components:
+        values = np.asarray(
+            [record["prompt_lengths"][component] for record in records],
+            dtype=float,
+        )
+        result["components"][component] = {
+            "min": int(values.min()) if len(values) else 0,
+            "median": float(np.median(values)) if len(values) else 0.0,
+            "p95": float(np.quantile(values, 0.95)) if len(values) else 0.0,
+            "max": int(values.max()) if len(values) else 0,
+        }
+    return result
 
 
 def build_prompts(
@@ -159,6 +214,14 @@ def build_prompts(
             "client_stats_hash": fingerprint(client_stats),
             "summary_stats_hash": fingerprint(summary_stats_str),
             "few_shot_hash": fingerprint(few_shot_str),
+            "prompt_lengths": {
+                "summary": len(summary_stats_str),
+                "few_shot": len(few_shot_str),
+                "target_profile": len(client_stats),
+                "system": len(system_prompt),
+                "user": len(user_prompt),
+                "total": len(system_prompt) + len(user_prompt),
+            },
         })
 
     return records

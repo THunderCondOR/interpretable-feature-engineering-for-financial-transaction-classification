@@ -1,7 +1,12 @@
 import pandas as pd
 
 from src.data.profiles import format_legacy_mean_category_summary
-from src.pipeline.prompt_builder import build_few_shot_str
+from src.pipeline.prompt_builder import (
+    build_few_shot_str,
+    build_prompts,
+    prompt_length_telemetry,
+    representative_medoid_ids,
+)
 
 
 def config(**pipeline):
@@ -23,11 +28,28 @@ def test_zero_shot_has_truly_empty_demonstration_block():
 
 
 def test_representative_few_shot_uses_class_medoids_deterministically():
-    settings=config(few_shot_per_class=1,few_shot_strategy="representative",few_shot_seed=137)
+    settings=config(few_shot_per_class=1,few_shot_strategy="representative_medoid",few_shot_seed=137)
     first=build_few_shot_str(frame(),settings)
     second=build_few_shot_str(frame(),settings)
     assert first==second
     assert first.count("* Всего операций: 3")==2
+    assert "reasoning" not in first.lower()
+    assert "cot" not in first.lower()
+
+
+def test_medoid_ids_are_train_only_and_deterministic():
+    train = frame()
+    first = representative_medoid_ids(
+        train, config(), label_id=0, n_clients=2
+    )
+    second = representative_medoid_ids(
+        train.sample(frac=1.0, random_state=9),
+        config(),
+        label_id=0,
+        n_clients=2,
+    )
+    assert first == second
+    assert set(first) <= set(train.loc[train.label == 0, "customer_id"])
 
 
 def test_neutral_only_legacy_summary_is_train_scoped_and_has_no_tail_std():
@@ -35,3 +57,23 @@ def test_neutral_only_legacy_summary_is_train_scoped_and_has_no_tail_std():
     assert "Training-split" in summary
     assert "std" not in summary.lower()
     assert "mean count among clients using category" in summary
+
+
+def test_long_prompts_are_not_blocked_or_truncated_and_have_telemetry(tmp_path):
+    (tmp_path / "system.txt").write_text("system", encoding="utf-8")
+    (tmp_path / "user.txt").write_text(
+        "{SUMMARY_TRANSACTIONAL_STATS}\n{FEW_SHOT_EXAMPLES}\n{CLIENT_STATS}",
+        encoding="utf-8",
+    )
+    settings = config()
+    settings["prompts"] = {
+        "base_dir": str(tmp_path),
+        "system": "system.txt",
+        "user": "user.txt",
+    }
+    very_long = "summary " * 20_000
+    records = build_prompts(frame().query("customer_id == 0"), settings, very_long, "")
+    assert very_long in records[0]["user_prompt"]
+    assert records[0]["prompt_lengths"]["summary"] == len(very_long)
+    telemetry = prompt_length_telemetry(records)
+    assert telemetry["components"]["summary"]["max"] == len(very_long)

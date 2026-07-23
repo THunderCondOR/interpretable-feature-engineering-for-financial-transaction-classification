@@ -10,7 +10,13 @@ import numpy as np
 import pandas as pd
 
 
-QUANTILES = ((0.05, "p05"), (0.25, "q1"), (0.50, "median"), (0.75, "q3"), (0.95, "p95"))
+QUANTILES = (
+    (0.05, "p05"),
+    (0.25, "q1"),
+    (0.50, "median"),
+    (0.75, "q3"),
+    (0.95, "p95"),
+)
 
 
 def amount_semantics(config: dict) -> str:
@@ -67,8 +73,10 @@ def client_numeric_profile(
         outflow = -amounts[amounts < 0]
         profile.update({
             "total_inflow": float(inflow.sum()),
+            "mean_inflow": float(inflow.mean()) if len(inflow) else 0.0,
             "median_inflow": float(inflow.median()) if len(inflow) else 0.0,
             "total_outflow": float(outflow.sum()),
+            "mean_outflow": float(outflow.mean()) if len(outflow) else 0.0,
             "median_outflow": float(outflow.median()) if len(outflow) else 0.0,
             "inflow_operation_share": _share(len(inflow), n_txn),
             "outflow_operation_share": _share(len(outflow), n_txn),
@@ -77,6 +85,7 @@ def client_numeric_profile(
         values = amounts.abs()
         profile.update({
             "total_transaction_value": float(values.sum()),
+            "mean_transaction_value": float(values.mean()) if len(values) else 0.0,
             "median_transaction_value": float(values.median()) if len(values) else 0.0,
             "p95_transaction_value": float(values.quantile(0.95)) if len(values) else 0.0,
         })
@@ -139,13 +148,16 @@ def format_client_profile(client_df: pd.DataFrame, config: dict) -> str:
             lines.extend(f"  - {cat}: {float(value):.2f}" for cat, value in by_category.items())
         lines.extend([
             f"* Общий приток: {p['total_inflow']:.2f}",
+            f"* Средний приток на операцию: {p['mean_inflow']:.2f}",
             f"* Медианный приток на операцию: {p['median_inflow']:.2f}",
             f"* Общий отток (положительная величина): {p['total_outflow']:.2f}",
+            f"* Средний отток на операцию: {p['mean_outflow']:.2f}",
             f"* Медианный отток на операцию: {p['median_outflow']:.2f}",
         ])
     else:
         lines.extend([
             f"* Общая величина операций: {p['total_transaction_value']:.2f}",
+            f"* Средняя величина операции: {p['mean_transaction_value']:.2f}",
             f"* Медианная величина операции: {p['median_transaction_value']:.2f}",
             f"* 95-й перцентиль величины операции: {p['p95_transaction_value']:.2f}",
         ])
@@ -162,7 +174,7 @@ def format_client_profile(client_df: pd.DataFrame, config: dict) -> str:
 
 
 def robust_statistics_payload(df: pd.DataFrame, config: dict) -> dict[str, Any]:
-    """Describe untrimmed client-level train observations using robust summaries."""
+    """Describe untrimmed client-level train observations with mean and tails."""
     clients = client_feature_frame(df, config)
     label_names = config["dataset"].get("label_names", {})
     numeric = [column for column in clients.select_dtypes(include=[np.number]).columns if column not in {"label", "customer_id"}]
@@ -182,7 +194,14 @@ def robust_statistics_payload(df: pd.DataFrame, config: dict) -> dict[str, Any]:
             values = group[column].dropna()
             if values.empty:
                 continue
-            class_payload["metrics"][column] = {name: float(values.quantile(q)) for q, name in QUANTILES}
+            class_payload["metrics"][column] = {
+                "mean": float(values.mean()),
+                "std": float(values.std(ddof=1)) if len(values) > 1 else 0.0,
+                **{
+                    name: float(values.quantile(q))
+                    for q, name in QUANTILES
+                },
+            }
         class_ids = set(group["customer_id"].tolist())
         class_counts = prevalence[prevalence["customer_id"].isin(class_ids)]
         totals = class_counts.groupby("customer_id")["count"].sum()
@@ -192,6 +211,10 @@ def robust_statistics_payload(df: pd.DataFrame, config: dict) -> dict[str, Any]:
             class_payload["categories"].append({
                 "category": str(category),
                 "client_prevalence": _share(rows.index.nunique(), len(class_ids)),
+                # Missing category rows are real zeros, not missing values.
+                "mean_transaction_count_all_clients": float(
+                    rows.reindex(list(class_ids), fill_value=0).mean()
+                ),
                 "median_share_among_users": float(shares.median()) if len(shares) else 0.0,
             })
         payload["classes"][str(int(label))] = class_payload
@@ -201,17 +224,33 @@ def robust_statistics_payload(df: pd.DataFrame, config: dict) -> dict[str, Any]:
 
 def format_robust_summary(payload: dict[str, Any]) -> str:
     lines = [
-        "# Train-only robust dataset summary",
+        "# Train-only mean and robust dataset summary",
         f"Clients: {payload['n_clients']}",
         f"Amount semantics: {payload['amount_semantics']}",
-        "Outliers: observations are not removed; P5/Q1/median/Q3/P95 are reported.",
+        (
+            "Outliers: observations are not removed. The prompt reports mean, "
+            "median, IQR and P5-P95; SD is retained in paper exports."
+        ),
     ]
     for class_payload in payload["classes"].values():
         lines.extend(["", f"## {class_payload['name']}", f"Clients: {class_payload['n_clients']}"])
         for metric, values in class_payload["metrics"].items():
-            lines.append(f"* {metric}: P5={values['p05']:.3f}, Q1={values['q1']:.3f}, median={values['median']:.3f}, Q3={values['q3']:.3f}, P95={values['p95']:.3f}")
-        lines.append("* Category prevalence and median within-client share among users:")
-        lines.extend(f"  - {row['category']}: prevalence={row['client_prevalence']:.1%}, median share={row['median_share_among_users']:.1%}" for row in class_payload["categories"])
+            lines.append(
+                f"* {metric}: mean={values['mean']:.3f}, "
+                f"median={values['median']:.3f}, "
+                f"IQR=[{values['q1']:.3f}, {values['q3']:.3f}], "
+                f"P5-P95=[{values['p05']:.3f}, {values['p95']:.3f}]"
+            )
+        lines.append(
+            "* Category prevalence, mean count across all class clients "
+            "(including zeros), and median within-client share among users:"
+        )
+        lines.extend(
+            f"  - {row['category']}: prevalence={row['client_prevalence']:.1%}, "
+            f"mean count={row['mean_transaction_count_all_clients']:.3f}, "
+            f"median share={row['median_share_among_users']:.1%}"
+            for row in class_payload["categories"]
+        )
     return "\n".join(lines)
 
 
@@ -239,6 +278,7 @@ def export_robust_statistics(payload: dict[str, Any], output_dir: str | Path, st
         for category in class_payload["categories"]:
             rows.extend([
                 {"label": class_payload["label"], "class_name": class_payload["name"], "kind": "category", "item": category["category"], "statistic": "client_prevalence", "value": category["client_prevalence"]},
+                {"label": class_payload["label"], "class_name": class_payload["name"], "kind": "category", "item": category["category"], "statistic": "mean_transaction_count_all_clients", "value": category["mean_transaction_count_all_clients"]},
                 {"label": class_payload["label"], "class_name": class_payload["name"], "kind": "category", "item": category["category"], "statistic": "median_share_among_users", "value": category["median_share_among_users"]},
             ])
     frame = pd.DataFrame(rows)

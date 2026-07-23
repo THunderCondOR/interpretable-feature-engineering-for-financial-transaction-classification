@@ -1,22 +1,13 @@
-1. Сводная статистика обучающей выборки по классам:
+Train-only label-conditioned statistics:
 
 {SUMMARY_TRANSACTIONAL_STATS}
 
-2. Few-shot примеры клиентов из обучающей выборки:
+Factual demonstrations selected only from the training split (this block may be empty):
 
 {FEW_SHOT_EXAMPLES}
 
-3. Агрегированные данные целевого клиента:
+Aggregated profile of the target client:
 
 {CLIENT_STATS}
 
-Задача:
-- Определи, больше похож ли целевой клиент на активного клиента или на клиента в оттоке.
-- Сравни его профиль со сводной статистикой классов.
-- Объясни решение через конкретные признаки: динамика активности, структура операций, категории, суммы, регулярность, доля снятий/переводов/POS.
-- Перед финальным ответом обязательно напиши содержательное объяснение с несколькими наблюдаемыми поведенческими признаками. Ответ, состоящий только из строки Final, запрещён.
-- Не используй истинную метку: она не дана.
-- В конце обязательно напиши ровно один ответ:
-Final: \boxed{активный клиент}
-или
-Final: \boxed{отток}
+Choose the useful evidence and reasoning structure yourself. Use only the supplied data, provide a non-empty behavioral explanation, and finish with exactly one allowed `Final` label.

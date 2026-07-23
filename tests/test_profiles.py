@@ -63,6 +63,30 @@ def test_robust_stats_are_client_level_untrimmed_and_export_all_formats(tmp_path
     assert payload["scope"] == "training_split_only"
     assert payload["outlier_handling"] == "untrimmed_observations"
     assert payload["n_clients"] == 5
+    metric = payload["classes"]["1"]["metrics"]["total_transaction_value"]
+    assert metric["mean"] == (1 + 3 + 1000) / 3
+    assert metric["std"] > metric["median"]
+    assert set(("mean", "std", "p05", "q1", "median", "q3", "p95")) <= set(metric)
     assert set(paths) == {"json", "csv", "md", "tex"}
     assert all(path.exists() for path in paths.values())
-    assert "P5/Q1/median/Q3/P95" in paths["md"].read_text(encoding="utf-8")
+    prompt_summary = paths["md"].read_text(encoding="utf-8")
+    assert "mean=" in prompt_summary
+    assert "IQR=[" in prompt_summary
+    assert "std=" not in prompt_summary
+
+
+def test_category_mean_count_includes_zero_clients():
+    frame = _frame([
+        {"customer_id": 1, "label": 0, "tr_datetime": "2024-01-01", "amount": 1, "mcc_code_desc": "A"},
+        {"customer_id": 1, "label": 0, "tr_datetime": "2024-01-02", "amount": 1, "mcc_code_desc": "A"},
+        {"customer_id": 2, "label": 0, "tr_datetime": "2024-01-01", "amount": 1, "mcc_code_desc": "B"},
+    ])
+    payload = robust_statistics_payload(
+        frame, _config("age", "unsigned_transaction_value")
+    )
+    categories = {
+        row["category"]: row
+        for row in payload["classes"]["0"]["categories"]
+    }
+    assert categories["A"]["mean_transaction_count_all_clients"] == 1.0
+    assert categories["A"]["client_prevalence"] == 0.5

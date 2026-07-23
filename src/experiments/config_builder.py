@@ -78,6 +78,27 @@ def _variant_overlay(variant: str) -> dict[str, Any]:
                 "few_shot_per_class": 0,
             },
         },
+        "guided_zero_shot_v3": {
+            "statistics": {"summary_profile": "robust_mean"},
+            "pipeline": {
+                "few_shot_strategy": "representative_medoid",
+                "few_shot_per_class": 0,
+            },
+        },
+        "guided_factual_fs1_v3": {
+            "statistics": {"summary_profile": "robust_mean"},
+            "pipeline": {
+                "few_shot_strategy": "representative_medoid",
+                "few_shot_per_class": 1,
+            },
+        },
+        "guided_factual_fs2_v3": {
+            "statistics": {"summary_profile": "robust_mean"},
+            "pipeline": {
+                "few_shot_strategy": "representative_medoid",
+                "few_shot_per_class": 2,
+            },
+        },
         "legacy_offline": {},
     }
     if variant not in variants:
@@ -210,6 +231,10 @@ def build_runtime_config(
         "batch_size": int(execution.get("initial_concurrency", 64)),
         "initial_concurrency": int(execution.get("initial_concurrency", 64)),
         "fallback_concurrency": int(execution.get("fallback_concurrency", 10)),
+        "minimum_concurrency": int(execution.get("minimum_concurrency", 1)),
+        "fallback_rate_limit_attempts": int(
+            execution.get("fallback_rate_limit_attempts", 3)
+        ),
         "recovery_clean_batches": int(execution.get("recovery_clean_batches", 10)),
         "cooldown_seconds": float(execution.get("cooldown_seconds", 60)),
         "rate_limit_fallback_concurrent": int(execution.get("fallback_concurrency", 10)),

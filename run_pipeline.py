@@ -30,7 +30,11 @@ from src.pipeline.claims_extractor import run_claims_extraction
 from src.pipeline.cot_features import build_cot_features
 from src.pipeline.explanation_gen import run_explanation_generation
 from src.pipeline.llm_eval import evaluate_llm_predictions
-from src.pipeline.prompt_builder import build_few_shot_str, build_prompts
+from src.pipeline.prompt_builder import (
+    build_few_shot_str,
+    build_prompts,
+    prompt_length_telemetry,
+)
 
 SPLITS = ("train", "val", "test")
 DEFAULT_STEPS = ("stats", "prompts", "cot", "llm_eval", "claims", "cot_features", "ml")
@@ -131,6 +135,17 @@ def run_prompts(config: dict, splits: list[str]) -> None:
         with open(path, "w", encoding="utf-8") as file:
             for record in records:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        telemetry_path = out_dir / f"prompt_length_telemetry_{split}.json"
+        temporary = telemetry_path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(
+                prompt_length_telemetry(records),
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(telemetry_path)
         print(f"Saved {split} prompts: {len(records)} clients -> {path}")
     pipeline_event(
         config,
