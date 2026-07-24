@@ -25,11 +25,12 @@ def api_result(
     *,
     finish_reason: str = "stop",
     reasoning_content: str | None = None,
+    reasoning: str | None = None,
 ) -> dict:
     message = SimpleNamespace(
         content=content,
         reasoning_content=reasoning_content,
-        model_extra={},
+        model_extra={"reasoning": reasoning} if reasoning is not None else {},
     )
     choice = SimpleNamespace(message=message, finish_reason=finish_reason)
     usage = SimpleNamespace(prompt_tokens=100, completion_tokens=20)
@@ -63,6 +64,44 @@ def test_empty_content_with_reasoning_is_not_successful() -> None:
     assert record["reasoning"] == "Internal reasoning"
     assert record["explanation"] == ""
     assert record["reasoning_chars"] > 0
+
+
+def test_provider_reasoning_is_used_when_visible_content_has_only_final() -> None:
+    provider_reasoning = (
+        "Transaction activity is sparse and declines late in the observation "
+        "period, which is more consistent with the first class."
+    )
+    record = build_output_record(
+        META,
+        api_result(
+            "Final: \\boxed{female}",
+            reasoning=provider_reasoning,
+        ),
+        LABELS,
+    )
+
+    assert _is_successful(record)
+    assert record["predicted"] == 0
+    assert record["explanation"] == (
+        f"{provider_reasoning}\n\nFinal: \\boxed{{female}}"
+    )
+    assert record["response_content"] == "Final: \\boxed{female}"
+    assert record["reasoning"] == provider_reasoning
+    assert record["reasoning_field"] == "reasoning"
+    assert record["explanation_source"] == "provider_reasoning_fallback"
+
+
+def test_visible_behavioral_explanation_is_preferred_over_provider_reasoning() -> None:
+    record = build_output_record(
+        META,
+        api_result(VALID_RESPONSE, reasoning="Private scratch analysis."),
+        LABELS,
+    )
+
+    assert _is_successful(record)
+    assert record["explanation"] == VALID_RESPONSE
+    assert record["reasoning"] == "Private scratch analysis."
+    assert record["explanation_source"] == "content"
 
 
 def test_truncated_response_is_not_successful() -> None:
