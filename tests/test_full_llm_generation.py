@@ -234,6 +234,69 @@ def test_full_runner_accepts_only_content_addressed_selected_config(tmp_path):
     assert "not owned" in failed.stderr
 
 
+def test_full_runner_accepts_subset_counts_signed_by_selection(tmp_path):
+    config = build_runtime_config(
+        load_yaml(ROOT / "configs/age.yaml"),
+        load_yaml(ROOT / "configs/v2/qwen.yaml"),
+        run_id="selected-subset",
+        variant="guided_zero_shot_v4",
+        results_root=tmp_path / "results",
+        expected_client_counts={"train": 8000, "val": 1000, "test": 3000},
+    )
+    selected = tmp_path / "age_selected_qwen.yaml"
+    selected.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    selection = {
+        "status": "completed",
+        "run_id": "selected-subset",
+        "dataset": "age",
+        "selected_variant": "guided_zero_shot_v4",
+        "full_expected_client_counts": {
+            "train": 8000,
+            "val": 1000,
+            "test": 3000,
+        },
+        "selected_configs": {
+            "qwen": {
+                "path": str(selected),
+                "sha256": file_sha256(selected),
+            }
+        },
+    }
+    selection["selection_sha256"] = fingerprint(selection)
+    selection_path = tmp_path / "age_selection.json"
+    selection_path.write_text(json.dumps(selection), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_full_llm_generation.py",
+            "--dataset",
+            "age",
+            "--model-config",
+            "configs/v2/qwen.yaml",
+            "--run-id",
+            "selected-subset",
+            "--selected-config",
+            str(selected),
+            "--selection",
+            str(selection_path),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(result.stdout)["expected_counts"] == {
+        "train": 8000,
+        "val": 1000,
+        "test": 3000,
+    }
+
+
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(

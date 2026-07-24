@@ -420,12 +420,19 @@ def main() -> None:
                 "Selected config identity mismatch: "
                 f"observed={observed_identity}, expected={expected_identity}"
             )
-        declared_counts = config.get("dataset", {}).get(
-            "expected_client_counts", {}
+        declared_counts = config.get("dataset", {}).get("expected_client_counts", {})
+        selection_counts = selection.get(
+            "full_expected_client_counts",
+            EXPECTED_CLIENT_COUNTS[args.dataset],
         )
-        if declared_counts != EXPECTED_CLIENT_COUNTS[args.dataset]:
+        selection_counts = {
+            str(split): int(count)
+            for split, count in selection_counts.items()
+        }
+        if declared_counts != selection_counts:
             raise RuntimeError(
-                f"Selected config client counts are incompatible: {declared_counts}"
+                "Selected config client counts disagree with the signed "
+                f"selection artifact: {declared_counts} != {selection_counts}"
             )
         selected_variant = str(config["experiment"]["variant"])
     else:

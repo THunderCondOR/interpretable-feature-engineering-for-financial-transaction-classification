@@ -14,7 +14,6 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.data.loader import add_features, load_dataset
+from src.data.client_sampling import stratified_client_ids
 from src.evaluation.prompt_pilot import (
     AGE_LABEL_SEMANTICS,
     PILOT_VARIANTS,
@@ -58,57 +58,11 @@ def stratified_pilot_ids(
     seed: int = PILOT_SAMPLING_SEED,
 ) -> list[int]:
     """Sample validation clients by label, activity, and absolute volume."""
-    clients = (
-        transactions.groupby("customer_id", sort=False)
-        .agg(
-            label=("label", "first"),
-            transaction_count=("amount", "size"),
-            transaction_volume=("amount", lambda values: values.abs().sum()),
-        )
-        .reset_index()
-        .sort_values("customer_id", kind="mergesort")
-        .reset_index(drop=True)
+    return stratified_client_ids(
+        transactions,
+        n_clients=n_clients,
+        seed=seed,
     )
-    for column in ("transaction_count", "transaction_volume"):
-        clients[f"{column}_quartile"] = pd.qcut(
-            clients[column].rank(method="first"),
-            4,
-            labels=False,
-            duplicates="drop",
-        )
-    clients["stratum"] = clients[
-        ["label", "transaction_count_quartile", "transaction_volume_quartile"]
-    ].astype(str).agg("/".join, axis=1)
-    target = min(int(n_clients), len(clients))
-    counts = clients["stratum"].value_counts().sort_index()
-    exact = counts / counts.sum() * target
-    allocation = np.floor(exact).astype(int)
-    remainder = target - int(allocation.sum())
-    for stratum in (
-        (exact - allocation)
-        .rename("fraction")
-        .reset_index()
-        .sort_values(["fraction", "stratum"], ascending=[False, True])
-        .head(remainder)["stratum"]
-    ):
-        allocation[stratum] += 1
-    rng = np.random.default_rng(seed)
-    selected: list[int] = []
-    for stratum, group in clients.groupby("stratum", sort=True):
-        take = min(int(allocation.get(stratum, 0)), len(group))
-        selected.extend(
-            int(value)
-            for value in rng.choice(
-                group["customer_id"].to_numpy(), take, replace=False
-            )
-        )
-    result = sorted(selected)
-    if len(result) != target or len(set(result)) != target:
-        raise RuntimeError(
-            f"Pilot sampling returned {len(result)} rows / {len(set(result))} "
-            f"unique IDs, expected {target}"
-        )
-    return result
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

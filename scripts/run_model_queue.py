@@ -96,6 +96,20 @@ def default_jobs(
     def selected_config(dataset: str, model_slug: str) -> Path:
         return generated / f"{dataset}_selected_{model_slug}.yaml"
 
+    def selected_counts(dataset: str, model_slug: str) -> dict[str, int]:
+        path = selected_config(dataset, model_slug)
+        if path.is_file():
+            payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+            configured = payload.get("dataset", {}).get(
+                "expected_client_counts", {}
+            )
+            if configured:
+                return {
+                    str(split): int(count)
+                    for split, count in configured.items()
+                }
+        return dict(EXPECTED_CLIENT_COUNTS[dataset])
+
     def pilot_job(dataset: str) -> dict[str, Any]:
         marker = completion / f"qwen_{dataset}_pilot.json"
         return {
@@ -146,7 +160,7 @@ def default_jobs(
             "stage": "full",
             "api": True,
             "expected_splits": ["train", "val", "test"],
-            "expected_client_counts": EXPECTED_CLIENT_COUNTS[dataset],
+            "expected_client_counts": selected_counts(dataset, model_slug),
             "wait_for": str(selection_path(dataset)),
             "expected_outputs": [
                 str(completion / f"{model_slug}_{dataset}.json")

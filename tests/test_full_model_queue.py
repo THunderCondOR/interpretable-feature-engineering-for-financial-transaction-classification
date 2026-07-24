@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import yaml
+
 from scripts.run_model_queue import (
     _event,
     _job_signature,
@@ -51,6 +53,40 @@ def test_gpt_queue_runs_rosbank_then_selected_gender_then_age():
     assert jobs[2]["wait_for"].endswith("age_selection.json")
     assert "scripts/run_full_llm_generation.py" in jobs[0]["command"]
     assert "scripts/run_full_llm_generation.py" in jobs[1]["command"]
+
+
+def test_queue_uses_signed_selected_config_counts_when_available(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    generated = Path("logs/runs/nightly/generated")
+    generated.mkdir(parents=True)
+    (generated / "age_selected_gpt_oss.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "dataset": {
+                    "expected_client_counts": {
+                        "train": 8000,
+                        "val": 1000,
+                        "test": 3000,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    jobs = default_jobs(
+        _profile("gpt_oss"),
+        model_config=Path("configs/v2/gpt_oss.yaml"),
+        run_id="nightly",
+    )
+
+    assert jobs[-1]["expected_client_counts"] == {
+        "train": 8000,
+        "val": 1000,
+        "test": 3000,
+    }
 
 
 def test_completion_evidence_must_match_run_model_dataset(tmp_path):
