@@ -1,9 +1,11 @@
+import json
 from types import SimpleNamespace
 
 from src.pipeline.claims_extractor import (
     _behavioral_text,
     _parse_claim_result,
     _validate_claims,
+    run_claims_extraction,
 )
 
 
@@ -81,3 +83,93 @@ def test_claim_parser_rejects_truncation_and_non_string_schema():
     claims, error_type, _ = _parse_claim_result(_result('["valid", 2]'))
     assert claims == []
     assert error_type == "InvalidClaimsSchema"
+
+
+def test_claims_defer_bad_content_without_replaying_good_requests(
+    tmp_path, monkeypatch
+):
+    explanations = tmp_path / "explanations.jsonl"
+    claims = tmp_path / "claims.jsonl"
+    explanations.write_text(
+        json.dumps(
+            {
+                "customer_id": 1,
+                "label": 0,
+                "label_name": "female",
+                "sample_id": 0,
+                "explanation": (
+                    "The client maintains regular transaction activity.\n"
+                    "Final: \\boxed{female}"
+                ),
+                "prompt_hash": "prompt",
+                "client_stats_hash": "client",
+                "summary_stats_hash": "summary",
+                "generation_signature": "explanation",
+                "min_behavioral_explanation_chars": 1,
+                "error": None,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    call_sizes = []
+
+    async def fake_batched_query(
+        dialogues, model, llm_config, *, on_batch_complete
+    ):
+        call_sizes.append(len(dialogues))
+        result = (
+            _result("[]")
+            if len(call_sizes) == 1
+            else _result(
+                '["The client maintains regular transaction activity."]'
+            )
+        )
+        on_batch_complete([(0, result)])
+        return [result]
+
+    monkeypatch.setattr(
+        "src.pipeline.claims_extractor.batched_query",
+        fake_batched_query,
+    )
+    config = {
+        "llm": {"default_model": "test"},
+        "execution": {"until_complete": True},
+        "claims_generation": {"model": "test", "max_tokens": 128},
+        "experiment": {"run_id": "test", "model_slug": "test"},
+        "dataset": {
+            "name": "gender",
+            "label_names": {"0": "female", "1": "male"},
+            "claim_forbidden_terms": [],
+        },
+        "pipeline": {"n_claims_samples": 1},
+        "prompts": {
+            "base_dir": ".",
+            "claims_system": "prompts/common/claims_extraction/system_prompt.txt",
+            "claims_user": "prompts/common/claims_extraction/user_prompt.txt",
+        },
+        "output": {
+            "base_dir": str(tmp_path),
+            "explanations": "explanations.jsonl",
+            "claims": "claims.jsonl",
+        },
+    }
+
+    run_claims_extraction(
+        config,
+        input_path=explanations,
+        output_path=claims,
+    )
+
+    assert call_sizes == [1, 1]
+    record = json.loads(claims.read_text(encoding="utf-8"))
+    assert record["claims"] == [
+        "The client maintains regular transaction activity."
+    ]
+    stats = json.loads(
+        claims.with_suffix(".generation_stats.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert stats["content_validation"]["error_types"] == {"EmptyClaims": 1}
+    assert stats["content_validation"]["unique_rejected_requests"] == 1

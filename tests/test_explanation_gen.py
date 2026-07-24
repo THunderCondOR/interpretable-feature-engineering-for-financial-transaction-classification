@@ -273,3 +273,93 @@ def test_batch_error_summary_is_saved_by_type(tmp_path, monkeypatch) -> None:
         "error_types": {"EmptyResponse": 1},
     }
     assert stats["last_batch"] == stats["new_requests"]
+
+
+def test_until_complete_commits_good_records_and_defers_only_bad_content(
+    tmp_path, monkeypatch
+) -> None:
+    prompt_path = tmp_path / "prompts.jsonl"
+    output_path = tmp_path / "explanations.jsonl"
+    prompts = [
+        {
+            "customer_id": customer_id,
+            "label": 0,
+            "label_name": "female",
+            "system_prompt": "system",
+            "user_prompt": f"user {customer_id}",
+        }
+        for customer_id in (1, 2)
+    ]
+    prompt_path.write_text(
+        "".join(json.dumps(prompt) + "\n" for prompt in prompts),
+        encoding="utf-8",
+    )
+    call_sizes = []
+
+    async def fake_batched_query(
+        dialogues, model, llm_config, *, on_batch_complete
+    ):
+        call_sizes.append(len(dialogues))
+        results = (
+            [api_result(VALID_RESPONSE), api_result("")]
+            if len(call_sizes) == 1
+            else [api_result(VALID_RESPONSE)]
+        )
+        on_batch_complete(list(enumerate(results)))
+        return results
+
+    monkeypatch.setattr(
+        "src.pipeline.explanation_gen.batched_query",
+        fake_batched_query,
+    )
+    config = {
+        "llm": {"default_model": "test"},
+        "execution": {"until_complete": True},
+        "experiment": {"run_id": "test", "model_slug": "test"},
+        "dataset": {"name": "gender", "label_names": LABELS},
+        "pipeline": {"n_explanation_samples": 1},
+        "output": {
+            "base_dir": str(tmp_path),
+            "prompts": "prompts.jsonl",
+            "explanations": "explanations.jsonl",
+        },
+    }
+
+    run_explanation_generation(
+        config,
+        input_path=prompt_path,
+        output_path=output_path,
+    )
+
+    assert call_sizes == [2, 1]
+    records = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 2
+    assert all(_is_successful(record) for record in records)
+    stats = json.loads(
+        output_path.with_suffix(".generation_stats.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert stats["content_validation"] == {
+        "total_rejections": 1,
+        "unique_rejected_requests": 1,
+        "error_types": {"EmptyResponse": 1},
+        "max_attempts_for_one_request": 1,
+        "attempts_by_request": {"2:0": 1},
+        "last_reasons_by_request": {"2:0": "empty response content"},
+    }
+    events = [
+        json.loads(line)
+        for line in (
+            tmp_path / ".scheduler" / "explanations.events.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    deferred = [
+        event for event in events if event["event"] == "content_records_deferred"
+    ]
+    assert deferred[0]["accepted"] == 1
+    assert deferred[0]["deferred"] == 1
+    assert deferred[0]["errors"][0]["request_key"] == "2:0"

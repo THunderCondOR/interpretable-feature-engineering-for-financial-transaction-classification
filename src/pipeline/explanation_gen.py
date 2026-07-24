@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from typing import Any
 from src.experiments.artifacts import fingerprint, prompt_signature
 from src.data.prompt_locale import contains_cyrillic
 from src.utils.async_api import batched_query
+from src.utils.event_log import append_structured_event
 from src.utils.prompt_parsing import extract_boxed_answer, normalize_text_label
 
 
@@ -355,6 +357,7 @@ def run_explanation_generation(
 
     keys_in_order = [_request_key(meta) for meta in ordered_meta]
     keys_to_run = [key for key in keys_in_order if key not in records_by_key]
+    initial_keys_to_run = list(keys_to_run)
     mode = "resume failed/missing" if resume else "rerun all"
     print(
         f"Explanation generation plan ({mode}): expected={len(ordered_meta)}, "
@@ -363,6 +366,41 @@ def run_explanation_generation(
 
     stats_path = _generation_stats_path(save_path)
     last_batch_summary: dict[str, Any] | None = None
+    content_error_counts: Counter[str] = Counter()
+    content_error_attempts: Counter[RequestKey] = Counter()
+    content_error_last_reasons: dict[RequestKey, str] = {}
+    if stats_path.is_file():
+        try:
+            prior_validation = json.loads(
+                stats_path.read_text(encoding="utf-8")
+            ).get("content_validation", {})
+            content_error_counts.update(
+                {
+                    str(key): int(value)
+                    for key, value in prior_validation.get(
+                        "error_types", {}
+                    ).items()
+                }
+            )
+            for raw_key, attempts in prior_validation.get(
+                "attempts_by_request", {}
+            ).items():
+                customer_id, sample_id = str(raw_key).split(":", 1)
+                content_error_attempts[
+                    (int(customer_id), int(sample_id))
+                ] = int(attempts)
+            for raw_key, reason in prior_validation.get(
+                "last_reasons_by_request", {}
+            ).items():
+                customer_id, sample_id = str(raw_key).split(":", 1)
+                content_error_last_reasons[
+                    (int(customer_id), int(sample_id))
+                ] = str(reason)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            print(
+                f"Warning: ignored malformed prior content-validation "
+                f"counters in {stats_path}"
+            )
 
     def save_generation_stats() -> dict:
         available_records = [
@@ -373,7 +411,7 @@ def run_explanation_generation(
         available_summary = summarize_records(available_records)
         processed_new_records = [
             records_by_key[key]
-            for key in keys_to_run
+            for key in initial_keys_to_run
             if key in records_by_key
         ]
         new_summary = summarize_records(processed_new_records)
@@ -382,24 +420,34 @@ def run_explanation_generation(
             "expected_records": len(ordered_meta),
             "resume": resume,
             "reused_successful": len(records_by_key) - len(processed_new_records),
-            "planned_new_requests": len(keys_to_run),
+            "planned_new_requests": len(initial_keys_to_run),
             "processed_new_requests": len(processed_new_records),
-            "pending_new_requests": len(keys_to_run) - len(processed_new_records),
+            "pending_new_requests": len(initial_keys_to_run) - len(processed_new_records),
             "new_requests": new_summary,
             "available_records": available_summary,
             "last_batch": last_batch_summary,
+            "content_validation": {
+                "total_rejections": sum(content_error_counts.values()),
+                "unique_rejected_requests": len(content_error_attempts),
+                "error_types": dict(sorted(content_error_counts.items())),
+                "max_attempts_for_one_request": max(
+                    content_error_attempts.values(), default=0
+                ),
+                "attempts_by_request": {
+                    f"{key[0]}:{key[1]}": attempts
+                    for key, attempts in sorted(content_error_attempts.items())
+                },
+                "last_reasons_by_request": {
+                    f"{key[0]}:{key[1]}": reason
+                    for key, reason in sorted(content_error_last_reasons.items())
+                },
+            },
         }
         _write_json_atomic(stats_path, payload)
         return payload
 
     if keys_to_run:
-        dialogues = [dialogues_by_key[key] for key in keys_to_run]
         meta_by_key = {_request_key(meta): meta for meta in ordered_meta}
-        metas_to_run = [meta_by_key[key] for key in keys_to_run]
-        llm_cfg["request_keys"] = [f"{key[0]}:{key[1]}" for key in keys_to_run]
-        llm_cfg["generation_signature"] = fingerprint(
-            [expected_signatures[key] for key in keys_to_run]
-        )
         llm_cfg.setdefault("scheduler_state_dir", str(save_path.parent / ".scheduler" / save_path.stem))
         llm_cfg.setdefault("events_path", str(save_path.parent / ".scheduler" / f"{save_path.stem}.events.jsonl"))
         llm_cfg["event_context"] = {
@@ -409,59 +457,140 @@ def run_explanation_generation(
             "stage": "explanations",
             "split": split,
         }
-
-        print(f"Sending {len(dialogues)} requests to {model} ({n_samples} per client configured)...")
         checkpointed_keys: set[RequestKey] = set()
+        repair_pass = 0
+        pending_keys = list(keys_to_run)
+        until_complete = bool(llm_cfg.get("until_complete"))
 
-        def checkpoint(batch_results: list[tuple[int, dict]]) -> None:
-            nonlocal last_batch_summary
-            staged_records = []
-            for idx, result in batch_results:
-                meta = metas_to_run[idx]
-                key = _request_key(meta)
-                record = build_output_record(meta, result, label_names)
-                staged_records.append((key, record))
-            if llm_cfg.get("until_complete") and any(not _is_successful(record) for _, record in staged_records):
-                errors = summarize_records([record for _, record in staged_records])["error_types"]
-                raise RuntimeError(f"repairable explanation window errors: {errors}")
-            batch_records = []
-            for key, record in staged_records:
-                records_by_key[key] = record
-                batch_records.append(record)
-                checkpointed_keys.add(key)
+        while pending_keys:
+            pass_keys = list(pending_keys)
+            dialogues = [dialogues_by_key[key] for key in pass_keys]
+            metas_to_run = [meta_by_key[key] for key in pass_keys]
+            llm_cfg["request_keys"] = [f"{key[0]}:{key[1]}" for key in pass_keys]
+            llm_cfg["generation_signature"] = fingerprint(
+                [expected_signatures[key] for key in pass_keys]
+            )
+            print(
+                f"Sending {len(dialogues)} requests to {model} "
+                f"({n_samples} per client configured, repair_pass={repair_pass})..."
+            )
 
-            available_meta = [
-                meta for meta in ordered_meta
-                if _request_key(meta) in records_by_key
+            def checkpoint(batch_results: list[tuple[int, dict]]) -> None:
+                nonlocal last_batch_summary
+                staged_records: list[tuple[RequestKey, dict]] = []
+                for idx, result in batch_results:
+                    meta = metas_to_run[idx]
+                    key = _request_key(meta)
+                    record = build_output_record(meta, result, label_names)
+                    staged_records.append((key, record))
+
+                accepted = [
+                    (key, record)
+                    for key, record in staged_records
+                    if _is_successful(record)
+                ]
+                rejected = [
+                    (key, record)
+                    for key, record in staged_records
+                    if not _is_successful(record)
+                ]
+                rejected_summary = summarize_records(
+                    [record for _, record in rejected]
+                )
+                error_details = []
+                for key, record in rejected:
+                    error_type = _record_error_type(record) or "UnknownError"
+                    reason = str(record.get("error") or error_type)
+                    content_error_counts[error_type] += 1
+                    content_error_attempts[key] += 1
+                    content_error_last_reasons[key] = reason
+                    error_details.append(
+                        {
+                            "request_key": f"{key[0]}:{key[1]}",
+                            "customer_id": key[0],
+                            "sample_id": key[1],
+                            "error_type": error_type,
+                            "reason": reason,
+                            "attempt": content_error_attempts[key],
+                        }
+                    )
+                if rejected:
+                    append_structured_event(
+                        llm_cfg.get("events_path"),
+                        llm_cfg["event_context"],
+                        event="content_records_deferred",
+                        repair_pass=repair_pass,
+                        batch_size=len(staged_records),
+                        accepted=len(accepted),
+                        deferred=len(rejected),
+                        error_types=rejected_summary["error_types"],
+                        errors=error_details,
+                    )
+                    print(
+                        f"[COT CONTENT DEFERRED] repair_pass={repair_pass} "
+                        f"accepted={len(accepted)} deferred={len(rejected)} "
+                        f"error_types={rejected_summary['error_types']} "
+                        f"request_keys={[item['request_key'] for item in error_details]}"
+                    )
+
+                records_to_commit = accepted if until_complete else staged_records
+                for key, record in records_to_commit:
+                    records_by_key[key] = record
+                    if _is_successful(record):
+                        checkpointed_keys.add(key)
+
+                available_meta = [
+                    meta for meta in ordered_meta
+                    if _request_key(meta) in records_by_key
+                ]
+                if records_to_commit:
+                    write_records(save_path, available_meta, records_by_key)
+                last_batch_summary = summarize_records(
+                    [record for _, record in staged_records]
+                )
+                stats = save_generation_stats()
+                print(
+                    f"[COT BATCH] completed={last_batch_summary['total']} "
+                    f"successful={last_batch_summary['successful']} "
+                    f"failed={last_batch_summary['failed']} "
+                    f"error_types={last_batch_summary['error_types']}"
+                )
+                print(
+                    f"[COT CHECKPOINT] processed_new={len(checkpointed_keys)}/"
+                    f"{len(initial_keys_to_run)} "
+                    f"successful_new={stats['new_requests']['successful']} "
+                    f"failed_new={stats['new_requests']['failed']} "
+                    f"saved={len(available_meta)}/{len(ordered_meta)} -> {save_path}; "
+                    f"stats -> {stats_path}"
+                )
+
+            asyncio.run(
+                batched_query(
+                    dialogues,
+                    model,
+                    llm_cfg,
+                    on_batch_complete=checkpoint,
+                )
+            )
+            pending_keys = [
+                key for key in pass_keys if key not in records_by_key
             ]
-            write_records(save_path, available_meta, records_by_key)
-            last_batch_summary = summarize_records(batch_records)
-            stats = save_generation_stats()
-            print(
-                f"[COT BATCH] completed={last_batch_summary['total']} "
-                f"successful={last_batch_summary['successful']} "
-                f"failed={last_batch_summary['failed']} "
-                f"error_types={last_batch_summary['error_types']}"
+            if not until_complete or not pending_keys:
+                break
+            repair_pass += 1
+            append_structured_event(
+                llm_cfg.get("events_path"),
+                llm_cfg["event_context"],
+                event="content_repair_pass_started",
+                repair_pass=repair_pass,
+                pending=len(pending_keys),
+                cumulative_error_types=dict(sorted(content_error_counts.items())),
             )
-            print(
-                f"[COT CHECKPOINT] processed_new={len(checkpointed_keys)}/{len(keys_to_run)} "
-                f"successful_new={stats['new_requests']['successful']} "
-                f"failed_new={stats['new_requests']['failed']} "
-                f"saved={len(available_meta)}/{len(ordered_meta)} -> {save_path}; "
-                f"stats -> {stats_path}"
+            repair_cooldown = float(
+                llm_cfg.get("content_repair_cooldown_seconds", 0.0)
             )
-
-        api_results = asyncio.run(
-            batched_query(
-                dialogues,
-                model,
-                llm_cfg,
-                on_batch_complete=checkpoint,
-            )
-        )
-
-        for meta, result in zip(metas_to_run, api_results):
-            records_by_key[_request_key(meta)] = build_output_record(meta, result, label_names)
+            if repair_cooldown > 0:
+                time.sleep(repair_cooldown)
     else:
         print("No requests to send: all expected explanations are already successful.")
 

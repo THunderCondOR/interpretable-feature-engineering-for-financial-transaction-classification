@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from src.experiments.artifacts import fingerprint, stage_signature
 from src.data.prompt_locale import assert_english_model_text, contains_cyrillic
 from src.pipeline.semantic_features import normalize_claim
 from src.utils.async_api import batched_query
+from src.utils.event_log import append_structured_event
 from src.utils.prompt_parsing import extract_json_list
 
 
@@ -416,9 +418,45 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
     )
 
     request_errors: dict[int, list[tuple[str, str]]] = {}
+    content_error_counts: Counter[str] = Counter()
+    content_error_attempts: Counter[int] = Counter()
+    content_error_last_reasons: dict[int, str] = {}
+    stats_path = save_path.with_suffix(".generation_stats.json")
+    if stats_path.is_file():
+        try:
+            prior_validation = json.loads(
+                stats_path.read_text(encoding="utf-8")
+            ).get("content_validation", {})
+            content_error_counts.update(
+                {
+                    str(key): int(value)
+                    for key, value in prior_validation.get(
+                        "error_types", {}
+                    ).items()
+                }
+            )
+            content_error_attempts.update(
+                {
+                    int(key): int(value)
+                    for key, value in prior_validation.get(
+                        "attempts_by_request", {}
+                    ).items()
+                }
+            )
+            content_error_last_reasons.update(
+                {
+                    int(key): str(value)
+                    for key, value in prior_validation.get(
+                        "last_reasons_by_request_index", {}
+                    ).items()
+                }
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            print(
+                f"Warning: ignored malformed prior content-validation "
+                f"counters in {stats_path}"
+            )
 
-    llm_cfg["request_keys"] = [f"{item['customer_id']}:{index}" for index, item in enumerate(meta)]
-    llm_cfg["generation_signature"] = generation_signature
     llm_cfg.setdefault("scheduler_state_dir", str(save_path.parent / ".scheduler" / save_path.stem))
     llm_cfg.setdefault("events_path", str(save_path.parent / ".scheduler" / f"{save_path.stem}.events.jsonl"))
     llm_cfg["event_context"] = {
@@ -429,82 +467,197 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
         "split": split,
     }
 
-    def checkpoint(batch_results: list[tuple[int, dict]]) -> None:
-        if llm_cfg.get("until_complete"):
-            repairable = []
-            for idx, result in batch_results:
-                _parsed, error_type, error = _parse_claim_result(
-                    result, forbidden_labels=forbidden_labels
-                )
-                if error_type:
-                    repairable.append((meta[idx]["customer_id"], error_type, error))
-            if repairable:
-                raise RuntimeError(f"repairable claims window errors: {repairable[:5]}")
-        batch_records = []
-        for idx, result in batch_results:
-            item_meta = meta[idx]
-            cid = int(item_meta["customer_id"])
-            parsed, error_type, error = _parse_claim_result(
-                result, forbidden_labels=forbidden_labels
-            )
-            record = claims_by_client.setdefault(
-                cid,
-                {
-                    "customer_id": cid,
-                    "label": item_meta.get("label", -1),
-                    "label_name": item_meta.get("label_name", "unknown"),
-                    "claims": [],
-                    "error": None,
-                    "error_type": None,
-                    "generation_signature": generation_signature,
-                    "source_explanation_hash": item_meta["source_explanation_hash"],
-                    "source_prompt_hashes": item_meta["source_prompt_hashes"],
-                    "source_client_stats_hashes": item_meta["source_client_stats_hashes"],
-                    "source_summary_stats_hashes": item_meta["source_summary_stats_hashes"],
-                },
-            )
-            record["claims"].extend(parsed)
-            if error_type:
-                request_errors.setdefault(cid, []).append((error_type, error or ""))
-            if record["claims"]:
-                seen = set()
-                record["claims"] = [
-                    claim
-                    for claim in record["claims"]
-                    if not (claim.lower() in seen or seen.add(claim.lower()))
-                ]
-                record["error"] = None
-                record["error_type"] = None
-            else:
-                errors = request_errors.get(cid, [])
-                record["error_type"] = errors[-1][0] if errors else "EmptyClaims"
-                record["error"] = errors[-1][1] if errors else "no claims extracted"
-            _attach_claim_records(record)
-            batch_records.append(record)
-
-        _write_claim_records(save_path, ordered_clients, claims_by_client)
-        summary = _claims_summary(batch_records)
-        print(
-            f"[CLAIMS BATCH] successful={summary['successful']} failed={summary['failed']} "
-            f"error_types={summary['error_types']} total_claims={summary['total_claims']}"
-        )
-
     if all_dialogues:
-        asyncio.run(
-            batched_query(
-                all_dialogues,
-                model,
-                llm_cfg,
-                on_batch_complete=checkpoint,
+        until_complete = bool(llm_cfg.get("until_complete"))
+        pending_indices = list(range(len(all_dialogues)))
+        completed_request_indices: set[int] = set()
+        repair_pass = 0
+
+        while pending_indices:
+            pass_indices = list(pending_indices)
+            pass_dialogues = [all_dialogues[index] for index in pass_indices]
+            pass_meta = [meta[index] for index in pass_indices]
+            llm_cfg["request_keys"] = [
+                f"{meta[index]['customer_id']}:{index}" for index in pass_indices
+            ]
+            llm_cfg["generation_signature"] = fingerprint(
+                {
+                    "claims_signature": generation_signature,
+                    "request_keys": llm_cfg["request_keys"],
+                }
             )
-        )
+
+            def checkpoint(batch_results: list[tuple[int, dict]]) -> None:
+                batch_records = []
+                rejected_details = []
+                accepted_in_batch = 0
+                for idx, result in batch_results:
+                    item_meta = pass_meta[idx]
+                    original_index = pass_indices[idx]
+                    cid = int(item_meta["customer_id"])
+                    parsed, error_type, error = _parse_claim_result(
+                        result, forbidden_labels=forbidden_labels
+                    )
+                    if error_type:
+                        reason = str(error or error_type)
+                        request_errors.setdefault(cid, []).append(
+                            (error_type, reason)
+                        )
+                        content_error_counts[error_type] += 1
+                        content_error_attempts[original_index] += 1
+                        content_error_last_reasons[original_index] = reason
+                        rejected_details.append(
+                            {
+                                "request_key": f"{cid}:{original_index}",
+                                "customer_id": cid,
+                                "request_index": original_index,
+                                "error_type": error_type,
+                                "reason": reason,
+                                "attempt": content_error_attempts[original_index],
+                            }
+                        )
+                        if until_complete:
+                            continue
+
+                    record = claims_by_client.setdefault(
+                        cid,
+                        {
+                            "customer_id": cid,
+                            "label": item_meta.get("label", -1),
+                            "label_name": item_meta.get("label_name", "unknown"),
+                            "claims": [],
+                            "error": None,
+                            "error_type": None,
+                            "generation_signature": generation_signature,
+                            "source_explanation_hash": item_meta["source_explanation_hash"],
+                            "source_prompt_hashes": item_meta["source_prompt_hashes"],
+                            "source_client_stats_hashes": item_meta["source_client_stats_hashes"],
+                            "source_summary_stats_hashes": item_meta["source_summary_stats_hashes"],
+                        },
+                    )
+                    record["claims"].extend(parsed)
+                    if record["claims"]:
+                        seen = set()
+                        record["claims"] = [
+                            claim
+                            for claim in record["claims"]
+                            if not (
+                                claim.lower() in seen
+                                or seen.add(claim.lower())
+                            )
+                        ]
+                        record["error"] = None
+                        record["error_type"] = None
+                        completed_request_indices.add(original_index)
+                        accepted_in_batch += 1
+                    else:
+                        errors = request_errors.get(cid, [])
+                        record["error_type"] = (
+                            errors[-1][0] if errors else "EmptyClaims"
+                        )
+                        record["error"] = (
+                            errors[-1][1] if errors else "no claims extracted"
+                        )
+                    _attach_claim_records(record)
+                    batch_records.append(record)
+
+                if rejected_details:
+                    batch_error_types = dict(
+                        sorted(
+                            Counter(
+                                item["error_type"]
+                                for item in rejected_details
+                            ).items()
+                        )
+                    )
+                    append_structured_event(
+                        llm_cfg.get("events_path"),
+                        llm_cfg["event_context"],
+                        event="content_records_deferred",
+                        repair_pass=repair_pass,
+                        batch_size=len(batch_results),
+                        accepted=accepted_in_batch,
+                        deferred=len(rejected_details),
+                        error_types=batch_error_types,
+                        errors=rejected_details,
+                    )
+                    print(
+                        f"[CLAIMS CONTENT DEFERRED] repair_pass={repair_pass} "
+                        f"accepted={accepted_in_batch} "
+                        f"deferred={len(rejected_details)} "
+                        f"error_types={batch_error_types} "
+                        f"request_keys="
+                        f"{[item['request_key'] for item in rejected_details]}"
+                    )
+
+                _write_claim_records(
+                    save_path, ordered_clients, claims_by_client
+                )
+                summary = _claims_summary(batch_records)
+                print(
+                    f"[CLAIMS BATCH] successful={summary['successful']} "
+                    f"failed={summary['failed']} "
+                    f"error_types={summary['error_types']} "
+                    f"total_claims={summary['total_claims']}"
+                )
+
+            asyncio.run(
+                batched_query(
+                    pass_dialogues,
+                    model,
+                    llm_cfg,
+                    on_batch_complete=checkpoint,
+                )
+            )
+            pending_indices = [
+                index
+                for index in pass_indices
+                if index not in completed_request_indices
+            ]
+            if not until_complete or not pending_indices:
+                break
+            repair_pass += 1
+            append_structured_event(
+                llm_cfg.get("events_path"),
+                llm_cfg["event_context"],
+                event="content_repair_pass_started",
+                repair_pass=repair_pass,
+                pending=len(pending_indices),
+                cumulative_error_types=dict(
+                    sorted(content_error_counts.items())
+                ),
+            )
+            repair_cooldown = float(
+                llm_cfg.get("content_repair_cooldown_seconds", 0.0)
+            )
+            if repair_cooldown > 0:
+                time.sleep(repair_cooldown)
 
     for record in claims_by_client.values():
         _attach_claim_records(record)
     _write_claim_records(save_path, ordered_clients, claims_by_client)
     final_records = [claims_by_client[cid] for cid in ordered_clients]
     summary = _claims_summary(final_records)
-    stats_path = save_path.with_suffix(".generation_stats.json")
+    summary["content_validation"] = {
+        "total_rejections": sum(content_error_counts.values()),
+        "unique_rejected_requests": len(content_error_attempts),
+        "error_types": dict(sorted(content_error_counts.items())),
+        "max_attempts_for_one_request": max(
+            content_error_attempts.values(), default=0
+        ),
+        "attempts_by_request": {
+            str(index): attempts
+            for index, attempts in sorted(content_error_attempts.items())
+        },
+        "last_reasons_by_request_index": {
+            str(index): reason
+            for index, reason in sorted(content_error_last_reasons.items())
+        },
+        "last_reasons_by_request": {
+            f"{meta[index]['customer_id']}:{index}": reason
+            for index, reason in sorted(content_error_last_reasons.items())
+        },
+    }
     temp_stats = stats_path.with_suffix(stats_path.suffix + ".tmp")
     with open(temp_stats, "w", encoding="utf-8") as file:
         json.dump(summary, file, indent=2, ensure_ascii=False)

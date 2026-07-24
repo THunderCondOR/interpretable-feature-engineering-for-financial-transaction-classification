@@ -45,6 +45,30 @@ def is_rate_limit(result: dict) -> bool:
     return bool(result.get("rate_limited")) or "ratelimit" in error or "too many requests" in error or " 429" in error
 
 
+def _error_details(
+    batch_results: list[tuple[int, dict]],
+    request_keys: list[str],
+) -> list[dict[str, Any]]:
+    """Return bounded, credential-safe API error details for JSONL events."""
+    details = []
+    for index, result in batch_results:
+        if not result.get("error"):
+            continue
+        reason = str(result.get("error") or "")
+        details.append(
+            {
+                "request_index": index,
+                "request_key": request_keys[index],
+                "error_type": str(
+                    result.get("error_type") or "UnknownAPIError"
+                ),
+                "reason": reason[:2000],
+                "rate_limited": bool(is_rate_limit(result)),
+            }
+        )
+    return details
+
+
 class AtomicAdaptiveScheduler:
     def __init__(self, config: dict, *, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep):
         self.high = int(config.get("initial_concurrency", config.get("max_concurrent", 64)))
@@ -265,8 +289,14 @@ class AtomicAdaptiveScheduler:
                 continue
 
             errors = Counter(str(result.get("error_type") or "UnknownAPIError") for _, result in batch_results if result.get("error"))
+            error_details = _error_details(batch_results, keys)
             if any(str(result.get("error_type")) in PERMANENT_ERRORS for _, result in batch_results):
-                self._event("stage_blocked", batch_id=batch_id, errors=dict(errors))
+                self._event(
+                    "stage_blocked",
+                    batch_id=batch_id,
+                    errors=dict(errors),
+                    error_details=error_details,
+                )
                 raise RuntimeError(f"Permanent API failure: {dict(errors)}")
             if any(is_rate_limit(result) for _, result in batch_results):
                 previous_mode = mode
@@ -321,6 +351,7 @@ class AtomicAdaptiveScheduler:
                     batch_id=batch_id,
                     reason="rate_limit",
                     errors=dict(errors),
+                    error_details=error_details,
                     retry_in=self.cooldown,
                     previous_mode=previous_mode,
                     next_mode=mode,
@@ -336,7 +367,15 @@ class AtomicAdaptiveScheduler:
                 or set(returned_indices) != set(expected_indices)
             )
             if errors or invalid_indices:
-                self._event("window_rolled_back", batch_id=batch_id, reason="transient_or_incomplete", errors=dict(errors))
+                self._event(
+                    "window_rolled_back",
+                    batch_id=batch_id,
+                    reason="transient_or_incomplete",
+                    errors=dict(errors),
+                    error_details=error_details,
+                    expected_indices=expected_indices if invalid_indices else None,
+                    returned_indices=returned_indices if invalid_indices else None,
+                )
                 await self.sleep(min(self.cooldown, self.backoff * (2 ** min(attempt - 1, 6))))
                 continue
 
@@ -345,7 +384,13 @@ class AtomicAdaptiveScheduler:
                 try:
                     commit_window(ordered_results)
                 except Exception as exc:
-                    self._event("window_rolled_back", batch_id=batch_id, reason=f"commit_validation:{type(exc).__name__}")
+                    self._event(
+                        "window_rolled_back",
+                        batch_id=batch_id,
+                        reason=f"commit_validation:{type(exc).__name__}",
+                        exception_type=type(exc).__name__,
+                        exception_message=str(exc)[:2000],
+                    )
                     await self.sleep(min(self.cooldown, self.backoff * (2 ** min(attempt - 1, 6))))
                     continue
             for index, result in ordered_results:
