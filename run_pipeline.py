@@ -85,15 +85,45 @@ def split_output_path(config: dict, key: str, split: str) -> Path:
     return out_dir / f"{base.stem}_{split}{base.suffix}"
 
 
-def load_split(config: dict, split: str) -> pd.DataFrame:
-    return add_features(load_dataset(config, split))
+def load_split(
+    config: dict,
+    split: str,
+    *,
+    apply_client_filter: bool = True,
+) -> pd.DataFrame:
+    return add_features(
+        load_dataset(
+            config,
+            split,
+            apply_client_filter=apply_client_filter,
+        )
+    )
+
+
+def load_prompt_context(config: dict) -> pd.DataFrame:
+    """Load the complete train split used for summaries and demonstrations."""
+    population = str(
+        config.get("pipeline", {}).get(
+            "prompt_context_population", "full_train_split"
+        )
+    )
+    if population != "full_train_split":
+        raise ValueError(
+            "Prompt context must use the complete train split; received "
+            f"prompt_context_population={population!r}"
+        )
+    return load_split(
+        config,
+        prompt_context_split(config),
+        apply_client_filter=False,
+    )
 
 
 def run_stats(config: dict, splits: list[str]) -> None:
     out_dir = Path(config["output"]["base_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_df = load_split(config, prompt_context_split(config))
+    train_df = load_prompt_context(config)
     summary = build_dataset_summary_str(train_df, config)
     summary_path = out_dir / config["output"]["summary_stats"]
     summary_path.write_text(summary, encoding="utf-8")
@@ -101,7 +131,11 @@ def run_stats(config: dict, splits: list[str]) -> None:
         robust_statistics_payload(train_df[train_df["label"] >= 0], config),
         out_dir / "statistics",
     )
-    print(f"Saved train summary -> {summary_path}")
+    print(
+        f"Saved train summary from "
+        f"{train_df['customer_id'].nunique()} reference clients -> "
+        f"{summary_path}"
+    )
 
     for split in splits:
         df = load_split(config, split)
@@ -125,7 +159,7 @@ def run_prompts(config: dict, splits: list[str]) -> None:
     out_dir = Path(config["output"]["base_dir"])
     summary_path = out_dir / config["output"]["summary_stats"]
     summary = summary_path.read_text(encoding="utf-8")
-    train_df = load_split(config, prompt_context_split(config))
+    train_df = load_prompt_context(config)
     few_shot = build_few_shot_str(train_df, config)
 
     for split in splits:

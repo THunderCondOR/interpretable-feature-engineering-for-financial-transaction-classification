@@ -125,6 +125,13 @@ def test_client_filter_is_applied_before_column_rename(tmp_path):
     loaded = load_dataset(config, "val")
     assert loaded["customer_id"].tolist() == [2, 3]
 
+    full_context = load_dataset(
+        config,
+        "val",
+        apply_client_filter=False,
+    )
+    assert full_context["customer_id"].tolist() == [1, 2, 3]
+
 
 def test_manifest_invalidates_when_input_content_changes_in_place(tmp_path):
     data = tmp_path / "train.csv"

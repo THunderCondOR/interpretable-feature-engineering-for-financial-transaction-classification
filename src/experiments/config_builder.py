@@ -328,6 +328,7 @@ def build_runtime_config(
         config.get("pipeline", {}),
         {
             "prompt_context_split": "train",
+            "prompt_context_population": "full_train_split",
             "claims_model": claims_generation["model"],
             "claims_temperature": float(claims_generation.get("temperature", 0.0)),
             "claims_top_p": float(claims_generation.get("top_p", 1.0)),

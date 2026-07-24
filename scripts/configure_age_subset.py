@@ -98,6 +98,9 @@ def configure(
             "val": str(val_path),
         }
         config["dataset"]["expected_client_counts"] = counts
+        config.setdefault("pipeline", {})[
+            "prompt_context_population"
+        ] = "full_train_split"
         write_runtime_config(config_path, config)
         entry["sha256"] = file_sha256(config_path)
 
@@ -117,6 +120,7 @@ def configure(
             "val": file_sha256(val_path),
         },
         "test_policy": "full split",
+        "prompt_context_policy": "complete 24000-client train split",
         "future_expansion": (
             "same output root; add missing IDs after an explicit manifest "
             "expansion while reusing compatible completed records"

@@ -15,7 +15,12 @@ import pandas as pd
 import numpy as np
 
 
-def load_dataset(config: dict, split: str = "train") -> pd.DataFrame:
+def load_dataset(
+    config: dict,
+    split: str = "train",
+    *,
+    apply_client_filter: bool = True,
+) -> pd.DataFrame:
     """
     Load a split CSV and rename columns to the internal schema.
 
@@ -30,7 +35,11 @@ def load_dataset(config: dict, split: str = "train") -> pd.DataFrame:
     path = config["dataset"]["splits"][split]
     df = pd.read_csv(path)
 
-    client_filter = config["dataset"].get("client_ids_by_split", {}).get(split)
+    client_filter = (
+        config["dataset"].get("client_ids_by_split", {}).get(split)
+        if apply_client_filter
+        else None
+    )
     if client_filter is not None:
         if isinstance(client_filter, (str, os.PathLike)):
             with open(Path(client_filter), encoding="utf-8") as file:

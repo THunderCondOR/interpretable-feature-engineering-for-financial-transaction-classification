@@ -165,6 +165,14 @@ def build_run_manifest(config: dict[str, Any], *, repo_root: str | Path = ".") -
     ]
     client_selection_files = files_fingerprint(selection_paths)
     prompt_files = files_fingerprint(prompt_paths)
+    prompt_context = {
+        "split": config.get("pipeline", {}).get(
+            "prompt_context_split", "train"
+        ),
+        "population": config.get("pipeline", {}).get(
+            "prompt_context_population", "full_train_split"
+        ),
+    }
     revision = git_revision(repo_root)
     runtime = runtime_identity()
     config_sha256 = fingerprint(config)
@@ -174,6 +182,7 @@ def build_run_manifest(config: dict[str, Any], *, repo_root: str | Path = ".") -
         "dataset_files": dataset_files,
         "client_selection_files": client_selection_files,
         "prompt_files": prompt_files,
+        "prompt_context": prompt_context,
         "git_revision": revision,
         "packages": runtime["packages"],
     }
@@ -191,6 +200,7 @@ def build_run_manifest(config: dict[str, Any], *, repo_root: str | Path = ".") -
         "dataset_files": dataset_files,
         "client_selection_files": client_selection_files,
         "prompt_files": prompt_files,
+        "prompt_context": prompt_context,
         "few_shot_configuration": config.get("pipeline", {}),
         "runtime": runtime,
         "created_at": datetime.now(timezone.utc).isoformat(),
