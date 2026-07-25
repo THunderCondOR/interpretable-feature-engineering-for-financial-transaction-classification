@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import adjusted_rand_score
 
@@ -11,12 +12,15 @@ from src.pipeline.semantic_features import (
     cut_agglomerative_hierarchy,
     fit_agglomerative_hierarchy,
     nearest_centroid_assignments,
+    normalize_claim,
     unique_claim_space,
 )
 from scripts.run_v4_offline_pipeline import (
     choose_candidate,
     choose_clustering_backend,
+    choose_representation,
     compatible_candidates,
+    features_from_assignments,
 )
 
 
@@ -85,6 +89,25 @@ def test_unique_claim_space_deduplicates_types_but_keeps_occurrences():
     assert len(space["occurrences"]) == 3
     assert len(space["texts"]) == 2
     assert space["occurrence_to_unique"].tolist() == [0, 0, 1]
+
+
+def test_claim_normalization_preserves_domain_bearing_words():
+    text = "  The client conducted a HIGH volume of transactions. "
+    assert normalize_claim(text) == (
+        "the client conducted a high volume of transactions"
+    )
+    space = unique_claim_space([{
+        "customer_id": 1,
+        "label": 0,
+        "claim_records": [{
+            "claim_id": "legacy",
+            "original_text": text,
+            "normalized_text": "the client conducted a high volume of",
+        }],
+    }])
+    assert space["texts"] == [
+        "the client conducted a high volume of transactions"
+    ]
 
 
 def test_candidate_selection_uses_simplest_within_tie_margin():
@@ -157,3 +180,58 @@ def test_scalable_backend_keeps_only_fixed_cluster_candidates():
         ["threshold_0.01", "k_200", "k_400", "k_800"],
         "minibatch_kmeans",
     ) == ["k_200", "k_400", "k_800"]
+
+
+def test_representation_selection_prefers_smaller_space_within_tie():
+    selected = choose_representation([
+        {
+            "encoding": "raw_count",
+            "n_features": 150,
+            "validation_balanced_accuracy": 0.651,
+        },
+        {
+            "encoding": "binary",
+            "n_features": 100,
+            "validation_balanced_accuracy": 0.647,
+        },
+        {
+            "encoding": "binary",
+            "n_features": 50,
+            "validation_balanced_accuracy": 0.64,
+        },
+    ], tie_margin=0.005)
+    assert selected["encoding"] == "binary"
+    assert selected["n_features"] == 100
+
+
+def test_assignment_features_support_binary_count_and_normalized():
+    records = [
+        {"customer_id": 10, "label": 0},
+        {"customer_id": 20, "label": 1},
+    ]
+    assignments = pd.DataFrame([
+        {"customer_id": 10, "cluster_index": 0, "assigned": True},
+        {"customer_id": 10, "cluster_index": 0, "assigned": True},
+        {"customer_id": 10, "cluster_index": 1, "assigned": True},
+        {"customer_id": 20, "cluster_index": -1, "assigned": False},
+    ])
+    model = {"feature_names": ["cot_a", "cot_b"]}
+    binary = features_from_assignments(
+        records, assignments, model, encoding="binary"
+    )
+    raw = features_from_assignments(
+        records, assignments, model, encoding="raw_count"
+    )
+    normalized = features_from_assignments(
+        records, assignments, model, encoding="normalized_count"
+    )
+    assert binary[["cot_a", "cot_b"]].to_numpy().tolist() == [
+        [1.0, 1.0], [0.0, 0.0]
+    ]
+    assert raw[["cot_a", "cot_b"]].to_numpy().tolist() == [
+        [2.0, 1.0], [0.0, 0.0]
+    ]
+    assert np.allclose(
+        normalized[["cot_a", "cot_b"]].to_numpy(),
+        [[2 / 3, 1 / 3], [0.0, 0.0]],
+    )

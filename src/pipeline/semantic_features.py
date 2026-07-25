@@ -11,13 +11,13 @@ from sklearn.metrics.pairwise import cosine_distances
 
 from src.experiments.artifacts import fingerprint
 from src.utils.cluster import embed_texts
-from src.utils.filtration import clean_text
 
 Embedder = Callable[..., np.ndarray]
 
 
 def normalize_claim(text: str) -> str:
-    return " ".join(clean_text(str(text)).lower().split()).strip(" .")
+    """Normalize formatting without deleting domain-bearing words."""
+    return " ".join(str(text).casefold().split()).strip(" .")
 
 
 def claim_occurrences(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -28,7 +28,10 @@ def claim_occurrences(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ]
         for index, entry in enumerate(entries):
             original = str(entry.get("original_text", entry.get("text", ""))).strip()
-            normalized = str(entry.get("normalized_text") or normalize_claim(original))
+            # Recompute from the immutable original text.  Older API artifacts
+            # contain a destructive normalized_text field which removed words
+            # such as "transaction(s)" and must not define the semantic space.
+            normalized = normalize_claim(original)
             if normalized:
                 rows.append({
                     "claim_id": entry.get("claim_id") or fingerprint({

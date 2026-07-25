@@ -86,7 +86,7 @@ def main() -> None:
     parser.add_argument(
         "--derived-root",
         type=Path,
-        default=Path("results/v2/derived/reviewer-v4-offline-v1"),
+        default=Path("results/v2/derived/reviewer-v4-offline-v2"),
     )
     parser.add_argument(
         "--skip-cell",

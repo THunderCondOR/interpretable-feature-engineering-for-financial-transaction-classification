@@ -21,6 +21,7 @@ import pandas as pd
 import yaml
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.cluster import MiniBatchKMeans
+from sklearn.feature_selection import mutual_info_classif
 from xgboost import XGBClassifier
 
 from src.experiments.artifacts import (
@@ -51,6 +52,8 @@ from src.pipeline.semantic_features import (
 
 DEFAULT_CANDIDATES = ("threshold_0.01", "k_200", "k_400", "k_800")
 DEFAULT_EXACT_CLAIM_LIMIT = 45_000
+DEFAULT_ENCODINGS = ("binary", "raw_count", "normalized_count")
+DEFAULT_MI_TOP_K = (50, 100, 150, 200)
 
 
 def choose_clustering_backend(
@@ -226,6 +229,147 @@ def fixed_candidate_score(
     model.fit(train[columns].to_numpy(np.float32), train["label"].to_numpy(int))
     prediction = model.predict(val[columns].to_numpy(np.float32))
     return float(balanced_accuracy_score(val["label"], prediction))
+
+
+def features_from_assignments(
+    records: list[dict[str, Any]],
+    assignments: pd.DataFrame,
+    model: dict[str, Any],
+    *,
+    encoding: str,
+    selected_feature_names: list[str] | None = None,
+) -> pd.DataFrame:
+    """Build a client matrix from frozen claim-to-cluster assignments."""
+    names = list(model["feature_names"])
+    counts = (
+        assignments.loc[assignments["assigned"]]
+        .groupby(["customer_id", "cluster_index"])
+        .size()
+        .unstack(fill_value=0)
+        .reindex(columns=range(len(names)), fill_value=0)
+    )
+    client_ids = [int(row["customer_id"]) for row in records]
+    values = counts.reindex(client_ids, fill_value=0).to_numpy(np.float32)
+    if encoding == "binary":
+        values = (values > 0).astype(np.float32)
+    elif encoding == "normalized_count":
+        values = values / np.maximum(values.sum(axis=1, keepdims=True), 1.0)
+    elif encoding != "raw_count":
+        raise ValueError(f"Unknown feature encoding: {encoding}")
+    frame = pd.DataFrame(values, columns=names)
+    frame.insert(0, "label", [int(row.get("label", -1)) for row in records])
+    frame.insert(0, "customer_id", client_ids)
+    if selected_feature_names is not None:
+        frame = frame[
+            ["customer_id", "label", *selected_feature_names]
+        ]
+    return frame
+
+
+def rank_features_by_train_mi(
+    train: pd.DataFrame,
+    *,
+    encoding: str,
+) -> list[str]:
+    names = [column for column in train if column.startswith("cot_")]
+    scores = mutual_info_classif(
+        train[names].to_numpy(np.float32),
+        train["label"].to_numpy(int),
+        discrete_features=encoding != "normalized_count",
+        random_state=17,
+    )
+    return [
+        name
+        for name, _ in sorted(
+            zip(names, scores),
+            key=lambda item: (-float(item[1]), item[0]),
+        )
+    ]
+
+
+def choose_representation(
+    rows: list[dict[str, Any]],
+    tie_margin: float,
+) -> dict[str, Any]:
+    best = max(row["validation_balanced_accuracy"] for row in rows)
+    eligible = [
+        row
+        for row in rows
+        if best - row["validation_balanced_accuracy"] <= tie_margin
+    ]
+    encoding_order = {
+        "binary": 0,
+        "normalized_count": 1,
+        "raw_count": 2,
+    }
+    return sorted(
+        eligible,
+        key=lambda row: (
+            row["n_features"],
+            encoding_order[row["encoding"]],
+            -row["validation_balanced_accuracy"],
+        ),
+    )[0]
+
+
+def sweep_representations(
+    *,
+    records: dict[str, list[dict[str, Any]]],
+    assignments: dict[str, pd.DataFrame],
+    model: dict[str, Any],
+    config: dict[str, Any],
+    encodings: tuple[str, ...] = DEFAULT_ENCODINGS,
+    top_k_values: tuple[int, ...] = DEFAULT_MI_TOP_K,
+    tie_margin: float = 0.005,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, pd.DataFrame]]:
+    rows = []
+    frames_by_encoding = {}
+    rankings = {}
+    for encoding in encodings:
+        train = features_from_assignments(
+            records["train"], assignments["train"], model, encoding=encoding
+        )
+        val = features_from_assignments(
+            records["val"], assignments["val"], model, encoding=encoding
+        )
+        frames_by_encoding[encoding] = {"train": train, "val": val}
+        rankings[encoding] = rank_features_by_train_mi(
+            train,
+            encoding=encoding,
+        )
+        sizes = [
+            size for size in top_k_values if size < len(model["feature_names"])
+        ] + [None]
+        for top_k in sizes:
+            selected_names = (
+                rankings[encoding]
+                if top_k is None
+                else rankings[encoding][:top_k]
+            )
+            score = fixed_candidate_score(
+                train[["customer_id", "label", *selected_names]],
+                val[["customer_id", "label", *selected_names]],
+                config,
+            )
+            rows.append({
+                "encoding": encoding,
+                "mi_top_k": top_k,
+                "n_features": len(selected_names),
+                "validation_balanced_accuracy": score,
+            })
+    selected = choose_representation(rows, tie_margin)
+    selected_names = (
+        rankings[selected["encoding"]]
+        if selected["mi_top_k"] is None
+        else rankings[selected["encoding"]][: selected["mi_top_k"]]
+    )
+    selected = {
+        **selected,
+        "selected_feature_names": selected_names,
+        "selection_metric": "cot_validation_balanced_accuracy",
+        "selection_tie_margin": tie_margin,
+    }
+    return selected, rows, frames_by_encoding[selected["encoding"]]
 
 
 def refresh_cluster_metadata(
@@ -562,31 +706,52 @@ def materialize_selected(
     rows: list[dict[str, Any]],
     tie_margin: float,
 ) -> dict[str, Any]:
-    selected = choose_candidate(rows, tie_margin)
-    selection_payload = {
-        "selection_split": "val",
-        "selection_metric": "balanced_accuracy",
-        "tie_margin": tie_margin,
-        "candidates": rows,
-        "selected_candidate": selected["candidate"],
-        "selected_validation_balanced_accuracy": selected[
-            "validation_balanced_accuracy"
-        ],
-        "selected_n_clusters": selected["n_clusters"],
-    }
-    selection_payload["selection_signature"] = fingerprint(selection_payload)
-    selection_path = output_root / "cluster_selection.json"
-    candidate_dir = Path(selected["candidate_dir"])
+    selected_cluster = choose_candidate(rows, tie_margin)
+    candidate_dir = Path(selected_cluster["candidate_dir"])
     model = load_model(
         candidate_dir / "cluster_model.json",
         candidate_dir / "centroids.npz",
     )
+    train_assignments = pd.read_parquet(
+        candidate_dir / "claim_assignments_train.parquet"
+    )
+    val_assignments = pd.read_parquet(
+        candidate_dir / "claim_assignments_val.parquet"
+    )
+    representation, representation_rows, selected_frames = (
+        sweep_representations(
+            records=records,
+            assignments={
+                "train": train_assignments,
+                "val": val_assignments,
+            },
+            model=model,
+            config=config,
+            tie_margin=tie_margin,
+        )
+    )
+    selection_payload = {
+        "selection_split": "val",
+        "cluster_selection_metric": "balanced_accuracy",
+        "tie_margin": tie_margin,
+        "candidates": rows,
+        "selected_candidate": selected_cluster["candidate"],
+        "selected_validation_balanced_accuracy": selected_cluster[
+            "validation_balanced_accuracy"
+        ],
+        "selected_n_clusters": selected_cluster["n_clusters"],
+        "representation_candidates": representation_rows,
+        "selected_representation": representation,
+    }
+    selection_payload["selection_signature"] = fingerprint(selection_payload)
+    selection_path = output_root / "cluster_selection.json"
     identity = stage_identity(
         stage="selected_features",
         source=source,
         inputs={"selection_signature": selection_payload["selection_signature"]},
         configuration={
-            "selected_candidate": selected["candidate"],
+            "selected_candidate": selected_cluster["candidate"],
+            "selected_representation": representation,
             "max_assign_distance": model["settings"]["max_assign_distance"],
         },
         repo_root=REPO_ROOT,
@@ -602,19 +767,44 @@ def materialize_selected(
         embeddings["test"],
         model,
     )
+    del test_features
+    selected_names = representation["selected_feature_names"]
+    train_features = selected_frames["train"][
+        ["customer_id", "label", *selected_names]
+    ]
+    val_features = selected_frames["val"][
+        ["customer_id", "label", *selected_names]
+    ]
+    test_features = features_from_assignments(
+        records["test"],
+        test_assignments,
+        model,
+        encoding=representation["encoding"],
+        selected_feature_names=selected_names,
+    )
+    model["selected_feature_names"] = selected_names
+    model["representation"] = {
+        key: value
+        for key, value in representation.items()
+        if key != "selected_feature_names"
+    }
     selected_dir = output_root / "selected_clusters"
     selected_dir.mkdir(parents=True, exist_ok=True)
     outputs = [selection_path]
-    for name in ("cluster_model.json", "centroids.npz"):
-        target = selected_dir / name
-        atomic_copy(candidate_dir / name, target)
-        outputs.append(target)
-    for split in ("train", "val"):
-        for prefix in ("cot_features", "claim_assignments"):
-            source_path = candidate_dir / f"{prefix}_{split}.parquet"
-            target = output_root / f"{prefix}_{split}.parquet"
-            atomic_copy(source_path, target)
-            outputs.append(target)
+    selected_model_path = selected_dir / "cluster_model.json"
+    selected_centroids_path = selected_dir / "centroids.npz"
+    atomic_write_json(selected_model_path, model_payload(model))
+    atomic_copy(candidate_dir / "centroids.npz", selected_centroids_path)
+    outputs.extend([selected_model_path, selected_centroids_path])
+    for split, features, split_assignments in (
+        ("train", train_features, train_assignments),
+        ("val", val_features, val_assignments),
+    ):
+        feature_path = output_root / f"cot_features_{split}.parquet"
+        assignment_path = output_root / f"claim_assignments_{split}.parquet"
+        atomic_frame(feature_path, features)
+        atomic_frame(assignment_path, split_assignments)
+        outputs.extend([feature_path, assignment_path])
     test_feature_path = output_root / "cot_features_test.parquet"
     test_assignment_path = output_root / "claim_assignments_test.parquet"
     atomic_frame(test_feature_path, test_features)
@@ -623,11 +813,11 @@ def materialize_selected(
 
     # Compatibility names consumed by the existing ML evaluator.
     atomic_copy(
-        selected_dir / "cluster_model.json",
+        selected_model_path,
         output_root / "cot_clusters.json",
     )
     atomic_copy(
-        selected_dir / "centroids.npz",
+        selected_centroids_path,
         output_root / "cot_cluster_model.npz",
     )
     outputs.extend([
@@ -692,7 +882,7 @@ def main() -> None:
     parser.add_argument(
         "--derived-root",
         type=Path,
-        default=Path("results/v2/derived/reviewer-v4-offline-v1"),
+        default=Path("results/v2/derived/reviewer-v4-offline-v2"),
     )
     parser.add_argument(
         "--candidates",
