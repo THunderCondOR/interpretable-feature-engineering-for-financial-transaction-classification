@@ -5,8 +5,9 @@ Two scopes are deliberately separate:
 
 * ``subset`` uses the same stratified train clients for both models and is
   intended for inexpensive representation-stability analysis.
-* ``full`` processes every client in train, validation, and test and produces
-  reusable artifacts for the complete downstream pipeline.
+* ``full`` processes the exact train, validation, and test populations used by
+  the completed seed-17 main run and produces reusable artifacts for the
+  complete downstream pipeline.
 
 The scopes must use different result roots because their manifests and
 completion contracts are not compatible.
@@ -33,7 +34,6 @@ from src.experiments.artifacts import (
     fingerprint,
 )
 from src.experiments.config_builder import (
-    EXPECTED_CLIENT_COUNTS,
     build_runtime_config,
     load_yaml,
     slug,
@@ -74,6 +74,43 @@ def source_client_ids(path: Path) -> set[int]:
             if line.strip():
                 result.add(int(json.loads(line)["customer_id"]))
     return result
+
+
+def source_full_contract(
+    dataset: str,
+    model: str,
+) -> tuple[dict[str, Any] | None, dict[str, int]]:
+    """Reuse the exact client population of the completed seed-17 main run."""
+    manifest_path = SOURCE_ROOTS[(dataset, model)] / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source_dataset = manifest.get("config", {}).get("dataset", {})
+    counts = {
+        str(split): int(count)
+        for split, count in source_dataset.get(
+            "expected_client_counts", {}
+        ).items()
+    }
+    required_splits = {"train", "val", "test"}
+    if set(counts) != required_splits:
+        raise RuntimeError(
+            f"Incomplete seed-17 client contract in {manifest_path}: {counts}"
+        )
+    selections = source_dataset.get("client_ids_by_split")
+    if selections:
+        selections = {
+            str(split): str(path)
+            for split, path in selections.items()
+        }
+        for split, path in selections.items():
+            if split not in required_splits:
+                raise RuntimeError(
+                    f"Unexpected client selection split={split} in {manifest_path}"
+                )
+            if not Path(path).is_file():
+                raise FileNotFoundError(
+                    f"Missing seed-17 client selection for {split}: {path}"
+                )
+    return selections, counts
 
 
 def materialize_shared_ids(
@@ -145,7 +182,7 @@ def main() -> None:
         "--scope",
         choices=("subset", "full"),
         default="subset",
-        help="Use a fixed train subset or all train/val/test clients.",
+        help="Use a fixed train subset or the full seed-17 experiment contract.",
     )
     parser.add_argument("--sample-size", type=int, default=300)
     parser.add_argument("--sampling-seed", type=int, default=137)
@@ -154,7 +191,7 @@ def main() -> None:
         type=Path,
         help=(
             "Output root. Defaults to llm-seeds-v1 for subset scope and "
-            "llm-full-seeds-v1 for full scope."
+            "llm-full-seeds-v2 for full scope."
         ),
     )
     parser.add_argument("--execute", action="store_true")
@@ -165,13 +202,13 @@ def main() -> None:
     profile = load_yaml(args.model_config)
     model = slug(profile["experiment"]["model_slug"])
     run_id = args.run_id or (
-        "reviewer-v4-llm-full-seeds-v1"
+        "reviewer-v4-llm-full-seeds-v2"
         if args.scope == "full"
         else "reviewer-v4-llm-seed-stability-v1"
     )
     results_root = args.results_root or Path(
         "results/v2/stability/"
-        + ("llm-full-seeds-v1" if args.scope == "full" else "llm-seeds-v1")
+        + ("llm-full-seeds-v2" if args.scope == "full" else "llm-seeds-v1")
     )
     protected_other_scope = Path(
         "results/v2/stability/"
@@ -203,10 +240,19 @@ def main() -> None:
             )
         else:
             ids_path = None
-            client_ids_by_split = None
-            expected_counts = dict(EXPECTED_CLIENT_COUNTS[dataset])
+            client_ids_by_split, expected_counts = source_full_contract(
+                dataset,
+                model,
+            )
             splits = ["train", "val", "test"]
-            ids_sha256 = None
+            ids_sha256 = (
+                fingerprint({
+                    split: file_sha256(path)
+                    for split, path in (client_ids_by_split or {}).items()
+                })
+                if client_ids_by_split
+                else None
+            )
         base = load_yaml(Path("configs") / f"{dataset}.yaml")
         for seed in args.seeds:
             config = build_runtime_config(
