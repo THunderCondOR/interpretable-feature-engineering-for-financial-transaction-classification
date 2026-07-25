@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import yaml
 from sklearn.metrics import balanced_accuracy_score
+from sklearn.cluster import MiniBatchKMeans
 from xgboost import XGBClassifier
 
 from src.experiments.artifacts import (
@@ -49,6 +50,38 @@ from src.pipeline.semantic_features import (
 )
 
 DEFAULT_CANDIDATES = ("threshold_0.01", "k_200", "k_400", "k_800")
+DEFAULT_EXACT_CLAIM_LIMIT = 45_000
+
+
+def choose_clustering_backend(
+    n_claims: int,
+    requested: str,
+    *,
+    exact_claim_limit: int = DEFAULT_EXACT_CLAIM_LIMIT,
+) -> str:
+    if requested not in {"auto", "agglomerative", "minibatch_kmeans"}:
+        raise ValueError(f"Unsupported clustering backend: {requested}")
+    if requested != "auto":
+        return requested
+    return (
+        "agglomerative"
+        if int(n_claims) <= int(exact_claim_limit)
+        else "minibatch_kmeans"
+    )
+
+
+def compatible_candidates(
+    candidates: list[str],
+    backend: str,
+) -> list[str]:
+    if backend == "agglomerative":
+        return candidates
+    supported = [item for item in candidates if item.startswith("k_")]
+    if not supported:
+        raise ValueError(
+            "minibatch_kmeans requires at least one fixed-K candidate"
+        )
+    return supported
 
 
 def offline_event(
@@ -312,6 +345,7 @@ def materialize_hierarchy(
     source: dict[str, Any],
     train_embeddings: np.ndarray,
     embedding_stage: dict[str, Any],
+    backend: str,
 ) -> dict[str, Any]:
     hierarchy_path = output_root / "hierarchy" / "train_hierarchy.npz"
     identity = stage_identity(
@@ -323,7 +357,11 @@ def materialize_hierarchy(
                 output_root / "embeddings" / "embeddings_train.npy"
             ]),
         },
-        configuration={"metric": "cosine", "linkage": "average"},
+        configuration={
+            "backend": backend,
+            "metric": "cosine" if backend == "agglomerative" else "euclidean_on_unit_vectors",
+            "linkage": "average" if backend == "agglomerative" else None,
+        },
         repo_root=REPO_ROOT,
     )
     manifest_path = stage_path(output_root, "hierarchy")
@@ -333,8 +371,16 @@ def materialize_hierarchy(
             "children": payload["children"],
             "distances": payload["distances"],
             "n_samples": int(payload["n_samples"][0]),
+            "backend": backend,
         }
-    hierarchy = fit_agglomerative_hierarchy(train_embeddings)
+    if backend == "agglomerative":
+        hierarchy = fit_agglomerative_hierarchy(train_embeddings)
+    else:
+        hierarchy = {
+            "children": np.empty((0, 2), dtype=np.int64),
+            "distances": np.empty(0, dtype=np.float64),
+            "n_samples": int(len(train_embeddings)),
+        }
     atomic_npz(
         hierarchy_path,
         children=hierarchy["children"],
@@ -346,14 +392,15 @@ def materialize_hierarchy(
         identity,
         outputs=[hierarchy_path],
         metrics={
+            "backend": backend,
             "n_samples": hierarchy["n_samples"],
             "estimated_condensed_distance_gb": (
                 hierarchy["n_samples"] * (hierarchy["n_samples"] - 1) * 8
                 / 2 / 1e9
-            ),
+            ) if backend == "agglomerative" else 0.0,
         },
     )
-    return hierarchy
+    return {**hierarchy, "backend": backend}
 
 
 def run_candidate(
@@ -370,7 +417,33 @@ def run_candidate(
     hierarchy_signature: str,
 ) -> dict[str, Any]:
     candidate_dir = output_root / "candidates" / candidate
-    labels, overlay = candidate_partition(hierarchy, candidate)
+    if hierarchy["backend"] == "agglomerative":
+        labels, overlay = candidate_partition(hierarchy, candidate)
+        overlay["algorithm"] = "agglomerative_average_cosine"
+    else:
+        if not candidate.startswith("k_"):
+            raise ValueError(
+                f"{candidate} is not supported by minibatch_kmeans"
+            )
+        count = min(
+            int(candidate.removeprefix("k_")),
+            int(hierarchy["n_samples"]),
+        )
+        labels = MiniBatchKMeans(
+            n_clusters=count,
+            batch_size=4096,
+            n_init=3,
+            max_iter=200,
+            random_state=17,
+            reassignment_ratio=0.01,
+        ).fit_predict(np.asarray(embeddings["train"], dtype=np.float32))
+        overlay = {
+            # Retained as inert compatibility metadata; fixed-K formation does
+            # not consult this threshold.
+            "distance_threshold": 0.01,
+            "n_clusters": count,
+            "algorithm": "minibatch_kmeans_unit_embeddings",
+        }
     candidate_config = copy.deepcopy(config)
     candidate_config.setdefault("clustering", {}).update({
         **overlay,
@@ -627,6 +700,16 @@ def main() -> None:
         default=list(DEFAULT_CANDIDATES),
     )
     parser.add_argument("--tie-margin", type=float, default=0.005)
+    parser.add_argument(
+        "--clustering-backend",
+        choices=("auto", "agglomerative", "minibatch_kmeans"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--exact-claim-limit",
+        type=int,
+        default=DEFAULT_EXACT_CLAIM_LIMIT,
+    )
     parser.add_argument("--skip-ml", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
@@ -643,6 +726,8 @@ def main() -> None:
         "source": source,
         "output_root": str(output_root),
         "candidates": args.candidates,
+        "clustering_backend": args.clustering_backend,
+        "exact_claim_limit": args.exact_claim_limit,
         "selection": "validation balanced accuracy; simplest within 0.005",
         "ml": not args.skip_ml,
     }
@@ -673,11 +758,26 @@ def main() -> None:
     embedding_stage = json.loads(
         stage_path(output_root, "embeddings").read_text(encoding="utf-8")
     )
+    backend = choose_clustering_backend(
+        len(spaces["train"]["texts"]),
+        args.clustering_backend,
+        exact_claim_limit=args.exact_claim_limit,
+    )
+    candidates = compatible_candidates(args.candidates, backend)
+    print(json.dumps({
+        "selected_clustering_backend": backend,
+        "train_unique_claims": len(spaces["train"]["texts"]),
+        "effective_candidates": candidates,
+        "skipped_candidates": [
+            item for item in args.candidates if item not in candidates
+        ],
+    }, indent=2))
     hierarchy = materialize_hierarchy(
         output_root=output_root,
         source=source,
         train_embeddings=embeddings["train"],
         embedding_stage=embedding_stage,
+        backend=backend,
     )
     offline_event(output_root, source, stage="hierarchy")
     hierarchy_stage = json.loads(
@@ -696,14 +796,14 @@ def main() -> None:
             embedding_signature=embedding_signature,
             hierarchy_signature=hierarchy_stage["stage_signature"],
         )
-        for candidate in args.candidates
+        for candidate in candidates
     ]
     offline_event(
         output_root,
         source,
         stage="cluster_candidates",
         completed=len(rows),
-        expected=len(args.candidates),
+        expected=len(candidates),
     )
     selection = materialize_selected(
         output_root=output_root,

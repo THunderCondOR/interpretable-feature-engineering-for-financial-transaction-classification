@@ -13,7 +13,11 @@ from src.pipeline.semantic_features import (
     nearest_centroid_assignments,
     unique_claim_space,
 )
-from scripts.run_v4_offline_pipeline import choose_candidate
+from scripts.run_v4_offline_pipeline import (
+    choose_candidate,
+    choose_clustering_backend,
+    compatible_candidates,
+)
 
 
 def test_hierarchy_fixed_k_cut_matches_sklearn_partition():
@@ -137,3 +141,19 @@ def test_completed_stage_rejects_modified_output(tmp_path):
 
     output.write_text('{"value": 2}', encoding="utf-8")
     assert not compatible_stage(manifest, identity)
+
+
+def test_auto_backend_avoids_quadratic_clustering_for_large_claim_space():
+    assert choose_clustering_backend(45_000, "auto") == "agglomerative"
+    assert choose_clustering_backend(45_001, "auto") == "minibatch_kmeans"
+    assert (
+        choose_clustering_backend(100_000, "agglomerative")
+        == "agglomerative"
+    )
+
+
+def test_scalable_backend_keeps_only_fixed_cluster_candidates():
+    assert compatible_candidates(
+        ["threshold_0.01", "k_200", "k_400", "k_800"],
+        "minibatch_kmeans",
+    ) == ["k_200", "k_400", "k_800"]
