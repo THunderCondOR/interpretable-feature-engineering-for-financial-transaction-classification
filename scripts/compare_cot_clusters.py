@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.neighbors import NearestNeighbors
 
 from src.utils.cluster import embed_texts
 
@@ -111,6 +112,83 @@ def summarize_matches(
     return summary, pairs
 
 
+def scalable_matches(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+    left_embeddings: np.ndarray,
+    right_embeddings: np.ndarray,
+    *,
+    threshold: float,
+    top_k: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Directional and mutual matching without a quadratic similarity matrix."""
+    right_index = NearestNeighbors(n_neighbors=1, metric="cosine").fit(
+        right_embeddings
+    )
+    left_distance, left_nn = right_index.kneighbors(left_embeddings)
+    left_score = 1.0 - left_distance[:, 0]
+    left_nn = left_nn[:, 0]
+    left_index = NearestNeighbors(n_neighbors=1, metric="cosine").fit(
+        left_embeddings
+    )
+    right_distance, right_nn = left_index.kneighbors(right_embeddings)
+    right_score = 1.0 - right_distance[:, 0]
+    right_nn = right_nn[:, 0]
+    mutual = {
+        (index, int(left_nn[index]))
+        for index in range(len(left))
+        if right_nn[left_nn[index]] == index
+    }
+    left_weights = np.asarray([
+        row.get("occurrences", row.get("size", 1)) for row in left
+    ], dtype=float)
+    right_weights = np.asarray([
+        row.get("occurrences", row.get("size", 1)) for row in right
+    ], dtype=float)
+    left_weights /= max(float(left_weights.sum()), 1.0)
+    right_weights /= max(float(right_weights.sum()), 1.0)
+    left_matched = left_score >= threshold
+    right_matched = right_score >= threshold
+    summary = {
+        "n_left_clusters": len(left),
+        "n_right_clusters": len(right),
+        "matching_mode": "batched_directional_nearest_neighbour",
+        "similarity_threshold": threshold,
+        "mean_left_to_right_best_cosine": float(left_score.mean()),
+        "mean_right_to_left_best_cosine": float(right_score.mean()),
+        "median_left_to_right_best_cosine": float(np.median(left_score)),
+        "median_right_to_left_best_cosine": float(np.median(right_score)),
+        "mutual_nearest_pairs": len(mutual),
+        "mutual_nearest_share_left": len(mutual) / max(len(left), 1),
+        "size_weighted_left_best_cosine": float(
+            np.average(left_score, weights=left_weights)
+        ),
+        "size_weighted_right_best_cosine": float(
+            np.average(right_score, weights=right_weights)
+        ),
+        "matched_left_mass": float(left_weights[left_matched].sum()),
+        "matched_right_mass": float(right_weights[right_matched].sum()),
+        "unmatched_left_mass": float(left_weights[~left_matched].sum()),
+        "unmatched_right_mass": float(right_weights[~right_matched].sum()),
+        "one_to_one_mean_cosine": None,
+    }
+    ranked = np.argsort(-left_score)[:top_k]
+    pairs = [
+        {
+            "left_feature": left[index].get("feature"),
+            "right_feature": right[int(left_nn[index])].get("feature"),
+            "cosine": float(left_score[index]),
+            "mutual_nearest": (int(index), int(left_nn[index])) in mutual,
+            "left_examples": (left[index].get("examples") or [])[:3],
+            "right_examples": (
+                right[int(left_nn[index])].get("examples") or []
+            )[:3],
+        }
+        for index in ranked
+    ]
+    return summary, pairs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--left-root", required=True, type=Path)
@@ -121,6 +199,12 @@ def main() -> None:
     parser.add_argument("--embedding-model", default="paraphrase-multilingual-MiniLM-L12-v2")
     parser.add_argument("--max-examples", type=int, default=10)
     parser.add_argument("--top-k", type=int, default=25)
+    parser.add_argument("--match-threshold", type=float, default=0.70)
+    parser.add_argument(
+        "--max-full-matrix-cells",
+        type=int,
+        default=5_000_000,
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
@@ -140,8 +224,16 @@ def main() -> None:
     details: dict[str, Any] = {}
 
     for dataset in args.datasets:
-        left_path = args.left_root / dataset / "cot_clusters.json"
-        right_path = args.right_root / dataset / "cot_clusters.json"
+        left_path = (
+            args.left_root / "cot_clusters.json"
+            if (args.left_root / "cot_clusters.json").is_file()
+            else args.left_root / dataset / "cot_clusters.json"
+        )
+        right_path = (
+            args.right_root / "cot_clusters.json"
+            if (args.right_root / "cot_clusters.json").is_file()
+            else args.right_root / dataset / "cot_clusters.json"
+        )
         left = load_clusters(left_path)
         right = load_clusters(right_path)
         texts = [cluster_text(c, args.max_examples) for c in left] + [
@@ -151,8 +243,23 @@ def main() -> None:
         emb = embed_texts(texts, model_name=args.embedding_model)
         left_emb = emb[: len(left)]
         right_emb = emb[len(left) :]
-        sim = cosine_similarity(left_emb, right_emb) if len(left) and len(right) else np.zeros((len(left), len(right)))
-        summary, pairs = summarize_matches(left, right, sim, args.top_k)
+        if len(left) * len(right) <= args.max_full_matrix_cells:
+            sim = (
+                cosine_similarity(left_emb, right_emb)
+                if len(left) and len(right)
+                else np.zeros((len(left), len(right)))
+            )
+            summary, pairs = summarize_matches(left, right, sim, args.top_k)
+            summary["matching_mode"] = "full_hungarian"
+        else:
+            summary, pairs = scalable_matches(
+                left,
+                right,
+                left_emb,
+                right_emb,
+                threshold=args.match_threshold,
+                top_k=args.top_k,
+            )
         summary = {"dataset": dataset, **summary}
         rows.append(summary)
         details[dataset] = {

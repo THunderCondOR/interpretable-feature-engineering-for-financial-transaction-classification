@@ -23,6 +23,14 @@ DISPLAY_STAGES = [
     "train_claims",
     "val_claims",
     "test_claims",
+    "embeddings",
+    "hierarchy",
+    "cluster_candidates",
+    "cluster_selection",
+    "test_features",
+    "ml",
+    "stability",
+    "grounding",
     "queue",
 ]
 
