@@ -7,6 +7,7 @@ import random
 import sys
 from pathlib import Path
 from typing import Any
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -98,6 +99,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-roots", nargs="+", default=["results", "results/gpt_oss_120b"])
     parser.add_argument("--run-names", nargs="+", default=["qwen", "gpt_oss_120b"])
+    parser.add_argument(
+        "--sources-config",
+        type=Path,
+        help="YAML registry of exact nested v4 source roots.",
+    )
     parser.add_argument("--datasets", nargs="+", default=["gender", "age", "rosbank"])
     parser.add_argument("--split", default="test")
     parser.add_argument("--execute", action="store_true")
@@ -108,7 +114,7 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
 
-    if len(args.run_roots) != len(args.run_names):
+    if not args.sources_config and len(args.run_roots) != len(args.run_names):
         raise ValueError("--run-roots and --run-names must have the same length")
 
     if not args.execute:
@@ -116,6 +122,9 @@ def main() -> None:
             "mode": "dry-run",
             "run_roots": args.run_roots,
             "run_names": args.run_names,
+            "sources_config": (
+                str(args.sources_config) if args.sources_config else None
+            ),
             "datasets": args.datasets,
             "split": args.split,
             "clients_per_dataset": args.clients_per_dataset,
@@ -129,23 +138,78 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     out_records = []
 
-    for run_name, run_root in zip(args.run_names, args.run_roots):
-        root = Path(run_root)
-        for dataset in args.datasets:
-            dataset_root = root / dataset
-            stats = _by_customer(dataset_root / f"clients_stats_{args.split}.jsonl")
-            claims = _by_customer(dataset_root / f"claims_{args.split}.jsonl")
-            prompts_path = dataset_root / f"prompts_{args.split}.jsonl"
-            prompts = _by_customer(prompts_path) if prompts_path.exists() else {}
-            train_summary = (dataset_root / "summary_stats.txt").read_text(encoding="utf-8")
-            eligible = sorted(
-                cid for cid, record in claims.items()
-                if _claims(record) and cid in stats
-            )
-            sampled_ids = rng.sample(
-                eligible,
-                k=min(args.clients_per_dataset, len(eligible)),
-            )
+    if args.sources_config:
+        payload = yaml.safe_load(
+            args.sources_config.read_text(encoding="utf-8")
+        )
+        sources = [
+            {
+                "run_name": str(row["run_name"]),
+                "dataset": str(row["dataset"]),
+                "root": Path(row["root"]),
+            }
+            for row in payload.get("sources", [])
+            if str(row.get("dataset")) in args.datasets
+        ]
+    else:
+        sources = [
+            {
+                "run_name": run_name,
+                "dataset": dataset,
+                "root": Path(run_root) / dataset,
+            }
+            for run_name, run_root in zip(args.run_names, args.run_roots)
+            for dataset in args.datasets
+        ]
+    if not sources:
+        raise ValueError("No grounding sources configured")
+
+    loaded: dict[tuple[str, str], dict[str, Any]] = {}
+    for source in sources:
+        dataset_root = source["root"]
+        dataset = source["dataset"]
+        run_name = source["run_name"]
+        stats = _by_customer(dataset_root / f"clients_stats_{args.split}.jsonl")
+        claims = _by_customer(dataset_root / f"claims_{args.split}.jsonl")
+        prompts_path = dataset_root / f"prompts_{args.split}.jsonl"
+        prompts = _by_customer(prompts_path) if prompts_path.exists() else {}
+        train_summary = (dataset_root / "summary_stats.txt").read_text(
+            encoding="utf-8"
+        )
+        loaded[(dataset, run_name)] = {
+            "root": dataset_root,
+            "stats": stats,
+            "claims": claims,
+            "prompts": prompts,
+            "train_summary": train_summary,
+        }
+
+    for dataset in args.datasets:
+        dataset_sources = [
+            source for source in sources if source["dataset"] == dataset
+        ]
+        if not dataset_sources:
+            continue
+        eligible_sets = []
+        for source in dataset_sources:
+            item = loaded[(dataset, source["run_name"])]
+            eligible_sets.append({
+                cid
+                for cid, record in item["claims"].items()
+                if _claims(record) and cid in item["stats"]
+            })
+        paired_eligible = sorted(set.intersection(*eligible_sets))
+        sampled_ids = rng.sample(
+            paired_eligible,
+            k=min(args.clients_per_dataset, len(paired_eligible)),
+        )
+        for source in dataset_sources:
+            run_name = source["run_name"]
+            item = loaded[(dataset, run_name)]
+            stats = item["stats"]
+            claims = item["claims"]
+            prompts = item["prompts"]
+            train_summary = item["train_summary"]
             for cid in sampled_ids:
                 evidence, provenance = _verified_evidence(
                     claim_record=claims[cid],

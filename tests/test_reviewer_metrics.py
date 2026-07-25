@@ -9,11 +9,22 @@ from src.evaluation.reviewer_metrics import (
     grounding_summary,
     surrogate_fidelity,
 )
+from scripts.summarize_grounding_judges import validate_judge_records
 
 
 def test_two_judge_disagreement_has_no_fake_majority():
     assert adjudicate_grounding(["supported", "unsupported"]) == ("disagreement", False)
     assert adjudicate_grounding(["supported", "supported"]) == ("supported", True)
+
+
+def test_grounding_accepts_source_specific_two_judge_sets():
+    frame = pd.DataFrame([
+        {"sample_id": "qwen", "judge_name": "local_gpt_oss", "evidence_hash": "a", "verdict": "supported"},
+        {"sample_id": "qwen", "judge_name": "openrouter", "evidence_hash": "a", "verdict": "supported"},
+        {"sample_id": "gpt", "judge_name": "local_qwen", "evidence_hash": "b", "verdict": "unsupported"},
+        {"sample_id": "gpt", "judge_name": "openrouter", "evidence_hash": "b", "verdict": "partially_supported"},
+    ])
+    validate_judge_records(frame)
 
 
 def test_grounding_reports_kappa_and_client_bootstrap():

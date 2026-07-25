@@ -1,0 +1,19 @@
+sources:
+  - run_name: qwen
+    dataset: gender
+    root: results/v2/gender/guided_zero_shot_v4/qwen/seed_17
+  - run_name: gpt_oss
+    dataset: gender
+    root: results/v2/gender/guided_zero_shot_v4/gpt_oss/seed_17
+  - run_name: qwen
+    dataset: rosbank
+    root: results/v2/rosbank/guided_zero_shot_v4/qwen/seed_17
+  - run_name: gpt_oss
+    dataset: rosbank
+    root: results/v2/rosbank/guided_zero_shot_v4/gpt_oss/seed_17
+  - run_name: qwen
+    dataset: age
+    root: results/v2/age/guided_zero_shot_v4__age_opaque/qwen/seed_17
+  - run_name: gpt_oss
+    dataset: age
+    root: results/v2/age/guided_zero_shot_v4__age_opaque/gpt_oss/seed_17

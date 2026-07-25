@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -57,11 +58,17 @@ def main():
     parser.add_argument("--gpt-model", default="Openai/Gpt-oss-120b")
     parser.add_argument("--run-roots", nargs="+", default=["results", "results/gpt_oss_120b"])
     parser.add_argument("--run-names", nargs="+", default=["qwen", "gpt_oss"])
+    parser.add_argument(
+        "--sources-config",
+        type=Path,
+        default=Path("configs/v4/grounding_sources.yaml"),
+    )
     parser.add_argument("--datasets", nargs="+", default=["gender", "age", "rosbank"])
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--allow-unverified-legacy", action="store_true")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--execute-api", action="store_true")
+    parser.add_argument("--execute-codex", action="store_true")
     parser.add_argument("--until-complete", action="store_true")
     args = parser.parse_args()
 
@@ -71,7 +78,7 @@ def main():
         return
     if args.execute_api and not args.until_complete:
         raise ValueError("--execute-api requires --until-complete")
-    if len(args.run_roots) != len(args.run_names):
+    if not args.sources_config and len(args.run_roots) != len(args.run_names):
         raise ValueError("--run-roots and --run-names must have equal lengths")
     if args.execute_api and "${" in args.local_api_base_url:
         raise ValueError("Resolve --local-api-base-url before execution")
@@ -81,12 +88,17 @@ def main():
     sample = output_dir / "grounding_samples.jsonl"
     prepare = [
         sys.executable, "scripts/prepare_grounding_sample.py",
-        "--run-roots", *args.run_roots,
-        "--run-names", *args.run_names,
         "--datasets", *args.datasets,
         "--output", str(sample),
         "--execute",
     ]
+    if args.sources_config:
+        prepare.extend(["--sources-config", str(args.sources_config)])
+    else:
+        prepare.extend([
+            "--run-roots", *args.run_roots,
+            "--run-names", *args.run_names,
+        ])
     if args.allow_unverified_legacy:
         prepare.append("--allow-unverified-legacy")
     subprocess.run(prepare, check=True)
@@ -94,8 +106,18 @@ def main():
     local_qwen = output_dir / "judge_qwen.jsonl"
     local_gpt = output_dir / "judge_gpt_oss.jsonl"
     openrouter = output_dir / "judge_openrouter.jsonl"
-    qwen_sources = [name for name in args.run_names if "gpt" in name.lower()]
-    gpt_sources = [name for name in args.run_names if "qwen" in name.lower()]
+    if args.sources_config:
+        source_payload = yaml.safe_load(
+            args.sources_config.read_text(encoding="utf-8")
+        )
+        source_names = sorted({
+            str(row["run_name"])
+            for row in source_payload.get("sources", [])
+        })
+    else:
+        source_names = args.run_names
+    qwen_sources = [name for name in source_names if "gpt" in name.lower()]
+    gpt_sources = [name for name in source_names if "qwen" in name.lower()]
     commands = [
         judge_command(sample=sample, output=local_qwen, judge_name="local_qwen",
             model=args.qwen_model, api_base_url=args.local_api_base_url,
@@ -128,6 +150,19 @@ def main():
         "blind_fields": plan["blind_fields"],
     }
     atomic_write_json(output_dir / "codex_adjudication_tasks.json", tasks)
+    codex_command = [
+        sys.executable,
+        "scripts/run_codex_grounding_adjudicator.py",
+        "--input",
+        str(summary_prefix.with_suffix(".disagreements.json")),
+        "--output",
+        str(output_dir / "codex_adjudication.json"),
+        "--model",
+        "gpt-5.5",
+    ]
+    atomic_write_json(output_dir / "codex.command.json", codex_command)
+    if args.execute_codex:
+        subprocess.run([*codex_command, "--execute-codex"], check=True)
     print(f"Completed automated grounding judges -> {output_dir}")
 
 

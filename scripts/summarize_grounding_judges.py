@@ -34,7 +34,10 @@ def majority(verdicts: list[str]) -> tuple[str, bool]:
     return adjudicate_grounding(verdicts)
 
 
-def validate_judge_records(df: pd.DataFrame, expected_judges: set[str]) -> None:
+def validate_judge_records(
+    df: pd.DataFrame,
+    expected_judges: set[str] | None = None,
+) -> None:
     required = {"sample_id", "judge_name", "evidence_hash", "verdict"}
     missing_columns = required - set(df.columns)
     if missing_columns:
@@ -43,10 +46,20 @@ def validate_judge_records(df: pd.DataFrame, expected_judges: set[str]) -> None:
         raise ValueError("Duplicate judge verdicts for the same sample_id")
     for sample_id, group in df.groupby("sample_id", sort=False):
         actual = set(group["judge_name"].dropna().astype(str))
-        if actual != expected_judges:
+        if expected_judges is not None:
+            if actual != expected_judges:
+                raise ValueError(
+                    f"Incomplete judge set for sample_id={sample_id}: "
+                    f"expected={sorted(expected_judges)}, actual={sorted(actual)}"
+                )
+        elif (
+            len(actual) != 2
+            or "openrouter" not in actual
+            or not actual.intersection({"local_qwen", "local_gpt_oss"})
+        ):
             raise ValueError(
-                f"Incomplete judge set for sample_id={sample_id}: "
-                f"expected={sorted(expected_judges)}, actual={sorted(actual)}"
+                f"Invalid source-specific judge set for sample_id={sample_id}: "
+                f"{sorted(actual)}"
             )
         hashes = set(group["evidence_hash"].dropna().astype(str))
         if len(hashes) != 1 or group["evidence_hash"].isna().any():
@@ -81,7 +94,10 @@ def main() -> None:
         expected_judges.add(judge)
         records.extend(input_records)
     df = pd.DataFrame(records)
-    validate_judge_records(df, expected_judges)
+    # Each source claim has two initial judges: OpenRouter and the opposite
+    # local model. The union of input files contains three judge names, but no
+    # individual sample should be forced to have all three.
+    validate_judge_records(df)
     args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
 
     grouped_rows = []
@@ -97,6 +113,10 @@ def main() -> None:
             "split": first.get("split"),
             "customer_id": first.get("customer_id"),
             "claim": first.get("claim"),
+            "client_stats": first.get("client_stats"),
+            "train_reference_summary": first.get("train_reference_summary"),
+            "field_semantics": first.get("field_semantics"),
+            "evidence_hash": first.get("evidence_hash"),
             "majority_verdict": maj,
             "has_majority": has_majority,
             "strict_consensus": len(set(verdicts)) == 1,
