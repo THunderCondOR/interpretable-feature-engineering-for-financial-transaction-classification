@@ -1,0 +1,11 @@
+cluster_candidates:
+  - distance_threshold: 0.01
+  - n_clusters: 200
+  - n_clusters: 400
+  - n_clusters: 800
+
+min_client_coverage: 5
+feature_encoding: binary
+selection_metric: balanced_accuracy
+selection_tie_margin: 0.005
+ml_seeds: [17, 101, 947]

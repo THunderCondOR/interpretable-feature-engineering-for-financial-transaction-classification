@@ -53,6 +53,19 @@ def _unique(occurrences):
     return texts, np.asarray(mapping, dtype=np.int32)
 
 
+def unique_claim_space(records):
+    """Return the canonical atomic-claim space used by every clustering runner."""
+    occurrences = claim_occurrences(records)
+    if not occurrences:
+        raise ValueError("No claims found")
+    texts, occurrence_to_unique = _unique(occurrences)
+    return {
+        "occurrences": occurrences,
+        "texts": texts,
+        "occurrence_to_unique": occurrence_to_unique,
+    }
+
+
 def _normal(values):
     values = np.asarray(values, dtype=np.float32)
     norms = np.linalg.norm(values, axis=1, keepdims=True)
@@ -116,6 +129,74 @@ def _cluster(embeddings, settings):
     return AgglomerativeClustering(**kwargs).fit_predict(embeddings).astype(np.int32)
 
 
+def fit_agglomerative_hierarchy(embeddings):
+    """Fit one complete average-linkage tree reusable for threshold and fixed-K cuts."""
+    values = np.asarray(embeddings, dtype=np.float32)
+    if len(values) < 2:
+        return {
+            "children": np.empty((0, 2), dtype=np.int64),
+            "distances": np.empty(0, dtype=np.float64),
+            "n_samples": int(len(values)),
+        }
+    clusterer = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=0.0,
+        metric="cosine",
+        linkage="average",
+        compute_distances=True,
+    ).fit(values)
+    return {
+        "children": np.asarray(clusterer.children_, dtype=np.int64),
+        "distances": np.asarray(clusterer.distances_, dtype=np.float64),
+        "n_samples": int(len(values)),
+    }
+
+
+def cut_agglomerative_hierarchy(
+    hierarchy,
+    *,
+    n_clusters=None,
+    distance_threshold=None,
+):
+    """Cut a saved sklearn hierarchy without repeating the O(n²) tree fit."""
+    n_samples = int(hierarchy["n_samples"])
+    if n_samples == 0:
+        return np.empty(0, dtype=np.int32)
+    if n_samples == 1:
+        return np.zeros(1, dtype=np.int32)
+    if (n_clusters is None) == (distance_threshold is None):
+        raise ValueError("Specify exactly one of n_clusters or distance_threshold")
+    children = np.asarray(hierarchy["children"], dtype=np.int64)
+    if n_clusters is not None:
+        target = min(max(int(n_clusters), 1), n_samples)
+        merge_count = n_samples - target
+    else:
+        distances = np.asarray(hierarchy["distances"], dtype=np.float64)
+        merge_count = int(np.searchsorted(
+            distances,
+            float(distance_threshold),
+            side="right",
+        ))
+
+    active = set(range(n_samples))
+    for merge_index, (left, right) in enumerate(children[:merge_count]):
+        active.discard(int(left))
+        active.discard(int(right))
+        active.add(n_samples + merge_index)
+
+    labels = np.empty(n_samples, dtype=np.int32)
+    for label, root in enumerate(sorted(active)):
+        stack = [int(root)]
+        while stack:
+            node = stack.pop()
+            if node < n_samples:
+                labels[node] = label
+            else:
+                left, right = children[node - n_samples]
+                stack.extend((int(left), int(right)))
+    return labels
+
+
 def _centroid(values):
     center = values.mean(axis=0)
     return center / max(float(np.linalg.norm(center)), 1e-12)
@@ -123,10 +204,10 @@ def _centroid(values):
 
 def fit_semantic_space(config, train_records, *, embedder: Embedder = embed_texts):
     """Fit from train texts only. Labels below are post-hoc metadata."""
-    occurrences = claim_occurrences(train_records)
-    if not occurrences:
-        raise ValueError("No train claims found")
-    texts, occurrence_to_unique = _unique(occurrences)
+    space = unique_claim_space(train_records)
+    occurrences = space["occurrences"]
+    texts = space["texts"]
+    occurrence_to_unique = space["occurrence_to_unique"]
     model_name = config.get("clustering", {}).get(
         "embedding_model", config.get("pipeline", {}).get("embedding_model", "tf-idf")
     )
@@ -137,6 +218,38 @@ def fit_semantic_space(config, train_records, *, embedder: Embedder = embed_text
     )
     settings = _settings(config)
     raw_ids = _cluster(embeddings, settings)
+    return build_semantic_model_from_partition(
+        config,
+        occurrences=occurrences,
+        texts=texts,
+        occurrence_to_unique=occurrence_to_unique,
+        embeddings=embeddings,
+        raw_ids=raw_ids,
+        embedding_transformer=embedding_transformer,
+        embedding_state_signature=embedding_state_signature,
+        train_records=train_records,
+        embedder=embedder,
+    )
+
+
+def build_semantic_model_from_partition(
+    config,
+    *,
+    occurrences,
+    texts,
+    occurrence_to_unique,
+    embeddings,
+    raw_ids,
+    embedding_transformer=None,
+    embedding_state_signature=None,
+    train_records=None,
+    embedder: Embedder = embed_texts,
+):
+    """Build the frozen semantic model from a label-agnostic train partition."""
+    model_name = config.get("clustering", {}).get(
+        "embedding_model", config.get("pipeline", {}).get("embedding_model", "tf-idf")
+    )
+    settings = _settings(config)
     centroids, metadata = [], []
     for raw_id in sorted(set(raw_ids.tolist())):
         unique_indices = np.flatnonzero(raw_ids == raw_id)
@@ -176,34 +289,112 @@ def fit_semantic_space(config, train_records, *, embedder: Embedder = embed_text
             "model": model_name,
             "embedding_state_signature": embedding_state_signature,
             "settings": settings,
+            "partition": np.asarray(raw_ids, dtype=np.int32).tolist(),
         }),
     }
-    model.update(fit_supervised_selection(config, transform_semantic_space(config, train_records, model, embedder=embedder)))
+    if train_records is not None:
+        model.update(fit_supervised_selection(
+            config,
+            transform_semantic_space(
+                config,
+                train_records,
+                model,
+                embedder=embedder,
+            ),
+        ))
+    else:
+        model.update({
+            "selected_feature_names": model["feature_names"],
+            "selection_scores": {},
+            "selection_mode": "disabled",
+        })
     return model
 
 
 def transform_semantic_space(config, records, model, *, embedder: Embedder = embed_texts):
     """Assign any split to frozen train centroids without consulting labels."""
-    occurrences = claim_occurrences(records)
-    texts, occurrence_to_unique = _unique(occurrences)
+    space = unique_claim_space(records)
+    occurrences = space["occurrences"]
+    texts = space["texts"]
+    occurrence_to_unique = space["occurrence_to_unique"]
+    embeddings = transform_text_embedding_space(
+        texts,
+        model["embedding_model"],
+        model.get("embedding_transformer"),
+        embedder=embedder,
+    )
+    features, _ = transform_precomputed_claim_space(
+        records,
+        space,
+        embeddings,
+        model,
+    )
+    return features
+
+
+def nearest_centroid_assignments(
+    embeddings,
+    centroids,
+    *,
+    max_distance,
+    batch_size=2048,
+):
+    """Assign embeddings in bounded-memory batches."""
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    centroids = np.asarray(centroids, dtype=np.float32)
+    nearest = np.full(len(embeddings), -1, dtype=np.int32)
+    nearest_distance = np.full(len(embeddings), np.inf, dtype=np.float32)
+    for start in range(0, len(embeddings), int(batch_size)):
+        stop = min(start + int(batch_size), len(embeddings))
+        distances = cosine_distances(embeddings[start:stop], centroids)
+        local_nearest = distances.argmin(axis=1)
+        local_distance = distances[
+            np.arange(stop - start),
+            local_nearest,
+        ]
+        accepted = local_distance <= float(max_distance)
+        accepted_indices = np.flatnonzero(accepted) + start
+        nearest[accepted_indices] = local_nearest[accepted].astype(np.int32)
+        nearest_distance[start:stop] = local_distance.astype(np.float32)
+    return nearest, nearest_distance
+
+
+def transform_precomputed_claim_space(records, space, embeddings, model):
+    """Build client features and auditable occurrence assignments."""
+    occurrences = space["occurrences"]
+    occurrence_to_unique = np.asarray(
+        space["occurrence_to_unique"],
+        dtype=np.int32,
+    )
     vectors = {
         int(row["customer_id"]): np.zeros(len(model["feature_names"]), dtype=np.float32)
         for row in records
     }
-    if texts:
-        embeddings = transform_text_embedding_space(
-            texts,
-            model["embedding_model"],
-            model.get("embedding_transformer"),
-            embedder=embedder,
-        )
-        distances = cosine_distances(embeddings, model["centroids"])
-        nearest = distances.argmin(axis=1)
-        accepted = distances.min(axis=1) <= model["settings"]["max_assign_distance"]
-        for occurrence_index, row in enumerate(occurrences):
-            unique_index = occurrence_to_unique[occurrence_index]
-            if accepted[unique_index]:
-                vectors[row["customer_id"]][int(nearest[unique_index])] += 1.0
+    unique_assignments, unique_distances = nearest_centroid_assignments(
+        embeddings,
+        model["centroids"],
+        max_distance=model["settings"]["max_assign_distance"],
+    )
+    assignment_rows = []
+    for occurrence_index, row in enumerate(occurrences):
+        unique_index = int(occurrence_to_unique[occurrence_index])
+        cluster_index = int(unique_assignments[unique_index])
+        if cluster_index >= 0:
+            vectors[row["customer_id"]][cluster_index] += 1.0
+        assignment_rows.append({
+            "claim_id": row["claim_id"],
+            "customer_id": int(row["customer_id"]),
+            "label": int(row.get("label", -1)),
+            "normalized_text": row["normalized_text"],
+            "cluster_index": cluster_index,
+            "cluster_id": (
+                model["cluster_meta"][cluster_index]["cluster_id"]
+                if cluster_index >= 0
+                else None
+            ),
+            "assignment_distance": float(unique_distances[unique_index]),
+            "assigned": bool(cluster_index >= 0),
+        })
     encoding, rows = model["settings"]["feature_encoding"], []
     for record in records:
         cid, values = int(record["customer_id"]), vectors[int(record["customer_id"])]
@@ -216,7 +407,7 @@ def transform_semantic_space(config, records, model, *, embedder: Embedder = emb
         row = {"customer_id": cid, "label": int(record.get("label", -1))}
         row.update(dict(zip(model["feature_names"], values.astype(float))))
         rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), pd.DataFrame(assignment_rows)
 
 
 def fit_supervised_selection(config, train_features):

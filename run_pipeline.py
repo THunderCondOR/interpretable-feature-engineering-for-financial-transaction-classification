@@ -391,6 +391,17 @@ def main() -> None:
             "Refusing to write to a legacy output directory. Use a versioned v2 config "
             "or pass --allow-legacy-output explicitly."
         )
+    if (
+        set(steps) & {"cot_features", "ml"}
+        and str(config.get("experiment", {}).get("run_id", "")).startswith(
+            "reviewer-v4-english-"
+        )
+    ):
+        raise RuntimeError(
+            "v4 API result roots are immutable. Run downstream clustering and "
+            "ML with scripts/run_v4_offline_pipeline.py --source-root "
+            f"{config['output']['base_dir']} instead."
+        )
 
     if config.get("experiment"):
         manifest_path = ensure_run_manifest(config, repo_root=Path(__file__).parent)

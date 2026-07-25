@@ -38,7 +38,10 @@ def share(part: float, whole: float) -> float:
 
 def build_handcrafted_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     if config["dataset"]["name"] == "rosbank":
-        return build_rosbank_handcrafted_features(df)
+        return build_rosbank_handcrafted_features(
+            df,
+            observation_end=config.get("dataset", {}).get("observation_end"),
+        )
     return build_generic_handcrafted_features(
         df,
         amount_semantics=config.get("dataset", {}).get(
@@ -148,7 +151,11 @@ def build_generic_handcrafted_features(
     return pd.DataFrame(records).fillna(0)
 
 
-def build_rosbank_handcrafted_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_rosbank_handcrafted_features(
+    df: pd.DataFrame,
+    *,
+    observation_end: str | None = None,
+) -> pd.DataFrame:
     records = []
     for customer_id, client in df.groupby("customer_id", sort=False):
         label = int(client["label"].iloc[0])
@@ -192,6 +199,15 @@ def build_rosbank_handcrafted_features(df: pd.DataFrame) -> pd.DataFrame:
         if "period_of_day" in client.columns:
             for period in ["утро", "день", "вечер", "ночь"]:
                 row[f"share_{period}"] = float((client["period_of_day"] == period).mean())
+        if client["tr_datetime"].notna().any():
+            ordered = client.sort_values("tr_datetime")
+            start, end = ordered["tr_datetime"].min(), ordered["tr_datetime"].max()
+            if observation_end:
+                fixed_end = pd.Timestamp(observation_end)
+                row["recency_days"] = max(
+                    float((fixed_end - end).total_seconds() / 86400.0),
+                    0.0,
+                )
         if client["tr_datetime"].notna().any() and n_txn >= 4:
             ordered = client.sort_values("tr_datetime")
             start, end = ordered["tr_datetime"].min(), ordered["tr_datetime"].max()
