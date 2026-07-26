@@ -33,6 +33,15 @@ dataset:
   primary_metric: roc_auc
   splits: {}
 
+llm:
+  api_base_url: "${API_BASE_URL}"
+  api_key: "${API_KEY}"
+  default_model: "Openai/Gpt-oss-120b"
+  max_tokens: 8192
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+
 prompts:
   base_dir: "."
   language: en

@@ -248,6 +248,8 @@ def test_cv_config_binds_pilot_to_inner_train_only(tmp_path):
         "val": "inner_validation",
     }
     assert config["pipeline"]["prompt_context_apply_client_filter"] is True
+    assert config["llm"]["api_base_url"] == "${API_BASE_URL}"
+    assert config["llm"]["api_key"] == "${API_KEY}"
     assert config["dataset"]["client_ids_by_split"]["train"].endswith(
         "inner_train_ids.json"
     )
