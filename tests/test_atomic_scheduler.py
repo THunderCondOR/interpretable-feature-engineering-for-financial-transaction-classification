@@ -14,6 +14,14 @@ def limited():
     return {"response": None, "error": "429 too many requests", "error_type": "RateLimitError", "rate_limited": True}
 
 
+def not_found():
+    return {
+        "response": None,
+        "error": "Model 'test' not found",
+        "error_type": "NotFoundError",
+    }
+
+
 def config(tmp_path, name="worker"):
     return {
         "initial_concurrency": 64, "fallback_concurrency": 10,
@@ -215,6 +223,56 @@ def test_permanent_api_error_blocks_without_retrying(tmp_path):
     with pytest.raises(RuntimeError, match="Permanent API failure"):
         asyncio.run(scheduler.run([1], execute))
     assert attempts == 1
+
+
+def test_model_not_found_waits_hour_and_retries_three_times(tmp_path):
+    state = config(tmp_path)
+    state.update({
+        "not_found_cooldown_seconds": 3600,
+        "not_found_max_retries": 3,
+    })
+    attempts, sleeps = 0, []
+
+    async def execute(window, _concurrency):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 3:
+            return [(index, not_found()) for index, _ in window]
+        return [(index, ok(index)) for index, _ in window]
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    result = asyncio.run(
+        AtomicAdaptiveScheduler(state, sleep=sleep).run([1], execute)
+    )
+    assert attempts == 4
+    assert sleeps == [3600, 3600, 3600]
+    assert result[0]["response"] == "ok-0"
+
+
+def test_model_not_found_blocks_after_three_hourly_retries(tmp_path):
+    state = config(tmp_path)
+    state.update({
+        "not_found_cooldown_seconds": 3600,
+        "not_found_max_retries": 3,
+    })
+    attempts, sleeps = 0, []
+
+    async def execute(window, _concurrency):
+        nonlocal attempts
+        attempts += 1
+        return [(index, not_found()) for index, _ in window]
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    with pytest.raises(RuntimeError, match="three|3 hourly"):
+        asyncio.run(
+            AtomicAdaptiveScheduler(state, sleep=sleep).run([1], execute)
+        )
+    assert attempts == 4
+    assert sleeps == [3600, 3600, 3600]
 
 
 def test_until_complete_is_not_limited_by_default_window_attempt_cap(tmp_path):

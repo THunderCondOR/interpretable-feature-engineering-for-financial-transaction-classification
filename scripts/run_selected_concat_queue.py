@@ -41,6 +41,11 @@ CELLS = tuple(
     for dataset in ("rosbank", "gender", "age")
 )
 DEFAULT_K = (0, 5, 10, 20, 50, 100, 200)
+MIXTURES = {
+    "handcrafted": "selected_concat",
+    "standard": "selected_standard_concat",
+    "all": "selected_all_concat",
+}
 
 
 def atomic_jsonl(path: Path, rows: list[dict]) -> None:
@@ -94,8 +99,39 @@ def xgb(config: dict, params: dict, seed: int) -> XGBClassifier:
     )
 
 
-def run_cell(cell: Path, *, tie_margin: float, candidates: tuple[int, ...]) -> dict:
-    output = cell / "selected_concat"
+def prefixed_pack(pack: dict, prefix: str) -> dict:
+    columns = list(pack["columns"])
+    rename = {column: f"{prefix}{column}" for column in columns}
+    return {
+        split: pack[split].rename(columns=rename)
+        for split in ("train", "val", "test")
+    } | {"columns": [rename[column] for column in columns]}
+
+
+def build_base_pack(packs: dict, mixture: str) -> dict:
+    if mixture in {"standard", "handcrafted"}:
+        return packs[mixture]
+    standard = prefixed_pack(packs["standard"], "std__")
+    handcrafted = prefixed_pack(packs["handcrafted"], "hc__")
+    frames = {
+        split: merge_feature_frames(standard[split], handcrafted[split])
+        for split in ("train", "val", "test")
+    }
+    return {
+        **frames,
+        "columns": [*standard["columns"], *handcrafted["columns"]],
+    }
+
+
+def run_cell(
+    cell: Path,
+    *,
+    mixture: str,
+    tie_margin: float,
+    candidates: tuple[int, ...],
+) -> dict:
+    feature_set = MIXTURES[mixture]
+    output = cell / feature_set
     metrics_path = output / "metrics.json"
     predictions_path = output / "predictions.jsonl"
     selection_path = cell / "cluster_selection.json"
@@ -111,8 +147,11 @@ def run_cell(cell: Path, *, tie_margin: float, candidates: tuple[int, ...]) -> d
 
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
     ordered = selection["selected_representation"]["selected_feature_names"]
-    packs = build_feature_sets(derived, ["handcrafted", "cot"])
-    handcrafted, cot = packs["handcrafted"], packs["cot"]
+    requested = ["cot", mixture] if mixture != "all" else [
+        "standard", "handcrafted", "cot"
+    ]
+    packs = build_feature_sets(derived, requested)
+    base, cot = build_base_pack(packs, mixture), packs["cot"]
     ordered = [name for name in ordered if name in cot["columns"]]
     available_k = sorted({min(value, len(ordered)) for value in candidates})
     source_files = [
@@ -121,7 +160,7 @@ def run_cell(cell: Path, *, tie_margin: float, candidates: tuple[int, ...]) -> d
         *(Path(path) for path in derived["dataset"]["splits"].values()),
     ]
     signature = fingerprint({
-        "stage": "selected_concat_v1",
+        "stage": f"{feature_set}_v1",
         "inputs": files_fingerprint(source_files),
         "candidates": available_k,
         "tie_margin": tie_margin,
@@ -134,16 +173,17 @@ def run_cell(cell: Path, *, tie_margin: float, candidates: tuple[int, ...]) -> d
 
     frames = {}
     for split in ("train", "val", "test"):
-        frames[split] = merge_feature_frames(handcrafted[split], cot[split])
-    hc_columns = handcrafted["columns"]
-    x_train_hc, y_train = split_xy(frames["train"], hc_columns)
-    x_val_hc, y_val = split_xy(frames["val"], hc_columns)
+        frames[split] = merge_feature_frames(base[split], cot[split])
+    base_columns = base["columns"]
+    _, y_train = split_xy(frames["train"], base_columns)
+    _, y_val = split_xy(frames["val"], base_columns)
     existing_ml = json.loads((cell / "ml_metrics.json").read_text(encoding="utf-8"))
-    base_params = existing_ml["handcrafted"]["xgboost"]["params"]
+    parameter_source = mixture if mixture != "all" else "standard"
+    base_params = existing_ml[parameter_source]["xgboost"]["params"]
 
     sweep = []
     for count in available_k:
-        columns = [*hc_columns, *ordered[:count]]
+        columns = [*base_columns, *ordered[:count]]
         x_train, _ = split_xy(frames["train"], columns)
         x_val, _ = split_xy(frames["val"], columns)
         model = xgb(derived, base_params, 17)
@@ -157,7 +197,7 @@ def run_cell(cell: Path, *, tie_margin: float, candidates: tuple[int, ...]) -> d
         })
     selected = choose_smallest_near_best(sweep, tie_margin)
     selected_k = int(selected["n_cluster_features"])
-    columns = [*hc_columns, *ordered[:selected_k]]
+    columns = [*base_columns, *ordered[:selected_k]]
 
     if selected_k == 0:
         params = base_params
@@ -193,7 +233,7 @@ def run_cell(cell: Path, *, tie_margin: float, candidates: tuple[int, ...]) -> d
             probabilities = model.predict_proba(values)
             for index, customer_id in enumerate(frames[split]["customer_id"]):
                 row = {
-                    "feature_set": "selected_concat",
+                    "feature_set": feature_set,
                     "classifier": "xgboost",
                     "seed": int(seed),
                     "split": split,
@@ -211,7 +251,8 @@ def run_cell(cell: Path, *, tie_margin: float, candidates: tuple[int, ...]) -> d
 
     payload = {
         "artifact_signature": signature,
-        "feature_set": "selected_concat",
+        "feature_set": feature_set,
+        "base_feature_set": mixture,
         "selection": {
             "metric": "validation_balanced_accuracy",
             "tie_margin": tie_margin,
@@ -244,6 +285,12 @@ def main() -> None:
     parser.add_argument("--tie-margin", type=float, default=0.005)
     parser.add_argument("--candidates", nargs="+", type=int, default=list(DEFAULT_K))
     parser.add_argument("--poll-seconds", type=int, default=60)
+    parser.add_argument(
+        "--mixtures",
+        nargs="+",
+        choices=tuple(MIXTURES),
+        default=["handcrafted"],
+    )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--wait", action="store_true")
     args = parser.parse_args()
@@ -254,6 +301,7 @@ def main() -> None:
         "wait": args.wait,
         "tie_margin": args.tie_margin,
         "candidates": sorted(set(args.candidates)),
+        "mixtures": args.mixtures,
         "cells": [
             str(args.derived_root / dataset / model / "seed_17")
             for dataset, model in CELLS
@@ -270,27 +318,29 @@ def main() -> None:
     state_path = args.derived_root / "selected_concat_queue.json"
     state = {**plan, "state": "running", "completed": [], "failed": None}
     atomic_write_json(state_path, state)
-    for dataset, model in CELLS:
-        key = f"{dataset}:{model}"
-        state["current"] = key
-        atomic_write_json(state_path, state)
-        try:
-            run_cell(
-                args.derived_root / dataset / model / "seed_17",
-                tie_margin=args.tie_margin,
-                candidates=tuple(sorted(set(args.candidates))),
-            )
-        except Exception as error:
-            state["state"] = "failed"
-            state["failed"] = {
-                "cell": key,
-                "type": type(error).__name__,
-                "message": str(error),
-            }
+    for mixture in args.mixtures:
+        for dataset, model in CELLS:
+            key = f"{mixture}:{dataset}:{model}"
+            state["current"] = key
             atomic_write_json(state_path, state)
-            raise
-        state["completed"].append(key)
-        atomic_write_json(state_path, state)
+            try:
+                run_cell(
+                    args.derived_root / dataset / model / "seed_17",
+                    mixture=mixture,
+                    tie_margin=args.tie_margin,
+                    candidates=tuple(sorted(set(args.candidates))),
+                )
+            except Exception as error:
+                state["state"] = "failed"
+                state["failed"] = {
+                    "cell": key,
+                    "type": type(error).__name__,
+                    "message": str(error),
+                }
+                atomic_write_json(state_path, state)
+                raise
+            state["completed"].append(key)
+            atomic_write_json(state_path, state)
     state["state"] = "completed"
     state["current"] = None
     state["finished_at"] = datetime.now(timezone.utc).isoformat()

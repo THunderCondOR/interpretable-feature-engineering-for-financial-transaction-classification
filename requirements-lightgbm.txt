@@ -1,0 +1,2 @@
+# Optional dependency for the PTLS-compatible downstream evaluator.
+lightgbm>=4.0,<5

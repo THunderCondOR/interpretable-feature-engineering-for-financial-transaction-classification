@@ -12,6 +12,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import os
 import platform
 import subprocess
 import sys
@@ -216,6 +217,29 @@ def ensure_run_manifest(config: dict[str, Any], *, repo_root: str | Path = ".") 
         with open(path, encoding="utf-8") as file:
             existing = json.load(file)
         if existing.get("manifest_sha256") != candidate["manifest_sha256"]:
+            # A scheduler-only hotfix may need to resume an already paid,
+            # content-addressed generation without rewriting its immutable
+            # provenance. This opt-in is intentionally environment-scoped and
+            # accepts only a Git-revision difference; configs, inputs, prompts,
+            # client selections, and package versions must remain identical.
+            resume_across_revision = os.environ.get(
+                "ALLOW_SCHEDULER_CODE_RESUME", ""
+            ).lower() in {"1", "true", "yes"}
+            stable_fields = (
+                "config_sha256",
+                "dataset_files",
+                "client_selection_files",
+                "prompt_files",
+                "prompt_context",
+            )
+            same_generation_contract = all(
+                existing.get(field) == candidate.get(field)
+                for field in stable_fields
+            ) and existing.get("runtime", {}).get("packages") == candidate.get(
+                "runtime", {}
+            ).get("packages")
+            if resume_across_revision and same_generation_contract:
+                return path
             raise RuntimeError(
                 f"Output directory {out_dir} belongs to an incompatible experiment: "
                 f"manifest identity {existing.get('manifest_sha256')} != "

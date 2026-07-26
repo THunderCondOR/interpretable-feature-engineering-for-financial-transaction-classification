@@ -12,9 +12,10 @@ WindowExecutor = Callable[[list[tuple[int, Any]], int], Awaitable[list[tuple[int
 WindowCommitter = Callable[[list[tuple[int, dict]]], None]
 
 PERMANENT_ERRORS = {
-    "AuthenticationError", "PermissionDeniedError", "NotFoundError",
-    "BadRequestError", "ConfigurationError", "ModelNotFoundError",
+    "AuthenticationError", "PermissionDeniedError",
+    "BadRequestError", "ConfigurationError",
 }
+NOT_FOUND_ERRORS = {"NotFoundError", "ModelNotFoundError"}
 TRANSIENT_ERRORS = {
     "APITimeoutError", "APIConnectionError", "InternalServerError",
     "TimeoutError", "ConnectionError", "HTTPStatusError",
@@ -32,11 +33,27 @@ def is_permanent_exception(exc: BaseException) -> bool:
             "invalid token",
             "authentication failed",
             "permission denied",
-            "model not found",
-            "unknown model",
             "http 401",
             "http 403",
         )
+    )
+
+
+def is_not_found_exception(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    message = str(exc).lower()
+    return name in NOT_FOUND_ERRORS or any(
+        marker in message
+        for marker in ("model not found", "unknown model", "model_not_found")
+    )
+
+
+def is_not_found(result: dict) -> bool:
+    error_type = str(result.get("error_type") or "")
+    message = str(result.get("error") or "").lower()
+    return error_type in NOT_FOUND_ERRORS or any(
+        marker in message
+        for marker in ("model not found", "unknown model", "model_not_found")
     )
 
 
@@ -78,6 +95,12 @@ class AtomicAdaptiveScheduler:
         self.recovery_windows = int(config.get("recovery_clean_batches", config.get("rate_limit_recovery_batches", 10)))
         self.cooldown = float(config.get("cooldown_seconds", config.get("rate_limit_cooldown_seconds", 60)))
         self.backoff = float(config.get("retry_backoff", 2))
+        self.not_found_cooldown = float(
+            config.get("not_found_cooldown_seconds", 3600)
+        )
+        self.not_found_max_retries = int(
+            config.get("not_found_max_retries", 3)
+        )
         configured_attempts = int(config.get("max_window_attempts", 20))
         # Paid overnight runs explicitly guarded by --until-complete keep
         # retrying repairable windows. Permanent auth/model/config errors are
@@ -94,6 +117,7 @@ class AtomicAdaptiveScheduler:
             self.serial,
             self.low_rate_limit_attempts,
             self.recovery_windows,
+            self.not_found_max_retries,
         ]
         if self.max_attempts is not None:
             positive_values.append(self.max_attempts)
@@ -127,12 +151,16 @@ class AtomicAdaptiveScheduler:
         clean_windows: int,
         consecutive_low_429: int,
         probe_from: str | None,
+        not_found_retries: int,
+        not_found_retry_at: float | None,
     ) -> dict:
         return {
             "mode": mode,
             "clean_windows": clean_windows,
             "consecutive_low_429": consecutive_low_429,
             "probe_from": probe_from,
+            "not_found_retries": not_found_retries,
+            "not_found_retry_at": not_found_retry_at,
             "generation_signature": self.signature,
         }
 
@@ -147,6 +175,8 @@ class AtomicAdaptiveScheduler:
             "clean_windows": 0,
             "consecutive_low_429": 0,
             "probe_from": None,
+            "not_found_retries": 0,
+            "not_found_retry_at": None,
         }
         path = self._adaptive_state_path()
         if not path or not path.is_file():
@@ -170,6 +200,10 @@ class AtomicAdaptiveScheduler:
                 int(payload.get("consecutive_low_429", 0)), 0
             ),
             "probe_from": payload.get("probe_from"),
+            "not_found_retries": max(
+                int(payload.get("not_found_retries", 0)), 0
+            ),
+            "not_found_retry_at": payload.get("not_found_retry_at"),
         }
 
     def _write_pending(
@@ -184,6 +218,8 @@ class AtomicAdaptiveScheduler:
         clean_windows,
         consecutive_low_429,
         probe_from,
+        not_found_retries,
+        not_found_retry_at,
     ):
         path = self._pending_path()
         if path:
@@ -193,6 +229,8 @@ class AtomicAdaptiveScheduler:
                 "clean_windows": clean_windows,
                 "consecutive_low_429": consecutive_low_429,
                 "probe_from": probe_from,
+                "not_found_retries": not_found_retries,
+                "not_found_retry_at": not_found_retry_at,
                 "generation_signature": self.signature,
             })
 
@@ -213,6 +251,8 @@ class AtomicAdaptiveScheduler:
         clean_windows = state["clean_windows"]
         consecutive_low_429 = state["consecutive_low_429"]
         probe_from = state["probe_from"]
+        not_found_retries = state["not_found_retries"]
+        not_found_retry_at = state["not_found_retry_at"]
         pending_path = self._pending_path()
         if pending_path and pending_path.exists():
             try:
@@ -237,6 +277,19 @@ class AtomicAdaptiveScheduler:
                             0,
                         )
                         probe_from = pending.get("probe_from", probe_from)
+                        not_found_retries = max(
+                            int(
+                                pending.get(
+                                    "not_found_retries",
+                                    not_found_retries,
+                                )
+                            ),
+                            0,
+                        )
+                        not_found_retry_at = pending.get(
+                            "not_found_retry_at",
+                            not_found_retry_at,
+                        )
                         self._event("pending_batch_recovered", start=offset, ordered_request_keys=pending_keys)
                     else:
                         self._event("pending_batch_ignored", reason="request_order_changed")
@@ -245,6 +298,25 @@ class AtomicAdaptiveScheduler:
         attempt_by_offset: Counter[int] = Counter()
 
         while offset < len(indexed):
+            if not_found_retry_at is not None:
+                remaining = max(float(not_found_retry_at) - time.time(), 0.0)
+                if remaining:
+                    self._event(
+                        "model_not_found_cooldown_resumed",
+                        retry_in=remaining,
+                        retry=not_found_retries,
+                        max_retries=self.not_found_max_retries,
+                    )
+                    await self.sleep(remaining)
+                not_found_retry_at = None
+                self._persist_state(
+                    mode=mode,
+                    clean_windows=clean_windows,
+                    consecutive_low_429=consecutive_low_429,
+                    probe_from=probe_from,
+                    not_found_retries=not_found_retries,
+                    not_found_retry_at=None,
+                )
             concurrency = {
                 "high": self.high,
                 "fallback": self.low,
@@ -267,6 +339,8 @@ class AtomicAdaptiveScheduler:
                 clean_windows=clean_windows,
                 consecutive_low_429=consecutive_low_429,
                 probe_from=probe_from,
+                not_found_retries=not_found_retries,
+                not_found_retry_at=not_found_retry_at,
             )
             self._event("window_started", batch_id=batch_id, start=offset, size=len(window), concurrency=concurrency, mode=mode, attempt=attempt)
             try:
@@ -275,6 +349,40 @@ class AtomicAdaptiveScheduler:
                 self._event("window_interrupted", batch_id=batch_id)
                 raise
             except Exception as exc:
+                if is_not_found_exception(exc):
+                    if not_found_retries >= self.not_found_max_retries:
+                        self._event(
+                            "stage_blocked",
+                            batch_id=batch_id,
+                            errors={type(exc).__name__: 1},
+                            reason="model_not_found_retries_exhausted",
+                        )
+                        raise RuntimeError(
+                            "Permanent API failure after "
+                            f"{self.not_found_max_retries} hourly model-not-found "
+                            f"retries: {type(exc).__name__}: {exc}"
+                        ) from exc
+                    not_found_retries += 1
+                    not_found_retry_at = time.time() + self.not_found_cooldown
+                    self._persist_state(
+                        mode=mode,
+                        clean_windows=clean_windows,
+                        consecutive_low_429=consecutive_low_429,
+                        probe_from=probe_from,
+                        not_found_retries=not_found_retries,
+                        not_found_retry_at=not_found_retry_at,
+                    )
+                    self._event(
+                        "window_rolled_back",
+                        batch_id=batch_id,
+                        reason="model_not_found",
+                        retry=not_found_retries,
+                        max_retries=self.not_found_max_retries,
+                        retry_in=self.not_found_cooldown,
+                    )
+                    await self.sleep(self.not_found_cooldown)
+                    not_found_retry_at = None
+                    continue
                 if is_permanent_exception(exc):
                     self._event(
                         "stage_blocked",
@@ -290,6 +398,56 @@ class AtomicAdaptiveScheduler:
 
             errors = Counter(str(result.get("error_type") or "UnknownAPIError") for _, result in batch_results if result.get("error"))
             error_details = _error_details(batch_results, keys)
+            if any(is_not_found(result) for _, result in batch_results):
+                if not_found_retries >= self.not_found_max_retries:
+                    self._event(
+                        "stage_blocked",
+                        batch_id=batch_id,
+                        errors=dict(errors),
+                        error_details=error_details,
+                        reason="model_not_found_retries_exhausted",
+                    )
+                    raise RuntimeError(
+                        "Permanent API failure after "
+                        f"{self.not_found_max_retries} hourly model-not-found "
+                        f"retries: {dict(errors)}"
+                    )
+                not_found_retries += 1
+                not_found_retry_at = time.time() + self.not_found_cooldown
+                self._persist_state(
+                    mode=mode,
+                    clean_windows=clean_windows,
+                    consecutive_low_429=consecutive_low_429,
+                    probe_from=probe_from,
+                    not_found_retries=not_found_retries,
+                    not_found_retry_at=not_found_retry_at,
+                )
+                self._write_pending(
+                    batch_id=batch_id,
+                    keys=window_keys,
+                    start=offset,
+                    concurrency=concurrency,
+                    attempt=attempt,
+                    mode=mode,
+                    clean_windows=clean_windows,
+                    consecutive_low_429=consecutive_low_429,
+                    probe_from=probe_from,
+                    not_found_retries=not_found_retries,
+                    not_found_retry_at=not_found_retry_at,
+                )
+                self._event(
+                    "window_rolled_back",
+                    batch_id=batch_id,
+                    reason="model_not_found",
+                    errors=dict(errors),
+                    error_details=error_details,
+                    retry=not_found_retries,
+                    max_retries=self.not_found_max_retries,
+                    retry_in=self.not_found_cooldown,
+                )
+                await self.sleep(self.not_found_cooldown)
+                not_found_retry_at = None
+                continue
             if any(str(result.get("error_type")) in PERMANENT_ERRORS for _, result in batch_results):
                 self._event(
                     "stage_blocked",
@@ -325,6 +483,8 @@ class AtomicAdaptiveScheduler:
                     clean_windows=clean_windows,
                     consecutive_low_429=consecutive_low_429,
                     probe_from=probe_from,
+                    not_found_retries=not_found_retries,
+                    not_found_retry_at=not_found_retry_at,
                 )
                 # pending_batch.json is the crash boundary for the current
                 # uncommitted window.  Rewrite it with the *new* limiter state
@@ -345,6 +505,8 @@ class AtomicAdaptiveScheduler:
                     clean_windows=clean_windows,
                     consecutive_low_429=consecutive_low_429,
                     probe_from=probe_from,
+                    not_found_retries=not_found_retries,
+                    not_found_retry_at=not_found_retry_at,
                 )
                 self._event(
                     "window_rolled_back",
@@ -396,6 +558,8 @@ class AtomicAdaptiveScheduler:
             for index, result in ordered_results:
                 results[index] = result
             offset += len(window)
+            not_found_retries = 0
+            not_found_retry_at = None
             self._clear_pending()
             committed_mode = mode
             if mode == "serial":
@@ -432,6 +596,8 @@ class AtomicAdaptiveScheduler:
                 clean_windows=clean_windows,
                 consecutive_low_429=consecutive_low_429,
                 probe_from=probe_from,
+                not_found_retries=not_found_retries,
+                not_found_retry_at=not_found_retry_at,
             )
             self._event(
                 "window_committed",
