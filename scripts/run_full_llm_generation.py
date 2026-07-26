@@ -35,9 +35,13 @@ from src.experiments.config_builder import (  # noqa: E402
     slug,
     write_runtime_config,
 )
+from src.data.entity_ids import EntityId, canonical_entity_id
 
 
-DATASETS = tuple(EXPECTED_CLIENT_COUNTS)
+DATASETS = tuple(EXPECTED_CLIENT_COUNTS) + (
+    "datafusion_education",
+    "berka",
+)
 SPLITS = ("train", "val", "test")
 LLM_STEPS = ("stats", "prompts", "cot", "llm_eval", "claims")
 
@@ -86,7 +90,9 @@ def pipeline_command(config_path: Path, splits: list[str]) -> list[str]:
     ]
 
 
-def _selected_client_ids(config: dict[str, Any], split: str) -> set[int] | None:
+def _selected_client_ids(
+    config: dict[str, Any], split: str
+) -> set[EntityId] | None:
     selection = config.get("dataset", {}).get("client_ids_by_split", {}).get(split)
     if selection is None:
         return None
@@ -94,29 +100,39 @@ def _selected_client_ids(config: dict[str, Any], split: str) -> set[int] | None:
         selection = json.loads(Path(selection).read_text(encoding="utf-8"))
     if not isinstance(selection, (list, tuple, set)):
         raise ValueError(f"Unsupported client filter for {split}: {selection!r}")
-    return {int(value) for value in selection}
+    return {canonical_entity_id(value) for value in selection}
 
 
 def expected_ids_by_split(
     config: dict[str, Any],
     splits: list[str],
-) -> dict[str, set[int]]:
+) -> dict[str, set[EntityId]]:
     """Read only customer columns and enforce the declared full-run counts."""
     dataset = config["dataset"]
     customer_column = dataset["columns"]["customer_id"]
     declared = dataset.get("expected_client_counts", {})
-    result: dict[str, set[int]] = {}
+    result: dict[str, set[EntityId]] = {}
     for split in splits:
         input_path = Path(dataset["splits"][split])
         if not input_path.is_file():
             raise FileNotFoundError(f"Missing {split} input: {input_path}")
-        identifiers: set[int] = set()
-        for chunk in pd.read_csv(
-            input_path,
-            usecols=[customer_column],
-            chunksize=250_000,
-        ):
-            identifiers.update(int(value) for value in chunk[customer_column].dropna())
+        identifiers: set[EntityId] = set()
+        if input_path.suffix.lower() in {".parquet", ".pq"}:
+            frame = pd.read_parquet(input_path, columns=[customer_column])
+            identifiers.update(
+                canonical_entity_id(value)
+                for value in frame[customer_column].dropna().unique()
+            )
+        else:
+            for chunk in pd.read_csv(
+                input_path,
+                usecols=[customer_column],
+                chunksize=250_000,
+            ):
+                identifiers.update(
+                    canonical_entity_id(value)
+                    for value in chunk[customer_column].dropna()
+                )
         selected = _selected_client_ids(config, split)
         if selected is not None:
             missing_selection = selected - identifiers
@@ -149,7 +165,9 @@ def validate_prompt_inputs(config: dict[str, Any]) -> None:
             raise FileNotFoundError(f"Missing prompt template: {path}")
 
 
-def _records_by_customer(path: Path, expected_ids: set[int]) -> dict[int, dict[str, Any]]:
+def _records_by_customer(
+    path: Path, expected_ids: set[EntityId]
+) -> dict[EntityId, dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(f"Missing required output: {path}")
     records: dict[int, dict[str, Any]] = {}
@@ -159,7 +177,7 @@ def _records_by_customer(path: Path, expected_ids: set[int]) -> dict[int, dict[s
                 continue
             try:
                 record = json.loads(line)
-                customer_id = int(record["customer_id"])
+                customer_id = canonical_entity_id(record["customer_id"])
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"Malformed record at {path}:{line_number}: {exc}") from exc
             if customer_id in records:
@@ -177,7 +195,7 @@ def _records_by_customer(path: Path, expected_ids: set[int]) -> dict[int, dict[s
 def _validate_split_outputs(
     config: dict[str, Any],
     split: str,
-    expected_ids: set[int],
+    expected_ids: set[EntityId],
 ) -> dict[str, Any]:
     stats = _records_by_customer(
         split_artifact_path(config, "clients_stats", split), expected_ids
@@ -273,7 +291,7 @@ def _validate_split_outputs(
 def validate_completion(
     config: dict[str, Any],
     splits: list[str],
-    expected_ids: dict[str, set[int]],
+    expected_ids: dict[str, set[EntityId]],
 ) -> dict[str, Any]:
     """Return immutable evidence only when every requested cell is complete."""
     split_evidence = {
@@ -308,6 +326,9 @@ def completion_payload(
         "label_semantics": config["experiment"].get(
             "label_semantics", "standard"
         ),
+        "protocol": config.get("cv", {}).get("protocol"),
+        "fold": config.get("cv", {}).get("fold"),
+        "fold_signature": config.get("cv", {}).get("fold_signature"),
         "splits": splits,
         "expected_counts": {split: int(expected_counts[split]) for split in splits},
         "manifest_sha256": evidence["manifest_sha256"],
@@ -421,10 +442,13 @@ def main() -> None:
                 f"observed={observed_identity}, expected={expected_identity}"
             )
         declared_counts = config.get("dataset", {}).get("expected_client_counts", {})
-        selection_counts = selection.get(
-            "full_expected_client_counts",
-            EXPECTED_CLIENT_COUNTS[args.dataset],
-        )
+        selection_counts = selection.get("full_expected_client_counts")
+        if selection_counts is None:
+            selection_counts = EXPECTED_CLIENT_COUNTS.get(args.dataset)
+        if selection_counts is None:
+            raise RuntimeError(
+                "Selection artifact must declare full_expected_client_counts"
+            )
         selection_counts = {
             str(split): int(count)
             for split, count in selection_counts.items()

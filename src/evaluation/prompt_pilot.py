@@ -6,7 +6,8 @@ from collections import Counter
 from typing import Any
 
 import numpy as np
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score
+from src.data.entity_ids import canonical_entity_id
 
 
 ZERO_SHOT = "guided_zero_shot_v4"
@@ -16,6 +17,130 @@ PILOT_VARIANTS = (ZERO_SHOT, FS1, FS2)
 AGE_OPAQUE = "age_opaque"
 AGE_ORDERED = "age_ordered"
 AGE_LABEL_SEMANTICS = (AGE_OPAQUE, AGE_ORDERED)
+
+
+def _score(metric: str, truth: np.ndarray, prediction: np.ndarray) -> float:
+    if metric == "balanced_accuracy":
+        return float(balanced_accuracy_score(truth, prediction))
+    if metric == "roc_auc":
+        if len(np.unique(truth)) < 2:
+            raise ValueError("ROC-AUC requires both classes")
+        return float(roc_auc_score(truth, prediction))
+    if metric == "positive_f1":
+        return float(f1_score(truth, prediction, pos_label=1, zero_division=0))
+    raise ValueError(f"Unsupported prompt-selection metric: {metric}")
+
+
+def paired_primary_metric_delta(
+    zero_rows: list[dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+    *,
+    metric: str,
+    samples: int = 2000,
+    seed: int = 137,
+) -> dict[str, float | int | str]:
+    """Paired stratified bootstrap for a dataset-specific primary metric."""
+    zero = {
+        canonical_entity_id(row["customer_id"]): row for row in zero_rows
+    }
+    candidate = {
+        canonical_entity_id(row["customer_id"]): row for row in candidate_rows
+    }
+    if set(zero) != set(candidate) or not zero:
+        raise ValueError("Pilot variants must contain identical non-empty IDs")
+    ordered = sorted(set(zero), key=lambda value: (str(type(value)), str(value)))
+    truth = np.asarray([int(zero[cid]["label"]) for cid in ordered], dtype=int)
+    zero_prediction = np.asarray(
+        [int(zero[cid]["predicted"]) for cid in ordered], dtype=int
+    )
+    candidate_prediction = np.asarray(
+        [int(candidate[cid]["predicted"]) for cid in ordered], dtype=int
+    )
+    if any(
+        int(candidate[cid]["label"]) != int(zero[cid]["label"])
+        for cid in ordered
+    ):
+        raise ValueError("Pilot variants disagree on labels")
+    point = _score(metric, truth, candidate_prediction) - _score(
+        metric, truth, zero_prediction
+    )
+    rng = np.random.default_rng(seed)
+    groups = [np.flatnonzero(truth == label) for label in np.unique(truth)]
+    deltas = []
+    for _ in range(int(samples)):
+        sampled = np.concatenate(
+            [rng.choice(group, size=len(group), replace=True) for group in groups]
+        )
+        deltas.append(
+            _score(metric, truth[sampled], candidate_prediction[sampled])
+            - _score(metric, truth[sampled], zero_prediction[sampled])
+        )
+    low, high = np.quantile(deltas, [0.025, 0.975])
+    return {
+        "metric": metric,
+        "delta": float(point),
+        "ci_low": float(low),
+        "ci_high": float(high),
+        "confidence": 0.95,
+        "method": "paired_stratified_client_bootstrap",
+        "n_bootstrap": int(samples),
+        "seed": int(seed),
+    }
+
+
+def select_prompt_variant_by_metric(
+    metrics: dict[str, dict[str, Any]],
+    paired_deltas: dict[str, dict[str, Any]],
+    *,
+    metric: str,
+) -> dict[str, Any]:
+    """Apply the >2pp rule using the benchmark's published primary metric."""
+    variants = {
+        "guided_zero_shot_v5": "zero",
+        "guided_factual_fs1_v5": "fs1",
+        "guided_factual_fs2_v5": "fs2",
+    }
+    zero, fs1, fs2 = variants
+    if zero not in metrics:
+        raise ValueError(f"Missing zero-shot metrics for {metric}")
+    threshold, epsilon = 0.02, 1e-12
+    qualified = []
+    decisions = {}
+    baseline = float(metrics[zero][metric])
+    for variant in (fs1, fs2):
+        if variant not in metrics or variant not in paired_deltas:
+            continue
+        delta = float(metrics[variant][metric]) - baseline
+        ci_low = float(paired_deltas[variant]["ci_low"])
+        passed = delta > threshold + epsilon and ci_low > 0.0
+        decisions[variant] = {
+            "metric": metric,
+            "delta": delta,
+            "paired_ci_low": ci_low,
+            "strict_gain_over_2pp": delta > threshold + epsilon,
+            "paired_ci_excludes_zero": ci_low > 0.0,
+            "qualified": passed,
+        }
+        if passed:
+            qualified.append(variant)
+    if not qualified:
+        selected = zero
+    elif len(qualified) == 1:
+        selected = qualified[0]
+    else:
+        fs1_score = float(metrics[fs1][metric])
+        fs2_score = float(metrics[fs2][metric])
+        selected = fs1 if abs(fs1_score - fs2_score) <= 0.005 else max(
+            qualified, key=lambda name: float(metrics[name][metric])
+        )
+    return {
+        "selected_variant": selected,
+        "primary_metric": metric,
+        "selection_threshold": 0.02,
+        "paired_ci_lower_bound_must_exceed": 0.0,
+        "fs1_tie_margin": 0.005,
+        "candidate_decisions": decisions,
+    }
 
 
 def paired_balanced_accuracy_delta(

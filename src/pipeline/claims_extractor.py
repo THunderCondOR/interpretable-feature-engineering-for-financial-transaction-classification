@@ -20,6 +20,7 @@ from src.pipeline.semantic_features import normalize_claim
 from src.utils.async_api import batched_query
 from src.utils.event_log import append_structured_event
 from src.utils.prompt_parsing import extract_json_list
+from src.data.entity_ids import EntityId, canonical_entity_id
 
 
 def _behavioral_text(explanation: str) -> str:
@@ -50,14 +51,14 @@ def _split_path(config: dict, key: str, split: str | None) -> Path:
 
 
 def load_explanations(path: str | Path) -> list[list[dict]]:
-    by_client: dict[int, list] = {}
+    by_client: dict[EntityId, list] = {}
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             rec = json.loads(line)
-            cid = int(rec["customer_id"])
+            cid = canonical_entity_id(rec["customer_id"])
             by_client.setdefault(cid, []).append(rec)
     return list(by_client.values())
 
@@ -68,8 +69,8 @@ def _claims_successful(record: dict) -> bool:
 
 def _load_successful_claims(
     path: Path,
-    expected_signatures: dict[int, dict[str, str]],
-) -> dict[int, dict]:
+    expected_signatures: dict[EntityId, dict[str, str]],
+) -> dict[EntityId, dict]:
     if not path.exists():
         return {}
     successful = {}
@@ -85,7 +86,7 @@ def _load_successful_claims(
             except json.JSONDecodeError:
                 error_types["MalformedJSONL"] += 1
                 continue
-            cid = int(record["customer_id"])
+            cid = canonical_entity_id(record["customer_id"])
             expected = expected_signatures.get(cid)
             compatible = bool(expected) and all(
                 record.get(key) == value for key, value in expected.items()
@@ -196,7 +197,11 @@ def _parse_claim_result(
         return [], "InvalidAPIResponse", str(exc)
 
 
-def _write_claim_records(path: Path, ordered_clients: list[int], records: dict[int, dict]) -> None:
+def _write_claim_records(
+    path: Path,
+    ordered_clients: list[EntityId],
+    records: dict[EntityId, dict],
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
     with open(temp_path, "w", encoding="utf-8") as file:
@@ -229,13 +234,13 @@ def _attach_claim_records(record: dict) -> None:
     record["claim_records"] = [
         {
             "claim_id": fingerprint({
-                "customer_id": int(record["customer_id"]),
+                "customer_id": canonical_entity_id(record["customer_id"]),
                 "source_explanation_hash": source_hash,
                 "extractor_signature": extractor,
                 "normalized_text": normalize_claim(claim),
                 "occurrence": index,
             })[:20],
-            "customer_id": int(record["customer_id"]),
+            "customer_id": canonical_entity_id(record["customer_id"]),
             "source_explanation_hash": source_hash,
             "generation_run": generation_run,
             "extractor_signature": extractor,
@@ -299,13 +304,15 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
     client_groups = load_explanations(load_path)
     print(f"Loaded explanations for {len(client_groups)} clients from {load_path}")
 
-    ordered_clients = [int(group[0]["customer_id"]) for group in client_groups]
+    ordered_clients = [
+        canonical_entity_id(group[0]["customer_id"]) for group in client_groups
+    ]
     expected_client_set = set(ordered_clients)
-    selected_by_client: dict[int, list[dict]] = {}
-    invalid_behavioral_by_client: dict[int, int] = {}
-    expected_signatures: dict[int, dict[str, str]] = {}
+    selected_by_client: dict[EntityId, list[dict]] = {}
+    invalid_behavioral_by_client: dict[EntityId, int] = {}
+    expected_signatures: dict[EntityId, dict[str, str]] = {}
     for group in client_groups:
-        cid = int(group[0]["customer_id"])
+        cid = canonical_entity_id(group[0]["customer_id"])
         valid = []
         invalid_behavioral = 0
         for record in group:
@@ -358,7 +365,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
 
     all_dialogues, meta = [], []
     for group in client_groups:
-        cid = int(group[0]["customer_id"])
+        cid = canonical_entity_id(group[0]["customer_id"])
         if cid in claims_by_client:
             continue
         selected = selected_by_client[cid]
@@ -417,7 +424,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
         f"max_tokens={llm_cfg['max_tokens']}"
     )
 
-    request_errors: dict[int, list[tuple[str, str]]] = {}
+    request_errors: dict[EntityId, list[tuple[str, str]]] = {}
     content_error_counts: Counter[str] = Counter()
     content_error_attempts: Counter[int] = Counter()
     content_error_last_reasons: dict[int, str] = {}
@@ -494,7 +501,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                 for idx, result in batch_results:
                     item_meta = pass_meta[idx]
                     original_index = pass_indices[idx]
-                    cid = int(item_meta["customer_id"])
+                    cid = canonical_entity_id(item_meta["customer_id"])
                     parsed, error_type, error = _parse_claim_result(
                         result, forbidden_labels=forbidden_labels
                     )

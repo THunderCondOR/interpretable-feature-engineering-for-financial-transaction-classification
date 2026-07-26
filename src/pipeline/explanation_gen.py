@@ -21,9 +21,10 @@ from src.data.prompt_locale import contains_cyrillic
 from src.utils.async_api import batched_query
 from src.utils.event_log import append_structured_event
 from src.utils.prompt_parsing import extract_boxed_answer, normalize_text_label
+from src.data.entity_ids import EntityId, canonical_entity_id, entity_sort_key
 
 
-RequestKey = tuple[int, int]
+RequestKey = tuple[EntityId, int]
 
 
 def _behavioral_text(explanation: str) -> str:
@@ -70,7 +71,10 @@ def _split_path(config: dict, key: str, split: str | None) -> Path:
 
 
 def _request_key(record: dict) -> RequestKey:
-    return int(record["customer_id"]), int(record.get("sample_id", 0))
+    return (
+        canonical_entity_id(record["customer_id"]),
+        int(record.get("sample_id", 0)),
+    )
 
 
 def _is_successful(record: dict) -> bool:
@@ -362,7 +366,7 @@ def run_explanation_generation(
             meta["prompt_hash"] = rec.get("prompt_hash") or fingerprint({
                 "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
-                "customer_id": int(rec["customer_id"]),
+                "customer_id": canonical_entity_id(rec["customer_id"]),
             })
             meta["client_stats_hash"] = rec.get("client_stats_hash")
             meta["summary_stats_hash"] = rec.get("summary_stats_hash")
@@ -415,14 +419,14 @@ def run_explanation_generation(
             ).items():
                 customer_id, sample_id = str(raw_key).split(":", 1)
                 content_error_attempts[
-                    (int(customer_id), int(sample_id))
+                    (canonical_entity_id(customer_id), int(sample_id))
                 ] = int(attempts)
             for raw_key, reason in prior_validation.get(
                 "last_reasons_by_request", {}
             ).items():
                 customer_id, sample_id = str(raw_key).split(":", 1)
                 content_error_last_reasons[
-                    (int(customer_id), int(sample_id))
+                    (canonical_entity_id(customer_id), int(sample_id))
                 ] = str(reason)
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             print(
@@ -463,11 +467,21 @@ def run_explanation_generation(
                 ),
                 "attempts_by_request": {
                     f"{key[0]}:{key[1]}": attempts
-                    for key, attempts in sorted(content_error_attempts.items())
+                    for key, attempts in sorted(
+                        content_error_attempts.items(),
+                        key=lambda item: (
+                            entity_sort_key(item[0][0]), item[0][1]
+                        ),
+                    )
                 },
                 "last_reasons_by_request": {
                     f"{key[0]}:{key[1]}": reason
-                    for key, reason in sorted(content_error_last_reasons.items())
+                    for key, reason in sorted(
+                        content_error_last_reasons.items(),
+                        key=lambda item: (
+                            entity_sort_key(item[0][0]), item[0][1]
+                        ),
+                    )
                 },
             },
         }
