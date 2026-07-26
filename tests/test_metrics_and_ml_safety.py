@@ -6,6 +6,7 @@ import pytest
 from scripts.run_gender_v2 import _metric
 from src.models.ml_baseline import (
     build_handcrafted_features,
+    build_llm_profile_features,
     merge_feature_frames,
     prediction_artifact_complete,
     validate_client_feature_frame,
@@ -130,5 +131,39 @@ def test_age_handcrafted_uses_unsigned_transaction_value_names():
     assert features.loc[0, "median_transaction_value"] == 20.0
     assert not any(
         "income" in column or "expense" in column
+        for column in features.columns
+    )
+
+
+def test_llm_profile_features_match_client_prompt_facts_without_class_stats():
+    frame = pd.DataFrame(
+        {
+            "customer_id": [1, 1, 2],
+            "label": [0, 0, 1],
+            "amount": [-10.0, -30.0, -5.0],
+            "tr_datetime": pd.to_datetime(
+                ["2024-01-01", "2024-01-03", "2024-01-02"]
+            ),
+            "mcc_code_desc": ["food", "travel", "food"],
+        }
+    )
+    features = build_llm_profile_features(
+        frame,
+        {
+            "dataset": {
+                "name": "gender",
+                "amount_semantics": "signed_cashflow",
+            }
+        },
+    ).set_index("customer_id")
+
+    assert features.loc[1, "profile__transactions_per_client"] == 2
+    assert features.loc[1, "profile__calendar_span_days"] == 3
+    assert features.loc[1, "profile__median_outflow"] == 20
+    assert features.loc[1, "profile__mcc_food_share"] == 0.5
+    assert features.loc[1, "profile__mcc_travel_outflow"] == 30
+    assert "label" in features.columns
+    assert not any(
+        "class" in column or "reference" in column
         for column in features.columns
     )

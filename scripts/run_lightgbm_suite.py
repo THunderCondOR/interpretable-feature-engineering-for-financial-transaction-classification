@@ -69,9 +69,26 @@ def ptls_parameters(dataset: str) -> dict:
     }
 
 
+def prefixed_pack_for_lightgbm(pack: dict, prefix: str) -> dict:
+    columns = list(pack["columns"])
+    mapping = {column: f"{prefix}{column}" for column in columns}
+    return {
+        split: pack[split].rename(columns=mapping)
+        for split in ("train", "val", "test")
+    } | {"columns": [mapping[column] for column in columns]}
+
+
 def feature_packs(config: dict) -> dict[str, dict]:
     packs = build_feature_sets(
-        config, ["standard", "handcrafted", "cot", "concat"]
+        config,
+        [
+            "standard",
+            "llm_profile",
+            "standard_profile",
+            "handcrafted",
+            "cot",
+            "concat",
+        ],
     )
     standard_cot = {
         split: merge_feature_frames(
@@ -84,17 +101,26 @@ def feature_packs(config: dict) -> dict[str, dict]:
         for column in standard_cot["train"].columns
         if column not in {"customer_id", "label"}
     ]
+    standard_profile_cot = {
+        split: merge_feature_frames(
+            packs["standard_profile"][split], packs["cot"][split]
+        )
+        for split in ("train", "val", "test")
+    }
+    standard_profile_cot["columns"] = [
+        column
+        for column in standard_profile_cot["train"].columns
+        if column not in {"customer_id", "label"}
+    ]
     # Standard and handcrafted contain overlapping generic names. Prefix both
     # namespaces before combining them so no signal is silently discarded.
-    renamed = {}
-    for name, prefix in (("standard", "std__"), ("handcrafted", "hc__")):
-        columns = packs[name]["columns"]
-        mapping = {column: f"{prefix}{column}" for column in columns}
-        renamed[name] = {
-            split: packs[name][split].rename(columns=mapping)
-            for split in ("train", "val", "test")
-        }
-        renamed[name]["columns"] = [mapping[column] for column in columns]
+    renamed = {
+        name: prefixed_pack_for_lightgbm(packs[name], prefix)
+        for name, prefix in (
+            ("standard", "std__"),
+            ("handcrafted", "hc__"),
+        )
+    }
     all_features = {}
     for split in ("train", "val", "test"):
         base = merge_feature_frames(
@@ -106,10 +132,29 @@ def feature_packs(config: dict) -> dict[str, dict]:
         for column in all_features["train"].columns
         if column not in {"customer_id", "label"}
     ]
+    standard_profile = prefixed_pack_for_lightgbm(
+        packs["standard_profile"], "stdp__"
+    )
+    handcrafted = prefixed_pack_for_lightgbm(
+        packs["handcrafted"], "hc__"
+    )
+    all_profile = {}
+    for split in ("train", "val", "test"):
+        base = merge_feature_frames(
+            standard_profile[split], handcrafted[split]
+        )
+        all_profile[split] = merge_feature_frames(base, packs["cot"][split])
+    all_profile["columns"] = [
+        column
+        for column in all_profile["train"].columns
+        if column not in {"customer_id", "label"}
+    ]
     return {
         **packs,
         "standard_cot": standard_cot,
+        "standard_profile_cot": standard_profile_cot,
         "all": all_features,
+        "all_profile": all_profile,
     }
 
 
@@ -129,8 +174,9 @@ def main() -> None:
         "cv_folds": args.folds,
         "random_state": 42,
         "feature_sets": [
-            "standard", "handcrafted", "cot", "concat",
-            "standard_cot", "all",
+            "standard", "llm_profile", "standard_profile",
+            "handcrafted", "cot", "concat", "standard_cot",
+            "standard_profile_cot", "all", "all_profile",
         ],
         "cells": [
             str(args.derived_root / dataset / model / "seed_17")

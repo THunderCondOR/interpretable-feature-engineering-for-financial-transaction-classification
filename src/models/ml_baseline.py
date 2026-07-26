@@ -2,6 +2,8 @@
 
 Supported feature sets:
 - standard: generic amount aggregates and category pivots;
+- llm_profile: the label-agnostic client facts shown in the LLM prompt;
+- standard_profile: standard + llm_profile;
 - handcrafted: deterministic transaction aggregates;
 - cot: train-fitted CoT cluster features;
 - concat: handcrafted + CoT features merged by customer_id and label.
@@ -21,11 +23,19 @@ from sklearn.tree import DecisionTreeClassifier, export_text
 from xgboost import XGBClassifier
 
 from src.data.loader import add_features, load_dataset
+from src.data.profiles import amount_semantics, client_feature_frame
 from src.experiments.artifacts import files_fingerprint, stage_signature
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-EXPERIMENTS = {"standard", "handcrafted", "cot", "concat"}
+EXPERIMENTS = {
+    "standard",
+    "llm_profile",
+    "standard_profile",
+    "handcrafted",
+    "cot",
+    "concat",
+}
 
 
 def safe_name(value: str) -> str:
@@ -97,6 +107,63 @@ def build_standard_features(df: pd.DataFrame) -> pd.DataFrame:
 
     features = pd.concat([base] + pivots, axis=1).fillna(0)
     return labels.join(features, how="left").fillna(0).reset_index()
+
+
+def build_llm_profile_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Build the label-agnostic numeric facts exposed in each client prompt.
+
+    This intentionally excludes the label-conditioned training reference. That
+    reference is shared prompt context, not a client feature, and folding it
+    into Standard would turn the baseline into supervised feature engineering.
+    """
+    features = client_feature_frame(df, config).set_index("customer_id")
+    feature_columns = [
+        column for column in features.columns if column != "label"
+    ]
+    features = features.rename(
+        columns={column: f"profile__{column}" for column in feature_columns}
+    )
+
+    category_counts = (
+        df.groupby(["customer_id", "mcc_code_desc"], observed=True)
+        .size()
+        .unstack("mcc_code_desc", fill_value=0)
+    )
+    category_counts.columns = [
+        f"profile__mcc_{safe_name(category)}_count"
+        for category in category_counts.columns
+    ]
+    denominators = df.groupby("customer_id").size().replace(0, np.nan)
+    category_shares = category_counts.div(denominators, axis=0).fillna(0)
+    category_shares.columns = [
+        column.removesuffix("_count") + "_share"
+        for column in category_counts.columns
+    ]
+    features = features.join(category_counts, how="left").join(
+        category_shares, how="left"
+    )
+
+    # The Gender prompt additionally shows positive outflow magnitude by
+    # category. Preserve that semantic separation instead of relying on a
+    # signed per-category sum that can cancel inflows and outflows.
+    if amount_semantics(config) == "signed_cashflow":
+        outflows = df.loc[df["amount"] < 0].copy()
+        if not outflows.empty:
+            outflows["_outflow"] = -outflows["amount"]
+            outflow_pivot = (
+                outflows.groupby(
+                    ["customer_id", "mcc_code_desc"], observed=True
+                )["_outflow"]
+                .sum()
+                .unstack("mcc_code_desc", fill_value=0)
+            )
+            outflow_pivot.columns = [
+                f"profile__mcc_{safe_name(category)}_outflow"
+                for category in outflow_pivot.columns
+            ]
+            features = features.join(outflow_pivot, how="left")
+
+    return features.fillna(0).reset_index()
 
 
 def build_generic_handcrafted_features(
@@ -407,17 +474,47 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
     }
 
     feature_sets = {}
-    if "standard" in requested:
+    if requested & {"standard", "standard_profile"}:
         standard_train_raw = build_standard_features(train_df)
         standard_val_raw = build_standard_features(val_df)
         standard_test_raw = build_standard_features(test_df)
         standard_cols = feature_columns(standard_train_raw)
-        feature_sets["standard"] = {
+        standard_pack = {
             "train": align_features(standard_train_raw, standard_cols),
             "val": align_features(standard_val_raw, standard_cols),
             "test": align_features(standard_test_raw, standard_cols),
             "columns": standard_cols,
         }
+        if "standard" in requested:
+            feature_sets["standard"] = standard_pack
+
+    if requested & {"llm_profile", "standard_profile"}:
+        profile_train_raw = build_llm_profile_features(train_df, config)
+        profile_val_raw = build_llm_profile_features(val_df, config)
+        profile_test_raw = build_llm_profile_features(test_df, config)
+        profile_cols = feature_columns(profile_train_raw)
+        profile_pack = {
+            "train": align_features(profile_train_raw, profile_cols),
+            "val": align_features(profile_val_raw, profile_cols),
+            "test": align_features(profile_test_raw, profile_cols),
+            "columns": profile_cols,
+        }
+        if "llm_profile" in requested:
+            feature_sets["llm_profile"] = profile_pack
+        if "standard_profile" in requested:
+            combined = {
+                split: merge_feature_frames(
+                    standard_pack[split], profile_pack[split]
+                )
+                for split in ("train", "val", "test")
+            }
+            feature_sets["standard_profile"] = {
+                **combined,
+                "columns": [
+                    *standard_pack["columns"],
+                    *profile_pack["columns"],
+                ],
+            }
 
     if "handcrafted" in requested or "concat" in requested:
         hc_train_raw = build_handcrafted_features(train_df, config)

@@ -44,7 +44,9 @@ DEFAULT_K = (0, 5, 10, 20, 50, 100, 200)
 MIXTURES = {
     "handcrafted": "selected_concat",
     "standard": "selected_standard_concat",
+    "standard_profile": "selected_standard_profile_concat",
     "all": "selected_all_concat",
+    "all_profile": "selected_all_profile_concat",
 }
 
 
@@ -109,9 +111,12 @@ def prefixed_pack(pack: dict, prefix: str) -> dict:
 
 
 def build_base_pack(packs: dict, mixture: str) -> dict:
-    if mixture in {"standard", "handcrafted"}:
+    if mixture in {"standard", "standard_profile", "handcrafted"}:
         return packs[mixture]
-    standard = prefixed_pack(packs["standard"], "std__")
+    standard_name = (
+        "standard_profile" if mixture == "all_profile" else "standard"
+    )
+    standard = prefixed_pack(packs[standard_name], "std__")
     handcrafted = prefixed_pack(packs["handcrafted"], "hc__")
     frames = {
         split: merge_feature_frames(standard[split], handcrafted[split])
@@ -147,9 +152,12 @@ def run_cell(
 
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
     ordered = selection["selected_representation"]["selected_feature_names"]
-    requested = ["cot", mixture] if mixture != "all" else [
-        "standard", "handcrafted", "cot"
-    ]
+    if mixture == "all":
+        requested = ["standard", "handcrafted", "cot"]
+    elif mixture == "all_profile":
+        requested = ["standard_profile", "handcrafted", "cot"]
+    else:
+        requested = ["cot", mixture]
     packs = build_feature_sets(derived, requested)
     base, cot = build_base_pack(packs, mixture), packs["cot"]
     ordered = [name for name in ordered if name in cot["columns"]]
@@ -178,7 +186,11 @@ def run_cell(
     _, y_train = split_xy(frames["train"], base_columns)
     _, y_val = split_xy(frames["val"], base_columns)
     existing_ml = json.loads((cell / "ml_metrics.json").read_text(encoding="utf-8"))
-    parameter_source = mixture if mixture != "all" else "standard"
+    parameter_source = (
+        mixture
+        if mixture in {"standard", "handcrafted"}
+        else "standard"
+    )
     base_params = existing_ml[parameter_source]["xgboost"]["params"]
 
     sweep = []
