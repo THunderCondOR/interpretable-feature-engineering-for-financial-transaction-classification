@@ -75,6 +75,14 @@ METRIC_DISPLAY_NAMES = {
     "outgoing_transfer_share": "Share of outgoing card-to-card transfers",
     "recency_days": "Days from the last transaction to the observation end",
     "second_to_first_activity_ratio": "Second-half / first-half activity ratio",
+    "credit_operation_share": "Share of credit operations",
+    "debit_operation_share": "Share of debit operations",
+    "mean_balance": "Mean observed account balance",
+    "median_balance": "Median observed account balance",
+    "minimum_balance": "Minimum observed account balance",
+    "negative_balance_share": "Share of observations with negative balance",
+    "unique_currencies": "Unique transaction currencies",
+    "dominant_currency_share": "Share of operations in the dominant currency",
 }
 
 AMOUNT_SEMANTICS_DISPLAY = {

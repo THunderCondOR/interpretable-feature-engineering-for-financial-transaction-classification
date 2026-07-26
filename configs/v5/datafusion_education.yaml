@@ -1,0 +1,62 @@
+dataset:
+  name: datafusion_education
+  benchmark_protocol: mbd_5fold_seed42
+  modality: transactions_only
+  amount_semantics: signed_cashflow
+  amount_unit: dataset_native_units
+  direction_rule: "amount > 0 is inflow; amount < 0 is outflow"
+  columns:
+    customer_id: customer_id
+    datetime: tr_datetime
+    amount: amount
+    category: mcc_code_desc
+    label: label
+  label_names:
+    "0": "no recorded higher-education qualification"
+    "1": "recorded higher-education qualification"
+  claim_forbidden_terms:
+    - higher education
+    - qualification
+  category_label: "transaction categories"
+  prompt_task_description: >-
+    Predict which proxy education-outcome class is associated with the client:
+    no recorded higher-education qualification or recorded higher-education
+    qualification.
+  prompt_dataset_guidance: >-
+    Use transaction behavior only. You may form cautious behavioral or
+    lifestyle hypotheses when they are supported by the observed transactions,
+    but do not treat occupation, income, family status, or education as known
+    facts and do not use external social stereotypes as independent evidence.
+  label_semantics: standard
+  num_labels: 2
+  metric: roc_auc
+  primary_metric: roc_auc
+  splits: {}
+
+prompts:
+  base_dir: "."
+  language: en
+  contract_version: evidence_bounded_v5
+  category_mapping_version: en_v1
+  system: prompts/common/explanation_generation/system_prompt.txt
+  user: prompts/common/explanation_generation/user_prompt.txt
+  claims_system: prompts/common/claims_extraction/system_prompt.txt
+  claims_user: prompts/common/claims_extraction/user_prompt.txt
+
+pipeline:
+  event_features: minimal
+  n_explanation_samples: 1
+  n_claims_samples: 1
+  claims_max_tokens: 2048
+  few_shot_per_class: 0
+  embedding_model: "all-MiniLM-L6-v2"
+  min_behavioral_explanation_chars: 1
+
+output:
+  base_dir: results/v5/datafusion_education
+  summary_stats: summary_stats.txt
+  clients_stats: clients_stats.jsonl
+  prompts: prompts.jsonl
+  explanations: explanations.jsonl
+  claims: claims.jsonl
+  metrics: metrics.json

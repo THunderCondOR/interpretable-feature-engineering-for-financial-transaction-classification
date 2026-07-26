@@ -96,7 +96,10 @@ def load_split(
             config,
             split,
             apply_client_filter=apply_client_filter,
-        )
+        ),
+        minimal=(
+            config.get("pipeline", {}).get("event_features") == "minimal"
+        ),
     )
 
 
@@ -115,7 +118,11 @@ def load_prompt_context(config: dict) -> pd.DataFrame:
     return load_split(
         config,
         prompt_context_split(config),
-        apply_client_filter=False,
+        apply_client_filter=bool(
+            config.get("pipeline", {}).get(
+                "prompt_context_apply_client_filter", False
+            )
+        ),
     )
 
 

@@ -14,3 +14,5 @@ torch
 tqdm
 transformers
 xgboost
+lightgbm
+catboost

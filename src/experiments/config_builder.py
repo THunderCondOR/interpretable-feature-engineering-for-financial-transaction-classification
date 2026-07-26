@@ -122,6 +122,27 @@ def _variant_overlay(variant: str) -> dict[str, Any]:
                 "few_shot_per_class": 2,
             },
         },
+        "guided_zero_shot_v5": {
+            "statistics": {"summary_profile": "robust_mean"},
+            "pipeline": {
+                "few_shot_strategy": "representative_medoid",
+                "few_shot_per_class": 0,
+            },
+        },
+        "guided_factual_fs1_v5": {
+            "statistics": {"summary_profile": "robust_mean"},
+            "pipeline": {
+                "few_shot_strategy": "representative_medoid",
+                "few_shot_per_class": 1,
+            },
+        },
+        "guided_factual_fs2_v5": {
+            "statistics": {"summary_profile": "robust_mean"},
+            "pipeline": {
+                "few_shot_strategy": "representative_medoid",
+                "few_shot_per_class": 2,
+            },
+        },
         "legacy_offline": {},
     }
     if variant not in variants:

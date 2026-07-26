@@ -25,6 +25,7 @@ from src.data.profiles import (
     format_robust_summary,
     robust_statistics_payload,
 )
+from src.data.entity_ids import canonical_entity_id
 
 
 def _filter_top_percentile(d: dict, q: float = 0.8) -> dict:
@@ -270,11 +271,13 @@ def build_all_client_stats(df: pd.DataFrame, config: dict) -> list[dict]:
     category_label = config["dataset"].get("category_label", "категории трат")
     summary_fn = get_summary_fn(config)
     records = []
-    for cid, client_df in df.groupby("customer_id", sort=False):
+    for cid, client_df in df.groupby(
+        "customer_id", sort=False, observed=True
+    ):
         label = int(client_df["label"].iloc[0]) if "label" in client_df.columns else -1
         label_name = label_names.get(str(label), "unknown") if label >= 0 else "unknown"
         records.append({
-            "customer_id": int(cid),
+            "customer_id": canonical_entity_id(cid),
             "label": label,
             "label_name": label_name,
             "client_stats": summary_fn(client_df, category_label),

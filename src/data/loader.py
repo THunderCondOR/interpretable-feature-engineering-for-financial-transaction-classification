@@ -14,6 +14,45 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
+from src.data.entity_ids import canonical_entity_series
+
+
+def _read_table(
+    path: str | os.PathLike,
+    *,
+    filter_column: str | None = None,
+    allowed: set | None = None,
+) -> pd.DataFrame:
+    path = Path(path)
+    if path.suffix.lower() in {".parquet", ".pq"}:
+        if filter_column and allowed is not None:
+            import pyarrow.dataset as ds
+
+            dataset = ds.dataset(path, format="parquet")
+            table = dataset.to_table(
+                filter=ds.field(filter_column).isin(list(allowed))
+            )
+            categorical = [
+                column for column in (
+                    filter_column, "mcc_code_desc", "currency_name",
+                    "operation_type", "operation_name", "purpose_name",
+                )
+                if column and column in table.column_names
+            ]
+            return table.to_pandas(categories=categorical)
+        table = __import__("pyarrow.parquet", fromlist=["read_table"]).read_table(
+            path
+        )
+        categorical = [
+            column for column in (
+                "customer_id", "mcc_code_desc", "currency_name",
+                "operation_type", "operation_name", "purpose_name",
+            )
+            if column in table.column_names
+        ]
+        return table.to_pandas(categories=categorical)
+    return pd.read_csv(path)
+
 
 def load_dataset(
     config: dict,
@@ -33,7 +72,6 @@ def load_dataset(
                                 mcc_code_desc, label
     """
     path = config["dataset"]["splits"][split]
-    df = pd.read_csv(path)
 
     client_filter = (
         config["dataset"].get("client_ids_by_split", {}).get(split)
@@ -46,11 +84,18 @@ def load_dataset(
                 client_filter = json.load(file)
         allowed = set(client_filter)
         source_customer_id = config["dataset"]["columns"]["customer_id"]
+        df = _read_table(
+            path,
+            filter_column=source_customer_id,
+            allowed=allowed,
+        )
         if source_customer_id not in df.columns:
             raise ValueError(f"Cannot apply client filter: missing {source_customer_id}")
         df = df[df[source_customer_id].isin(allowed)].copy()
         if df.empty and allowed:
             raise ValueError(f"Client filter for split={split} selected no rows")
+    else:
+        df = _read_table(path)
 
     col_map = config["dataset"]["columns"]
     rename = {
@@ -74,10 +119,12 @@ def load_dataset(
             f"Check column mapping in config."
         )
 
+    df["customer_id"] = canonical_entity_series(df["customer_id"])
+
     return df
 
 
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_features(df: pd.DataFrame, *, minimal: bool = False) -> pd.DataFrame:
     """
     Add derived features used by the aggregator.
     Input DataFrame must already have the internal schema.
@@ -98,6 +145,8 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     # Datetime features
     df["tr_datetime"] = pd.to_datetime(df["tr_datetime"], errors="coerce")
     df = df.sort_values(["customer_id", "tr_datetime"], ascending=[True, True])
+    if minimal:
+        return df
 
     df["hour"]    = df["tr_datetime"].dt.hour.fillna(0).astype(int)
     df["weekday"] = df["tr_datetime"].dt.weekday.fillna(0).astype(int)
@@ -109,14 +158,17 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
         lambda x: x.max() - x
     )
 
-    weekday_map = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
+    weekday_map = {
+        0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday",
+        4: "Friday", 5: "Saturday", 6: "Sunday",
+    }
     df["weekday_name"] = df["weekday"].map(weekday_map)
 
     def _hour_to_period(h):
-        if 6 <= h < 12:  return "утро"
-        elif 12 <= h < 18: return "день"
-        elif 18 <= h < 24: return "вечер"
-        else:              return "ночь"
+        if 6 <= h < 12:  return "morning"
+        elif 12 <= h < 18: return "afternoon"
+        elif 18 <= h < 24: return "evening"
+        else:              return "night"
 
     df["period_of_day"] = df["hour"].apply(_hour_to_period)
 

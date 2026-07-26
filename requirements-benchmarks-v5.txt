@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Only required while recreating the MBD-style Data Fusion fold manifests.
+# Keep this pin: the split implementation is part of the benchmark protocol.
+pyspark==3.3.3

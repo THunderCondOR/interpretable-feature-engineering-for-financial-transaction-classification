@@ -72,6 +72,25 @@ def client_numeric_profile(
         "transactions_per_active_day": _share(n_txn, active_days),
         "unique_categories": int(c["mcc_code_desc"].nunique()),
     }
+    currency_column = next(
+        (
+            column for column in ("currency_name", "currency_code")
+            if column in c.columns
+        ),
+        None,
+    )
+    if currency_column is not None:
+        # Arrow-backed Parquet columns are loaded as categoricals to keep the
+        # multi-million-row Data Fusion table compact.  Convert the small
+        # per-client slice before filling so "unknown" need not be inserted
+        # into the global categorical dictionary.
+        currency = c[currency_column].astype("string").fillna("unknown")
+        profile.update({
+            "unique_currencies": int(currency.nunique()),
+            "dominant_currency_share": float(
+                currency.value_counts(normalize=True).iloc[0]
+            ) if len(currency) else 0.0,
+        })
 
     semantics = amount_semantics(config)
     if semantics == "signed_cashflow":
@@ -97,7 +116,7 @@ def client_numeric_profile(
         })
 
     if semantics == "typed_transaction_value" and "trx_cat_ru" in c:
-        types = c["trx_cat_ru"].fillna("").astype(str).str.lower()
+        types = c["trx_cat_ru"].astype("string").fillna("").str.lower()
         profile.update({
             "card_payment_share": float(types.str.contains("оплата картой", regex=False).mean()),
             "cash_withdrawal_share": float(types.str.contains("снятие", regex=False).mean()),
@@ -113,13 +132,34 @@ def client_numeric_profile(
             profile["second_to_first_activity_ratio"] = _share(second, first)
         else:
             profile["second_to_first_activity_ratio"] = 0.0
+    elif semantics == "typed_transaction_value" and "operation_type" in c:
+        types = c["operation_type"].astype("string").fillna("").str.lower()
+        profile.update({
+            "credit_operation_share": float(types.eq("credit").mean()),
+            "debit_operation_share": float(types.eq("debit").mean()),
+        })
+        if "balance" in c:
+            balance = pd.to_numeric(c["balance"], errors="coerce").dropna()
+            profile.update({
+                "mean_balance": float(balance.mean()) if len(balance) else 0.0,
+                "median_balance": float(balance.median()) if len(balance) else 0.0,
+                "minimum_balance": float(balance.min()) if len(balance) else 0.0,
+                "negative_balance_share": float((balance < 0).mean())
+                if len(balance)
+                else 0.0,
+            })
     return profile
 
 
 def client_feature_frame(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     """Aggregate once per client; the caller must pass the intended train split."""
     end = _observation_end(config, df)
-    rows = [client_numeric_profile(group, config, observation_end=end) for _, group in df.groupby("customer_id", sort=False)]
+    rows = [
+        client_numeric_profile(group, config, observation_end=end)
+        for _, group in df.groupby(
+            "customer_id", sort=False, observed=True
+        )
+    ]
     return pd.DataFrame(rows)
 
 
@@ -152,13 +192,39 @@ def format_client_profile(client_df: pd.DataFrame, config: dict) -> str:
         "* Coverage note: this is a top-k list; an omitted category is not "
         "evidence that the client never used it."
     )
+    currency_column = next(
+        (
+            column for column in ("currency_name", "currency_code")
+            if column in client_df.columns
+        ),
+        None,
+    )
+    if currency_column is not None:
+        counts = (
+            client_df[currency_column]
+            .astype("string")
+            .fillna("unknown")
+            .value_counts()
+        )
+        lines.append(
+            "* Transaction currencies: "
+            + ", ".join(
+                f"{name}: {int(count)} ({count / len(client_df):.1%})"
+                for name, count in counts.items()
+            )
+        )
 
     semantics = amount_semantics(config)
     if semantics == "signed_cashflow":
         expenses = client_df.loc[client_df["amount"] < 0].copy()
         if not expenses.empty:
             expenses["outflow"] = -expenses["amount"]
-            by_category = expenses.groupby("mcc_code_desc")["outflow"].sum().sort_values(ascending=False).head(12)
+            by_category = (
+                expenses.groupby("mcc_code_desc", observed=True)["outflow"]
+                .sum()
+                .sort_values(ascending=False)
+                .head(12)
+            )
             lines.append("* Outflow categories by total positive outflow magnitude:")
             lines.extend(
                 f"  - {english_category(cat)}: {float(value):.2f}"
@@ -180,14 +246,24 @@ def format_client_profile(client_df: pd.DataFrame, config: dict) -> str:
             f"* P95 transaction value: {p['p95_transaction_value']:.2f}",
         ])
     if semantics == "typed_transaction_value":
-        lines.extend([
-            f"* Share of card payments: {p['card_payment_share']:.1%}",
-            f"* Share of cash withdrawals: {p['cash_withdrawal_share']:.1%}",
-            f"* Share of account deposits: {p['deposit_share']:.1%}",
-            f"* Share of outgoing card-to-card transfers: {p['outgoing_transfer_share']:.1%}",
-            f"* Days from the last transaction to the observation end: {p['recency_days']:.1f}",
-            f"* Second-half / first-half activity ratio: {p['second_to_first_activity_ratio']:.3f}",
-        ])
+        if "credit_operation_share" in p:
+            lines.extend([
+                f"* Share of credit operations: {p['credit_operation_share']:.1%}",
+                f"* Share of debit operations: {p['debit_operation_share']:.1%}",
+                f"* Mean observed account balance: {p['mean_balance']:.2f}",
+                f"* Median observed account balance: {p['median_balance']:.2f}",
+                f"* Minimum observed account balance: {p['minimum_balance']:.2f}",
+                f"* Share of observations with negative balance: {p['negative_balance_share']:.1%}",
+            ])
+        else:
+            lines.extend([
+                f"* Share of card payments: {p['card_payment_share']:.1%}",
+                f"* Share of cash withdrawals: {p['cash_withdrawal_share']:.1%}",
+                f"* Share of account deposits: {p['deposit_share']:.1%}",
+                f"* Share of outgoing card-to-card transfers: {p['outgoing_transfer_share']:.1%}",
+                f"* Days from the last transaction to the observation end: {p['recency_days']:.1f}",
+                f"* Second-half / first-half activity ratio: {p['second_to_first_activity_ratio']:.3f}",
+            ])
     return "\n".join(lines)
 
 
@@ -203,9 +279,21 @@ def robust_statistics_payload(df: pd.DataFrame, config: dict) -> dict[str, Any]:
         "n_clients": int(clients.shape[0]),
         "classes": {},
     }
-    prevalence = (df.groupby(["customer_id", "mcc_code_desc"]).size().reset_index(name="count"))
-    top_categories = (prevalence.groupby("mcc_code_desc")["customer_id"].nunique().sort_values(ascending=False).head(20).index.tolist())
-    labels_by_client = df.groupby("customer_id", sort=False)["label"].first()
+    prevalence = (
+        df.groupby(
+            ["customer_id", "mcc_code_desc"], observed=True
+        ).size().reset_index(name="count")
+    )
+    top_categories = (
+        prevalence.groupby("mcc_code_desc", observed=True)["customer_id"]
+        .nunique()
+        .sort_values(ascending=False)
+        .head(20)
+        .index.tolist()
+    )
+    labels_by_client = df.groupby(
+        "customer_id", sort=False, observed=True
+    )["label"].first()
     for label, group in clients.groupby("label", sort=True):
         class_payload: dict[str, Any] = {"label": int(label), "name": label_names.get(str(int(label)), str(int(label))), "n_clients": int(len(group)), "metrics": {}, "categories": []}
         for column in numeric:
@@ -222,7 +310,7 @@ def robust_statistics_payload(df: pd.DataFrame, config: dict) -> dict[str, Any]:
             }
         class_ids = set(group["customer_id"].tolist())
         class_counts = prevalence[prevalence["customer_id"].isin(class_ids)]
-        totals = class_counts.groupby("customer_id")["count"].sum()
+        totals = class_counts.groupby("customer_id", observed=True)["count"].sum()
         for category in top_categories:
             rows = class_counts[class_counts["mcc_code_desc"] == category].set_index("customer_id")["count"]
             shares = (rows / totals.loc[rows.index]).dropna()
@@ -281,8 +369,17 @@ def format_legacy_mean_category_summary(df: pd.DataFrame, config: dict) -> str:
     category_label = config["dataset"].get("category_label", "transaction categories")
     for label, name in config["dataset"].get("label_names", {}).items():
         group = df[df["label"] == int(label)]
-        counts = group.groupby(["customer_id", "mcc_code_desc"]).size().reset_index(name="count")
-        means = counts.groupby("mcc_code_desc")["count"].mean().sort_values(ascending=False).head(25)
+        counts = (
+            group.groupby(["customer_id", "mcc_code_desc"], observed=True)
+            .size()
+            .reset_index(name="count")
+        )
+        means = (
+            counts.groupby("mcc_code_desc", observed=True)["count"]
+            .mean()
+            .sort_values(ascending=False)
+            .head(25)
+        )
         lines.extend(["", f"## {name}", f"| {category_label} | mean count among clients using category |", "|---|---:|"])
         lines.extend(
             f"| {english_category(category)} | {value:.3f} |"

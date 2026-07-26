@@ -26,6 +26,7 @@ from src.data.prompt_locale import (
 )
 from src.data.profiles import client_feature_frame
 from src.experiments.artifacts import fingerprint
+from src.data.entity_ids import canonical_entity_id, entity_sort_key
 
 
 KNOWN_PLACEHOLDERS = {
@@ -204,7 +205,7 @@ def representative_medoid_ids(
     *,
     label_id: int,
     n_clients: int,
-) -> list[int]:
+) -> list[int | str]:
     """Choose deterministic class representatives in robust-scaled profile space."""
     profiles = client_feature_frame(train_df, config)
     numeric = [
@@ -229,11 +230,14 @@ def representative_medoid_ids(
     ranked = (
         pd.DataFrame(
             {
-                "customer_id": profiles.loc[class_mask, "customer_id"].astype(int),
+                "customer_id": profiles.loc[class_mask, "customer_id"].map(
+                    canonical_entity_id
+                ),
                 "distance": distance,
             }
         )
-        .sort_values(["distance", "customer_id"], kind="mergesort")
+        .assign(_entity_sort=lambda frame: frame["customer_id"].map(entity_sort_key))
+        .sort_values(["distance", "_entity_sort"], kind="mergesort")
     )
     return ranked["customer_id"].head(int(n_clients)).tolist()
 
@@ -286,8 +290,12 @@ def build_prompts(
     assert_english_model_text(few_shot_str, context="few-shot demonstrations")
 
     records = []
-    for cid in tqdm(df["customer_id"].unique(), desc="Building prompts"):
-        client_df = df[df["customer_id"] == cid]
+    grouped = df.groupby("customer_id", sort=False, observed=True)
+    for cid, client_df in tqdm(
+        grouped,
+        total=df["customer_id"].nunique(),
+        desc="Building prompts",
+    ):
         label = int(client_df["label"].iloc[0]) if "label" in client_df.columns else -1
         client_stats = summary_fn(client_df, category_label)
         user_prompt = _fill_prompt_template(
@@ -306,11 +314,11 @@ def build_prompts(
             {
                 "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
-                "customer_id": int(cid),
+                "customer_id": canonical_entity_id(cid),
             }
         )
         records.append({
-            "customer_id": int(cid),
+            "customer_id": canonical_entity_id(cid),
             "label": label,
             "label_name": label_name,
             "client_stats": client_stats,

@@ -1,0 +1,64 @@
+dataset:
+  name: berka
+  benchmark_protocol: unittab_70_30_5seed
+  modality: transactions_only
+  amount_semantics: typed_transaction_value
+  amount_unit: Czech koruna
+  direction_rule: "transaction direction is defined by operation_type"
+  columns:
+    customer_id: customer_id
+    datetime: tr_datetime
+    amount: amount
+    category: mcc_code_desc
+    label: label
+  label_names:
+    "0": "non-default"
+    "1": "default"
+  claim_forbidden_terms:
+    - default
+    - non-default
+    - loan status
+  category_label: "operation and payment-purpose categories"
+  prompt_task_description: >-
+    Predict whether the loan belongs to the non-default or default outcome
+    class using only the account's transaction history before loan origination.
+  prompt_dataset_guidance: >-
+    Use only the pre-loan transaction evidence. You may form cautious
+    hypotheses about cash-flow regularity, financial pressure, or account use
+    when supported by the observed history. Do not assume facts outside the
+    transactions, and never infer the outcome from loan-payment or post-loan
+    behavior because neither is provided.
+  label_semantics: standard
+  num_labels: 2
+  metric: positive_f1
+  primary_metric: positive_f1
+  positive_label: 1
+  splits: {}
+
+prompts:
+  base_dir: "."
+  language: en
+  contract_version: evidence_bounded_v5
+  category_mapping_version: en_v1
+  system: prompts/common/explanation_generation/system_prompt.txt
+  user: prompts/common/explanation_generation/user_prompt.txt
+  claims_system: prompts/common/claims_extraction/system_prompt.txt
+  claims_user: prompts/common/claims_extraction/user_prompt.txt
+
+pipeline:
+  event_features: minimal
+  n_explanation_samples: 1
+  n_claims_samples: 1
+  claims_max_tokens: 2048
+  few_shot_per_class: 0
+  embedding_model: "all-MiniLM-L6-v2"
+  min_behavioral_explanation_chars: 1
+
+output:
+  base_dir: results/v5/berka
+  summary_stats: summary_stats.txt
+  clients_stats: clients_stats.jsonl
+  prompts: prompts.jsonl
+  explanations: explanations.jsonl
+  claims: claims.jsonl
+  metrics: metrics.json
