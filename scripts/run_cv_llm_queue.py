@@ -100,13 +100,15 @@ def jobs(
     run_id: str,
     qwen_config: Path,
     gpt_config: Path,
+    datasets: tuple[str, ...] = DATASET_ORDER,
+    run_pilots: bool = False,
 ) -> list[dict[str, Any]]:
     result = []
     profile = qwen_config if model == "qwen" else gpt_config
-    for dataset in DATASET_ORDER:
+    for dataset in datasets:
         for fold in FOLDS:
             selection = selection_path(run_id, dataset, fold)
-            if model == "qwen":
+            if model == "qwen" or run_pilots:
                 result.append({
                     "id": f"{dataset}_fold_{fold}_pilot",
                     "kind": "pilot",
@@ -117,7 +119,10 @@ def jobs(
                         dataset=dataset,
                         fold=fold,
                         run_id=run_id,
-                        qwen_config=qwen_config,
+                        # run_cv_prompt_pilots historically calls the selector
+                        # profile "qwen".  When Qwen is unavailable, explicitly
+                        # pass the active GPT profile as selector instead.
+                        qwen_config=profile if run_pilots else qwen_config,
                         gpt_config=gpt_config,
                     ),
                 })
@@ -178,21 +183,43 @@ def main() -> None:
         "--gpt-config", type=Path, default=Path("configs/v2/gpt_oss.yaml")
     )
     parser.add_argument("--wait-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--datasets",
+        default=",".join(DATASET_ORDER),
+        help="Comma-separated benchmark queue subset, in execution order.",
+    )
+    parser.add_argument(
+        "--run-pilots",
+        action="store_true",
+        help=(
+            "Run each fold's prompt pilot with this queue's model before the "
+            "full cell. Useful when the default Qwen selector is unavailable."
+        ),
+    )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--execute-api", action="store_true")
     parser.add_argument("--until-complete", action="store_true")
     args = parser.parse_args()
+    datasets = tuple(
+        value.strip() for value in args.datasets.split(",") if value.strip()
+    )
+    unknown = set(datasets) - set(DATASET_ORDER)
+    if unknown or not datasets:
+        raise ValueError(f"Unsupported or empty dataset queue: {sorted(unknown)}")
     queue = jobs(
         model=args.model,
         run_id=args.run_id,
         qwen_config=args.qwen_config,
         gpt_config=args.gpt_config,
+        datasets=datasets,
+        run_pilots=args.run_pilots,
     )
     plan = {
         "mode": "execute" if args.execute else "dry-run",
         "run_id": args.run_id,
         "model": args.model,
-        "dataset_order": list(DATASET_ORDER),
+        "dataset_order": list(datasets),
+        "pilot_selector": args.model if args.run_pilots else "qwen",
         "folds": list(FOLDS),
         "jobs": [
             {
