@@ -25,6 +25,7 @@ from xgboost import XGBClassifier
 from src.data.loader import add_features, load_dataset
 from src.data.profiles import amount_semantics, client_feature_frame
 from src.experiments.artifacts import files_fingerprint, stage_signature
+from src.data.entity_ids import canonical_entity_id
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -35,6 +36,8 @@ EXPERIMENTS = {
     "handcrafted",
     "cot",
     "concat",
+    "standard_cot",
+    "all_features",
 }
 
 
@@ -76,6 +79,53 @@ def build_standard_features(df: pd.DataFrame) -> pd.DataFrame:
         amount_median="median",
         amount_std="std",
     )
+    quantiles = (
+        df.groupby("customer_id")["amount"]
+        .quantile([0.05, 0.25, 0.75, 0.95])
+        .unstack()
+        .rename(
+            columns={
+                0.05: "amount_p05",
+                0.25: "amount_q1",
+                0.75: "amount_q3",
+                0.95: "amount_p95",
+            }
+        )
+    )
+    base = base.join(quantiles, how="left")
+    base["positive_operation_share"] = (
+        df["amount"].gt(0).groupby(df["customer_id"]).mean()
+    )
+    base["negative_operation_share"] = (
+        df["amount"].lt(0).groupby(df["customer_id"]).mean()
+    )
+    base["total_positive_amount"] = (
+        df["amount"].where(df["amount"] > 0, 0).groupby(df["customer_id"]).sum()
+    )
+    base["total_negative_magnitude"] = (
+        -df["amount"].where(df["amount"] < 0, 0).groupby(df["customer_id"]).sum()
+    )
+    base["unique_categories"] = df.groupby("customer_id")[
+        "mcc_code_desc"
+    ].nunique()
+    currency_column = next(
+        (
+            column for column in ("currency_name", "currency_code")
+            if column in df.columns
+        ),
+        None,
+    )
+    if currency_column is not None:
+        currency_counts = (
+            df.groupby(["customer_id", currency_column])
+            .size()
+            .unstack(fill_value=0)
+        )
+        currency_counts.columns = [
+            f"currency_{safe_name(value)}_count"
+            for value in currency_counts.columns
+        ]
+        base = base.join(currency_counts, how="left")
     if "tr_datetime" in df.columns:
         dates = df.assign(
             _day=df["tr_datetime"].dt.date,
@@ -83,7 +133,18 @@ def build_standard_features(df: pd.DataFrame) -> pd.DataFrame:
         )
         active_days = dates.groupby("customer_id")["_day"].nunique().rename("active_days")
         active_months = dates.groupby("customer_id")["_month"].nunique().rename("active_months")
-        base = base.join(active_days, how="left").join(active_months, how="left")
+        calendar_span = (
+            dates.groupby("customer_id")["tr_datetime"].agg(
+                lambda values: (
+                    values.max().normalize() - values.min().normalize()
+                ).days + 1
+            )
+        ).rename("calendar_span_days")
+        base = (
+            base.join(active_days, how="left")
+            .join(active_months, how="left")
+            .join(calendar_span, how="left")
+        )
         base["txn_per_day"] = base["amount_count"] / base["active_days"].replace(0, np.nan)
         base["txn_per_month"] = base["amount_count"] / base["active_months"].replace(0, np.nan)
 
@@ -179,7 +240,7 @@ def build_generic_handcrafted_features(
         pos = client.loc[client["amount"] > 0, "amount"]
         neg = client.loc[client["amount"] < 0, "amount"]
         row: dict[str, float | int] = {
-            "customer_id": int(customer_id),
+            "customer_id": canonical_entity_id(customer_id),
             "label": label,
             "n_txn": n_txn,
             "active_days": n_days,
@@ -208,10 +269,27 @@ def build_generic_handcrafted_features(
                 }
             )
         if "period_of_day" in client.columns:
-            for period in ["утро", "день", "вечер", "ночь"]:
+            for period in ["morning", "afternoon", "evening", "night"]:
                 row[f"share_{period}"] = float((client["period_of_day"] == period).mean())
         if "is_weekend" in client.columns:
             row["share_weekend"] = float(client["is_weekend"].mean())
+        currency_column = next(
+            (
+                column for column in ("currency_name", "currency_code")
+                if column in client.columns
+            ),
+            None,
+        )
+        if currency_column is not None:
+            currency_counts = (
+                client[currency_column]
+                .astype("string")
+                .fillna("unknown")
+                .value_counts()
+            )
+            row["n_currencies"] = int(len(currency_counts))
+            for currency, count in currency_counts.items():
+                row[f"share_currency_{safe_name(currency)}"] = count / n_txn
         for category, count in client.groupby("mcc_code_desc")["amount"].count().to_dict().items():
             row[f"cnt_{safe_name(category)}"] = int(count)
         records.append(row)
@@ -230,7 +308,7 @@ def build_rosbank_handcrafted_features(
         n_days = max(client["tr_datetime"].dt.date.nunique(), 1) if client["tr_datetime"].notna().any() else 1
         n_months = max(client["tr_datetime"].dt.to_period("M").nunique(), 1) if client["tr_datetime"].notna().any() else 1
         row = {
-            "customer_id": int(customer_id),
+            "customer_id": canonical_entity_id(customer_id),
             "label": label,
             "n_txn": n_txn,
             "active_days": n_days,
@@ -264,7 +342,7 @@ def build_rosbank_handcrafted_features(
         if "is_weekend" in client.columns:
             row["share_weekend"] = float(client["is_weekend"].mean())
         if "period_of_day" in client.columns:
-            for period in ["утро", "день", "вечер", "ночь"]:
+            for period in ["morning", "afternoon", "evening", "night"]:
                 row[f"share_{period}"] = float((client["period_of_day"] == period).mean())
         if client["tr_datetime"].notna().any():
             ordered = client.sort_values("tr_datetime")
@@ -386,6 +464,9 @@ def evaluate(model, x: np.ndarray, y: np.ndarray) -> dict:
         "balanced_accuracy": float(balanced_accuracy_score(y, preds)),
         "f1_macro": float(f1_score(y, preds, average="macro", zero_division=0)),
         "f1_weighted": float(f1_score(y, preds, average="weighted", zero_division=0)),
+        "positive_f1": float(
+            f1_score(y, preds, pos_label=1, zero_division=0)
+        ),
         "mcc": float(matthews_corrcoef(y, preds)),
         "confusion_matrix": confusion_matrix(y, preds).tolist(),
     }
@@ -474,7 +555,7 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
     }
 
     feature_sets = {}
-    if requested & {"standard", "standard_profile"}:
+    if requested & {"standard", "standard_profile", "standard_cot", "all_features"}:
         standard_train_raw = build_standard_features(train_df)
         standard_val_raw = build_standard_features(val_df)
         standard_test_raw = build_standard_features(test_df)
@@ -488,7 +569,7 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
         if "standard" in requested:
             feature_sets["standard"] = standard_pack
 
-    if requested & {"llm_profile", "standard_profile"}:
+    if requested & {"llm_profile", "standard_profile", "all_features"}:
         profile_train_raw = build_llm_profile_features(train_df, config)
         profile_val_raw = build_llm_profile_features(val_df, config)
         profile_test_raw = build_llm_profile_features(test_df, config)
@@ -516,7 +597,7 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
                 ],
             }
 
-    if "handcrafted" in requested or "concat" in requested:
+    if "handcrafted" in requested or requested & {"concat", "all_features"}:
         hc_train_raw = build_handcrafted_features(train_df, config)
         hc_val_raw = build_handcrafted_features(val_df, config)
         hc_test_raw = build_handcrafted_features(test_df, config)
@@ -527,7 +608,7 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
         if "handcrafted" in requested:
             feature_sets["handcrafted"] = {"train": hc_train, "val": hc_val, "test": hc_test, "columns": hc_cols}
 
-    if "cot" in requested or "concat" in requested:
+    if "cot" in requested or requested & {"concat", "standard_cot", "all_features"}:
         cot_train_raw = validate_client_feature_frame(
             load_cot_features(cot_dir, "train"),
             canonical_clients["train"],
@@ -559,6 +640,39 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
         concat_test = merge_feature_frames(cot_test, hc_test)
         concat_cols = [column for column in concat_train.columns if column not in {"customer_id", "label"}]
         feature_sets["concat"] = {"train": concat_train, "val": concat_val, "test": concat_test, "columns": concat_cols}
+
+    if "standard_cot" in requested:
+        combined = {
+            split: merge_feature_frames(cot_pack, standard_pack[split])
+            for split, cot_pack in (
+                ("train", cot_train), ("val", cot_val), ("test", cot_test)
+            )
+        }
+        feature_sets["standard_cot"] = {
+            **combined,
+            "columns": [
+                column for column in combined["train"]
+                if column not in {"customer_id", "label"}
+            ],
+        }
+
+    if "all_features" in requested:
+        combined = {}
+        for split, cot_frame, hc_frame in (
+            ("train", cot_train, hc_train),
+            ("val", cot_val, hc_val),
+            ("test", cot_test, hc_test),
+        ):
+            merged = merge_feature_frames(standard_pack[split], profile_pack[split])
+            merged = merge_feature_frames(merged, hc_frame)
+            combined[split] = merge_feature_frames(merged, cot_frame)
+        feature_sets["all_features"] = {
+            **combined,
+            "columns": [
+                column for column in combined["train"]
+                if column not in {"customer_id", "label"}
+            ],
+        }
 
     return feature_sets
 
@@ -621,16 +735,21 @@ def prediction_artifact_complete(
                     and row.get("split") == split
                 ]
                 expected_labels = {
-                    int(row.customer_id): int(row.label)
+                    canonical_entity_id(row.customer_id): int(row.label)
                     for row in frame[["customer_id", "label"]].itertuples(index=False)
                 }
                 if len(cell) != len(expected_labels):
                     return False
-                ids = [int(row.get("customer_id", -1)) for row in cell]
+                ids = [
+                    canonical_entity_id(row.get("customer_id", -1))
+                    for row in cell
+                ]
                 if len(ids) != len(set(ids)) or set(ids) != set(expected_labels):
                     return False
                 for row in cell:
-                    customer_id = int(row.get("customer_id", -1))
+                    customer_id = canonical_entity_id(
+                        row.get("customer_id", -1)
+                    )
                     if int(row.get("label", -1)) != expected_labels[customer_id]:
                         return False
                     if int(row.get("prediction", -1)) not in range(num_labels):
@@ -762,7 +881,18 @@ def run_ml_baseline(config: dict, experiments: list[str] | None = None) -> None:
                 ),
             }
             for classifier_name, model in classifiers.items():
-                model.fit(x_train, y_train)
+                refit_train_and_val = bool(
+                    config.get("evaluation", {}).get(
+                        "refit_train_and_val_for_test", False
+                    )
+                )
+                if refit_train_and_val:
+                    model.fit(
+                        np.concatenate([x_train, x_val], axis=0),
+                        np.concatenate([y_train, y_val], axis=0),
+                    )
+                else:
+                    model.fit(x_train, y_train)
                 split_values = {
                     "train": (pack["train"], x_train, y_train),
                     "val": (pack["val"], x_val, y_val),
@@ -791,7 +921,7 @@ def run_ml_baseline(config: dict, experiments: list[str] | None = None) -> None:
                             "classifier": classifier_name,
                             "seed": seed,
                             "split": split_name,
-                            "customer_id": int(customer_id),
+                            "customer_id": canonical_entity_id(customer_id),
                             "label": int(truth[index]),
                             "prediction": int(predictions[index]),
                         }
@@ -842,7 +972,9 @@ def ml_artifact_signature(config: dict, feature_set: str) -> str:
     recomputed rather than silently reused.
     """
     source_paths = list(config["dataset"]["splits"].values())
-    if feature_set in {"cot", "concat"}:
+    if feature_set in {
+        "cot", "concat", "standard_cot", "all_features"
+    }:
         out_dir = Path(config.get("input", {}).get(
             "cot_features_base_dir", config["output"]["base_dir"]
         ))

@@ -11,6 +11,7 @@ from sklearn.metrics.pairwise import cosine_distances
 
 from src.experiments.artifacts import fingerprint
 from src.utils.cluster import embed_texts
+from src.data.entity_ids import canonical_entity_id
 
 Embedder = Callable[..., np.ndarray]
 
@@ -37,7 +38,7 @@ def claim_occurrences(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "claim_id": entry.get("claim_id") or fingerprint({
                         "customer_id": record["customer_id"], "text": normalized, "index": index,
                     })[:20],
-                    "customer_id": int(record["customer_id"]),
+                    "customer_id": canonical_entity_id(record["customer_id"]),
                     "label": int(record.get("label", -1)),
                     "original_text": original,
                     "normalized_text": normalized,
@@ -370,7 +371,9 @@ def transform_precomputed_claim_space(records, space, embeddings, model):
         dtype=np.int32,
     )
     vectors = {
-        int(row["customer_id"]): np.zeros(len(model["feature_names"]), dtype=np.float32)
+        canonical_entity_id(row["customer_id"]): np.zeros(
+            len(model["feature_names"]), dtype=np.float32
+        )
         for row in records
     }
     unique_assignments, unique_distances = nearest_centroid_assignments(
@@ -386,7 +389,7 @@ def transform_precomputed_claim_space(records, space, embeddings, model):
             vectors[row["customer_id"]][cluster_index] += 1.0
         assignment_rows.append({
             "claim_id": row["claim_id"],
-            "customer_id": int(row["customer_id"]),
+            "customer_id": canonical_entity_id(row["customer_id"]),
             "label": int(row.get("label", -1)),
             "normalized_text": row["normalized_text"],
             "cluster_index": cluster_index,
@@ -400,7 +403,8 @@ def transform_precomputed_claim_space(records, space, embeddings, model):
         })
     encoding, rows = model["settings"]["feature_encoding"], []
     for record in records:
-        cid, values = int(record["customer_id"]), vectors[int(record["customer_id"])]
+        cid = canonical_entity_id(record["customer_id"])
+        values = vectors[cid]
         if encoding == "binary":
             values = (values > 0).astype(np.float32)
         elif encoding == "normalized_count":
