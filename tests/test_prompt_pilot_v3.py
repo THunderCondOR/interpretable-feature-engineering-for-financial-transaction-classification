@@ -111,6 +111,27 @@ def test_rationale_diversity_and_social_audit_are_reported():
     )
 
 
+def test_rationale_diagnostics_support_opaque_string_customer_ids():
+    customer_id = "0034020d25da4951b559da1d3171a1e3"
+    diagnostics = rationale_diagnostics(
+        [
+            {
+                "customer_id": customer_id,
+                "predicted": 1,
+                "error": None,
+                "explanation": (
+                    "Frequent transactions in the books category. "
+                    "The client works as a doctor. Final: label"
+                ),
+            }
+        ],
+        [{"customer_id": customer_id, "client_stats": "  - books: 3"}],
+    )
+    assert diagnostics["category_reference"]["mentions"] == 1
+    examples = diagnostics["unsupported_social_claim_audit"]["examples"]
+    assert examples[0]["customer_id"] == customer_id
+
+
 def test_age_ordered_requires_strict_two_point_gain_and_positive_ci():
     exact = select_age_label_semantics(
         opaque_variant=AGE_OPAQUE,

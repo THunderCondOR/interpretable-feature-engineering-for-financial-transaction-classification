@@ -295,13 +295,16 @@ def rationale_diagnostics(
         1.0 - len(set(normalized)) / len(normalized) if normalized else 0.0
     )
     prompt_by_id = {
-        int(row["customer_id"]): row for row in (prompt_rows or [])
+        canonical_entity_id(row["customer_id"]): row
+        for row in (prompt_rows or [])
     }
     category_mentions = 0
     clients_with_category_reference = 0
     for row, text in zip(successful, normalized):
         client_stats = str(
-            prompt_by_id.get(int(row["customer_id"]), {}).get("client_stats", "")
+            prompt_by_id.get(
+                canonical_entity_id(row["customer_id"]), {}
+            ).get("client_stats", "")
         )
         categories = {
             match.group(1).strip().lower()
@@ -318,7 +321,7 @@ def rationale_diagnostics(
     )
     audited = [
         {
-            "customer_id": int(row["customer_id"]),
+            "customer_id": canonical_entity_id(row["customer_id"]),
             "patterns": [
                 pattern
                 for pattern in unsupported_patterns
