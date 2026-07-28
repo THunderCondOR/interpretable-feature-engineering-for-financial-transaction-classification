@@ -23,9 +23,25 @@ from src.experiments.artifacts import atomic_write_json, fingerprint
 from src.experiments.config_builder import load_yaml
 from src.experiments.cv_config import build_cv_runtime_config
 from scripts.cv_preflight import validate_prepared
+from scripts.run_cv_llm_queue import jobs as cv_queue_jobs
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_gpt_pilot_selector_does_not_replace_full_qwen_profile():
+    queue = cv_queue_jobs(
+        model="gpt_oss",
+        run_id="selector-profile-test",
+        qwen_config=Path("configs/v2/qwen.yaml"),
+        gpt_config=Path("configs/v2/gpt_oss.yaml"),
+        datasets=("berka",),
+        run_pilots=True,
+    )
+    pilot = queue[0]["command"]
+    assert pilot[pilot.index("--pilot-config") + 1] == "configs/v2/gpt_oss.yaml"
+    assert pilot[pilot.index("--qwen-config") + 1] == "configs/v2/qwen.yaml"
+    assert pilot[pilot.index("--gpt-config") + 1] == "configs/v2/gpt_oss.yaml"
 
 
 def test_berka_normalization_is_strictly_preloan_and_removes_uver(tmp_path):

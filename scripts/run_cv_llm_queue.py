@@ -53,6 +53,7 @@ def pilot_command(
     dataset: str,
     fold: int,
     run_id: str,
+    pilot_config: Path,
     qwen_config: Path,
     gpt_config: Path,
 ) -> list[str]:
@@ -62,6 +63,7 @@ def pilot_command(
         "--dataset", dataset,
         "--folds", str(fold),
         "--run-id", run_id,
+        "--pilot-config", str(pilot_config),
         "--qwen-config", str(qwen_config),
         "--gpt-config", str(gpt_config),
         "--stage", "all",
@@ -119,10 +121,8 @@ def jobs(
                         dataset=dataset,
                         fold=fold,
                         run_id=run_id,
-                        # run_cv_prompt_pilots historically calls the selector
-                        # profile "qwen".  When Qwen is unavailable, explicitly
-                        # pass the active GPT profile as selector instead.
-                        qwen_config=profile if run_pilots else qwen_config,
+                        pilot_config=profile,
+                        qwen_config=qwen_config,
                         gpt_config=gpt_config,
                     ),
                 })

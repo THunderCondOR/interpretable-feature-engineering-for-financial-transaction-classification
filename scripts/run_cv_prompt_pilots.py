@@ -98,6 +98,7 @@ def materialize_fold(
     prepared_root: Path,
     results_root: Path,
     generated_root: Path,
+    pilot_profile: dict[str, Any],
     qwen_profile: dict[str, Any],
     gpt_profile: dict[str, Any],
 ) -> dict[str, Any]:
@@ -116,7 +117,7 @@ def materialize_fold(
     for variant in V5_VARIANTS:
         config = build_cv_runtime_config(
             base,
-            qwen_profile,
+            pilot_profile,
             run_id=run_id,
             variant=variant,
             fold_manifest_path=fold_path,
@@ -146,6 +147,7 @@ def materialize_fold(
             variant: file_sha256(path)
             for variant, path in pilot_configs.items()
         },
+        "pilot_profile": pilot_profile,
         "qwen_profile": qwen_profile,
         "gpt_profile": gpt_profile,
     }
@@ -280,6 +282,14 @@ def main() -> None:
         "--qwen-config", type=Path, default=Path("configs/v2/qwen.yaml")
     )
     parser.add_argument(
+        "--pilot-config",
+        type=Path,
+        help=(
+            "Model profile used only to generate pilot predictions. Defaults "
+            "to --qwen-config; it does not replace the full Qwen profile."
+        ),
+    )
+    parser.add_argument(
         "--gpt-config", type=Path, default=Path("configs/v2/gpt_oss.yaml")
     )
     parser.add_argument(
@@ -319,6 +329,7 @@ def main() -> None:
     ):
         raise ValueError("Pilot API stages require --execute-api --until-complete")
     qwen, gpt = load_yaml(args.qwen_config), load_yaml(args.gpt_config)
+    pilot = load_yaml(args.pilot_config or args.qwen_config)
     for fold in folds:
         materialized_path = (
             generated_root / args.dataset / f"fold_{fold}"
@@ -332,6 +343,7 @@ def main() -> None:
                 prepared_root=args.prepared_root,
                 results_root=args.results_root,
                 generated_root=generated_root,
+                pilot_profile=pilot,
                 qwen_profile=qwen,
                 gpt_profile=gpt,
             )
@@ -339,6 +351,12 @@ def main() -> None:
             materialized = json.loads(
                 materialized_path.read_text(encoding="utf-8")
             )
+            # Selection may be rerun after model availability changes. Full
+            # model profiles come from the explicit current arguments, while
+            # the immutable pilot artifacts retain their original generator.
+            if args.stage == "select":
+                materialized["qwen_profile"] = qwen
+                materialized["gpt_profile"] = gpt
         if args.stage in {"all", "pilot"}:
             run_fold_pilot(materialized)
         if args.stage in {"all", "select"}:
