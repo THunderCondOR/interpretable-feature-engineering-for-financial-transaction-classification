@@ -47,15 +47,28 @@ def main() -> None:
                 "content": "Reply with exactly the single token OK.",
             }],
             "temperature": 0.0,
-            "max_tokens": 8,
+            "max_tokens": 128,
         }
-        if generation.get("extra_body"):
-            kwargs["extra_body"] = generation["extra_body"]
+        # The paid v5 configs explicitly disable provider-side thinking.  The
+        # reusable model profiles do not repeat that dataset-level setting, so
+        # the probe must exercise the same chat-template mode as the real run.
+        kwargs["extra_body"] = generation.get("extra_body") or {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
         response = client.chat.completions.create(
             **kwargs,
         )
-        content = str(response.choices[0].message.content or "").strip()
-        if "OK" not in content.upper():
+        message = response.choices[0].message
+        content = str(message.content or "").strip()
+        extra = getattr(message, "model_extra", None) or {}
+        reasoning = str(
+            getattr(message, "reasoning_content", None)
+            or extra.get("reasoning_content")
+            or getattr(message, "reasoning", None)
+            or extra.get("reasoning")
+            or ""
+        ).strip()
+        if "OK" not in content.upper() and "OK" not in reasoning.upper():
             raise RuntimeError(
                 f"Unexpected probe response for "
                 f"{profile['experiment']['model_slug']}"
