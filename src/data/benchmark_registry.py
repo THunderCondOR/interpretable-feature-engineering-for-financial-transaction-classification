@@ -27,6 +27,7 @@ class BenchmarkSpec:
     name: str
     protocol: str
     primary_metric: str
+    direct_selection_metric: str
     entity_column: str
     n_entities: int
     n_folds: int = 5
@@ -39,6 +40,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         name="datafusion_education",
         protocol="mbd_5fold_seed42",
         primary_metric="roc_auc",
+        direct_selection_metric="balanced_accuracy",
         entity_column="user_id",
         n_entities=8_509,
     ),
@@ -46,6 +48,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         name="berka",
         protocol="unittab_70_30_5seed",
         primary_metric="positive_f1",
+        direct_selection_metric="positive_f1",
         entity_column="loan_id",
         n_entities=682,
         comparison="protocol_matched_not_id_identical",

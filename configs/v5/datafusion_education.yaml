@@ -4,6 +4,7 @@ dataset:
   modality: transactions_only
   amount_semantics: signed_cashflow
   amount_unit: dataset_native_units
+  currency_aware_amounts: true
   direction_rule: "amount > 0 is inflow; amount < 0 is outflow"
   columns:
     customer_id: customer_id
@@ -31,6 +32,7 @@ dataset:
   num_labels: 2
   metric: roc_auc
   primary_metric: roc_auc
+  direct_selection_metric: balanced_accuracy
   splits: {}
 
 llm:
@@ -59,7 +61,7 @@ pipeline:
   claims_max_tokens: 2048
   few_shot_per_class: 0
   embedding_model: "all-MiniLM-L6-v2"
-  min_behavioral_explanation_chars: 1
+  min_behavioral_explanation_chars: 40
 
 output:
   base_dir: results/v5/datafusion_education

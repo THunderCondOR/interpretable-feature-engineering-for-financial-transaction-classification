@@ -30,17 +30,17 @@ python scripts/prepare_benchmark_dataset.py \
   --download --split-backend pyspark --execute
 
 bash scripts/launch_cv_model_queues.sh \
-  --run-id reviewer-v5-benchmarks
+  --run-id reviewer-v5-fixed-new-datasets
 
 bash scripts/launch_cv_model_queues.sh \
-  --run-id reviewer-v5-benchmarks --execute
+  --run-id reviewer-v5-fixed-new-datasets --execute
 
 python scripts/run_cv_offline_pipeline.py \
   --datasets berka,datafusion_education \
   --models qwen,gpt_oss --execute
 
 python scripts/summarize_cv_benchmarks.py \
-  --run-id reviewer-v5-benchmarks --execute
+  --run-id reviewer-v5-fixed-new-datasets --execute
 ```
 
 The exact Data Fusion reference preparation requires `pyspark==3.3.3`.
@@ -54,7 +54,7 @@ publish the five test-ID lists.
 API artifacts:
 
 ```text
-results/v5/<dataset>/<protocol>/fold_<n>/<variant>/<model>/seed_17/
+results/v5/runs/<run_id>/<dataset>/<protocol>/fold_<n>/<variant>/<model>/seed_17/
 ```
 
 Fold-fitted clusters and ML outputs:

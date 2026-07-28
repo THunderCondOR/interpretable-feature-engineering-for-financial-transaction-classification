@@ -94,7 +94,8 @@ def build_cv_runtime_config(
     )
     model_slug = slug(config["experiment"]["model_slug"])
     output_root = (
-        results_root / dataset / protocol / f"fold_{fold}"
+        results_root / "runs" / slug(run_id) / dataset / protocol
+        / f"fold_{fold}"
         / ("pilot" if mode == "pilot" else variant)
         / model_slug / f"seed_{config['experiment']['generation_seed']}"
     )

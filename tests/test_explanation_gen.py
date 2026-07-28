@@ -91,6 +91,25 @@ def test_provider_reasoning_is_used_when_visible_content_has_only_final() -> Non
     assert record["explanation_source"] == "provider_reasoning_fallback"
 
 
+def test_provider_reasoning_is_used_when_visible_content_repeats_label() -> None:
+    provider_reasoning = (
+        "The client has regular transaction activity across several observed "
+        "categories and maintains a stable cash-flow pattern."
+    )
+    record = build_output_record(
+        META,
+        api_result(
+            "female\n\nFinal: \\boxed{female}",
+            reasoning=provider_reasoning,
+        ),
+        LABELS,
+    )
+
+    assert _is_successful(record)
+    assert record["explanation"].startswith(provider_reasoning)
+    assert record["explanation_source"] == "provider_reasoning_fallback"
+
+
 def test_visible_behavioral_explanation_is_preferred_over_provider_reasoning() -> None:
     record = build_output_record(
         META,
@@ -402,3 +421,55 @@ def test_until_complete_commits_good_records_and_defers_only_bad_content(
     assert deferred[0]["accepted"] == 1
     assert deferred[0]["deferred"] == 1
     assert deferred[0]["errors"][0]["request_key"] == "2:0"
+
+
+def test_content_failure_has_finite_attempt_limit(tmp_path, monkeypatch) -> None:
+    prompt_path = tmp_path / "prompts.jsonl"
+    output_path = tmp_path / "explanations.jsonl"
+    prompt_path.write_text(
+        json.dumps({
+            "customer_id": 1,
+            "label": 0,
+            "label_name": "female",
+            "system_prompt": "system",
+            "user_prompt": "user",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    calls = 0
+
+    async def always_empty(dialogues, model, llm_config, *, on_batch_complete):
+        nonlocal calls
+        calls += 1
+        result = api_result("")
+        on_batch_complete([(0, result)])
+        return [result]
+
+    monkeypatch.setattr(
+        "src.pipeline.explanation_gen.batched_query", always_empty
+    )
+    config = {
+        "llm": {"default_model": "test"},
+        "execution": {
+            "until_complete": True,
+            "content_primary_attempts": 1,
+            "content_repair_attempts": 1,
+        },
+        "experiment": {"run_id": "test", "model_slug": "test"},
+        "dataset": {"name": "gender", "label_names": LABELS},
+        "pipeline": {"n_explanation_samples": 1},
+        "output": {
+            "base_dir": str(tmp_path),
+            "prompts": "prompts.jsonl",
+            "explanations": "explanations.jsonl",
+        },
+    }
+
+    run_explanation_generation(
+        config, input_path=prompt_path, output_path=output_path
+    )
+
+    assert calls == 2
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert record["terminal_content_failure"] is True
+    assert record["content_attempts"] == 2

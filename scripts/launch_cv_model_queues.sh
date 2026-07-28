@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_ID="reviewer-v5-benchmarks"
+RUN_ID="reviewer-v5-fixed-new-datasets"
 PYTHON_BIN="/home/chaichuk/miniconda3/envs/breaking-the-chain-env/bin/python"
 EXECUTE=0
 
@@ -37,7 +37,7 @@ mkdir -p "logs/runs/${RUN_ID}"
   --model-config configs/v2/qwen.yaml \
   --model-config configs/v2/gpt_oss.yaml \
   --execute-api
-for session in "${RUN_ID}_qwen" "${RUN_ID}_gpt_oss"; do
+for session in "${RUN_ID}_qwen" "${RUN_ID}_gpt_oss" "${RUN_ID}_status"; do
   if tmux -L "${SOCKET}" has-session -t "${session}" 2>/dev/null; then
     echo "Session already exists: ${session}" >&2
     exit 1
@@ -48,5 +48,7 @@ tmux -L "${SOCKET}" new-session -d -s "${RUN_ID}_qwen" \
   "set -o pipefail; '${PYTHON_BIN}' scripts/run_cv_llm_queue.py --model qwen --run-id '${RUN_ID}' --execute --execute-api --until-complete 2>&1 | tee 'logs/runs/${RUN_ID}/qwen.cv_queue.log'"
 tmux -L "${SOCKET}" new-session -d -s "${RUN_ID}_gpt_oss" \
   "set -o pipefail; '${PYTHON_BIN}' scripts/run_cv_llm_queue.py --model gpt_oss --run-id '${RUN_ID}' --execute --execute-api --until-complete 2>&1 | tee 'logs/runs/${RUN_ID}/gpt_oss.cv_queue.log'"
+tmux -L "${SOCKET}" new-session -d -s "${RUN_ID}_status" \
+  "'${PYTHON_BIN}' scripts/pipeline_status.py --run-id '${RUN_ID}' --results-root 'results/v5/runs/${RUN_ID}' --watch 5"
 
-echo "Started tmux socket ${SOCKET}: ${RUN_ID}_qwen and ${RUN_ID}_gpt_oss"
+echo "Started tmux socket ${SOCKET}: ${RUN_ID}_qwen, ${RUN_ID}_gpt_oss, ${RUN_ID}_status"

@@ -136,6 +136,7 @@ def materialize_fold(
         "protocol": spec.protocol,
         "fold": fold,
         "primary_metric": spec.primary_metric,
+        "direct_selection_metric": spec.direct_selection_metric,
         "pilot_size": int(fold_manifest["counts"]["inner_validation"]),
         "pilot_ids_sha256": fold_manifest["id_hashes"]["inner_validation"],
         "fold_signature": fold_manifest["fold_signature"],
@@ -198,7 +199,7 @@ def select_fold(
         variant: paired_primary_metric_delta(
             explanations[zero],
             explanations[variant],
-            metric=materialized["primary_metric"],
+            metric=materialized["direct_selection_metric"],
             seed=137 + int(materialized["fold"]),
         )
         for variant in V5_VARIANTS
@@ -207,7 +208,7 @@ def select_fold(
     decision = select_prompt_variant_by_metric(
         metrics,
         paired,
-        metric=materialized["primary_metric"],
+        metric=materialized["direct_selection_metric"],
     )
     selected = decision["selected_variant"]
     base = load_yaml(materialized["base_config"])
@@ -249,6 +250,7 @@ def select_fold(
         "fold_signature": materialized["fold_signature"],
         "pilot_ids_sha256": materialized["pilot_ids_sha256"],
         "primary_metric": materialized["primary_metric"],
+        "direct_selection_metric": materialized["direct_selection_metric"],
         "metrics": metrics,
         "paired_deltas": paired,
         "diagnostics": diagnostics,
@@ -268,7 +270,9 @@ def select_fold(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, choices=sorted(BENCHMARKS))
-    parser.add_argument("--run-id", default="reviewer-v5-benchmarks")
+    parser.add_argument(
+        "--run-id", default="reviewer-v5-fixed-new-datasets"
+    )
     parser.add_argument(
         "--prepared-root", type=Path, default=Path("data/benchmarks_v5")
     )
@@ -315,6 +319,9 @@ def main() -> None:
         "folds": folds,
         "variants": list(V5_VARIANTS),
         "primary_metric": BENCHMARKS[args.dataset].primary_metric,
+        "direct_selection_metric": (
+            BENCHMARKS[args.dataset].direct_selection_metric
+        ),
         "pilot_clients_per_fold": (
             400 if args.dataset == "datafusion_education" else 100
         ),

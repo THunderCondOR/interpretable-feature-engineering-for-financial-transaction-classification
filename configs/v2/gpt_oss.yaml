@@ -21,6 +21,8 @@ execution:
   cooldown_seconds: 60
   atomic_windows: true
   until_complete: true
+  content_primary_attempts: 3
+  content_repair_attempts: 3
   verify_ssl: true
   events_path: logs/runs/reviewer-v2/gpt_oss.events.jsonl
 clustering:

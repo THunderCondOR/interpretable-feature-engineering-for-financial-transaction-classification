@@ -109,6 +109,39 @@ def _load_successful_claims(
     return successful
 
 
+def _load_terminal_claims(
+    path: Path,
+    expected_signatures: dict[EntityId, dict[str, str]],
+    *,
+    max_content_attempts: int,
+) -> dict[EntityId, dict]:
+    """Reuse exhausted failures until prompts or extractor configuration change."""
+    if not path.exists():
+        return {}
+    terminal = {}
+    with path.open(encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                cid = canonical_entity_id(record["customer_id"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            expected = expected_signatures.get(cid)
+            compatible = bool(expected) and all(
+                record.get(key) == value for key, value in expected.items()
+            )
+            if (
+                compatible
+                and record.get("terminal_content_failure")
+                and int(record.get("content_attempts", 0))
+                >= max_content_attempts
+            ):
+                terminal[cid] = record
+    return terminal
+
+
 def _validate_claims(
     values: list,
     *,
@@ -261,6 +294,11 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
     llm_cfg.update(config.get("execution", {}))
     llm_cfg.update(config.get("claims_generation", {}))
     model = str(llm_cfg.get("model", llm_cfg["default_model"]))
+    max_content_attempts = int(
+        llm_cfg.get("content_primary_attempts", 3)
+    ) + int(llm_cfg.get("content_repair_attempts", 3))
+    if max_content_attempts < 1:
+        raise ValueError("Content-attempt limit must be positive")
     llm_cfg["max_tokens"] = int(
         llm_cfg.get(
             "max_tokens",
@@ -357,9 +395,17 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
         }
 
     existing = _load_successful_claims(save_path, expected_signatures)
+    terminal_existing = _load_terminal_claims(
+        save_path,
+        expected_signatures,
+        max_content_attempts=max_content_attempts,
+    )
     claims_by_client = {
         customer_id: record
-        for customer_id, record in existing.items()
+        for customer_id, record in {
+            **terminal_existing,
+            **existing,
+        }.items()
         if customer_id in expected_client_set
     }
 
@@ -410,6 +456,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
             ])
             meta.append({
                 "customer_id": rec["customer_id"],
+                "sample_id": int(rec.get("sample_id", 0)),
                 "label": rec.get("label", -1),
                 "label_name": rec.get("label_name", "unknown"),
                 "source_explanation_hash": source_hash,
@@ -426,8 +473,8 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
 
     request_errors: dict[EntityId, list[tuple[str, str]]] = {}
     content_error_counts: Counter[str] = Counter()
-    content_error_attempts: Counter[int] = Counter()
-    content_error_last_reasons: dict[int, str] = {}
+    content_error_attempts: Counter[str] = Counter()
+    content_error_last_reasons: dict[str, str] = {}
     stats_path = save_path.with_suffix(".generation_stats.json")
     if stats_path.is_file():
         try:
@@ -444,7 +491,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
             )
             content_error_attempts.update(
                 {
-                    int(key): int(value)
+                    str(key): int(value)
                     for key, value in prior_validation.get(
                         "attempts_by_request", {}
                     ).items()
@@ -452,9 +499,12 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
             )
             content_error_last_reasons.update(
                 {
-                    int(key): str(value)
-                    for key, value in prior_validation.get(
-                        "last_reasons_by_request_index", {}
+                    str(key): str(value)
+                    for key, value in (
+                        prior_validation.get("last_reasons_by_request")
+                        or prior_validation.get(
+                            "last_reasons_by_request_index", {}
+                        )
                     ).items()
                 }
             )
@@ -479,13 +529,21 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
         pending_indices = list(range(len(all_dialogues)))
         completed_request_indices: set[int] = set()
         repair_pass = 0
+        stable_request_keys = [
+            (
+                f"{canonical_entity_id(item['customer_id'])}:"
+                f"{int(item.get('sample_id', 0))}:"
+                f"{str(item['source_explanation_hash'])[:16]}"
+            )
+            for item in meta
+        ]
 
         while pending_indices:
             pass_indices = list(pending_indices)
             pass_dialogues = [all_dialogues[index] for index in pass_indices]
             pass_meta = [meta[index] for index in pass_indices]
             llm_cfg["request_keys"] = [
-                f"{meta[index]['customer_id']}:{index}" for index in pass_indices
+                stable_request_keys[index] for index in pass_indices
             ]
             llm_cfg["generation_signature"] = fingerprint(
                 {
@@ -502,6 +560,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                     item_meta = pass_meta[idx]
                     original_index = pass_indices[idx]
                     cid = canonical_entity_id(item_meta["customer_id"])
+                    request_key = stable_request_keys[original_index]
                     parsed, error_type, error = _parse_claim_result(
                         result, forbidden_labels=forbidden_labels
                     )
@@ -511,19 +570,25 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                             (error_type, reason)
                         )
                         content_error_counts[error_type] += 1
-                        content_error_attempts[original_index] += 1
-                        content_error_last_reasons[original_index] = reason
+                        content_error_attempts[request_key] += 1
+                        content_error_last_reasons[request_key] = reason
+                        terminal = (
+                            not until_complete
+                            or content_error_attempts[request_key]
+                            >= max_content_attempts
+                        )
                         rejected_details.append(
                             {
-                                "request_key": f"{cid}:{original_index}",
+                                "request_key": request_key,
                                 "customer_id": cid,
-                                "request_index": original_index,
+                                "sample_id": int(item_meta.get("sample_id", 0)),
                                 "error_type": error_type,
                                 "reason": reason,
-                                "attempt": content_error_attempts[original_index],
+                                "attempt": content_error_attempts[request_key],
+                                "terminal": terminal,
                             }
                         )
-                        if until_complete:
+                        if until_complete and not terminal:
                             continue
 
                     record = claims_by_client.setdefault(
@@ -565,6 +630,11 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                         record["error"] = (
                             errors[-1][1] if errors else "no claims extracted"
                         )
+                        record["terminal_content_failure"] = bool(error_type)
+                        record["content_attempts"] = content_error_attempts.get(
+                            request_key, 0
+                        )
+                        completed_request_indices.add(original_index)
                     _attach_claim_records(record)
                     batch_records.append(record)
 
@@ -588,6 +658,17 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                         error_types=batch_error_types,
                         errors=rejected_details,
                     )
+                    terminal_errors = [
+                        item for item in rejected_details if item["terminal"]
+                    ]
+                    if terminal_errors:
+                        append_structured_event(
+                            llm_cfg.get("events_path"),
+                            llm_cfg["event_context"],
+                            event="content_records_terminal",
+                            repair_pass=repair_pass,
+                            errors=terminal_errors,
+                        )
                     print(
                         f"[CLAIMS CONTENT DEFERRED] repair_pass={repair_pass} "
                         f"accepted={accepted_in_batch} "
@@ -600,6 +681,28 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                 _write_claim_records(
                     save_path, ordered_clients, claims_by_client
                 )
+                current_records = list(claims_by_client.values())
+                current_summary = _claims_summary(current_records)
+                current_summary["content_validation"] = {
+                    "total_rejections": sum(content_error_counts.values()),
+                    "unique_rejected_requests": len(content_error_attempts),
+                    "error_types": dict(sorted(content_error_counts.items())),
+                    "max_attempts_for_one_request": max(
+                        content_error_attempts.values(), default=0
+                    ),
+                    "attempts_by_request": dict(
+                        sorted(content_error_attempts.items())
+                    ),
+                    "last_reasons_by_request": dict(
+                        sorted(content_error_last_reasons.items())
+                    ),
+                }
+                temp_stats = stats_path.with_suffix(stats_path.suffix + ".tmp")
+                with open(temp_stats, "w", encoding="utf-8") as file:
+                    json.dump(
+                        current_summary, file, indent=2, ensure_ascii=False
+                    )
+                temp_stats.replace(stats_path)
                 summary = _claims_summary(batch_records)
                 print(
                     f"[CLAIMS BATCH] successful={summary['successful']} "
@@ -653,16 +756,12 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
             content_error_attempts.values(), default=0
         ),
         "attempts_by_request": {
-            str(index): attempts
-            for index, attempts in sorted(content_error_attempts.items())
-        },
-        "last_reasons_by_request_index": {
-            str(index): reason
-            for index, reason in sorted(content_error_last_reasons.items())
+            request_key: attempts
+            for request_key, attempts in sorted(content_error_attempts.items())
         },
         "last_reasons_by_request": {
-            f"{meta[index]['customer_id']}:{index}": reason
-            for index, reason in sorted(content_error_last_reasons.items())
+            request_key: reason
+            for request_key, reason in sorted(content_error_last_reasons.items())
         },
     }
     temp_stats = stats_path.with_suffix(stats_path.suffix + ".tmp")

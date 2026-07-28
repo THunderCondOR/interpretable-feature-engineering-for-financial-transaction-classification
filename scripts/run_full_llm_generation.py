@@ -36,6 +36,7 @@ from src.experiments.config_builder import (  # noqa: E402
     write_runtime_config,
 )
 from src.data.entity_ids import EntityId, canonical_entity_id
+from src.pipeline.explanation_gen import _has_behavioral_explanation
 
 
 DATASETS = tuple(EXPECTED_CLIENT_COUNTS) + (
@@ -213,10 +214,16 @@ def _validate_split_outputs(
 
     valid_labels = {int(value) for value in config["dataset"]["label_names"]}
     for customer_id, record in explanations.items():
-        if record.get("error") or record.get("error_type"):
+        if (
+            record.get("error")
+            or record.get("error_type")
+            or record.get("terminal_content_failure")
+        ):
             raise ValueError(f"Failed explanation for {split} client {customer_id}")
-        if not str(record.get("explanation", "")).strip():
-            raise ValueError(f"Empty explanation for {split} client {customer_id}")
+        if not _has_behavioral_explanation(record):
+            raise ValueError(
+                f"Missing behavioral explanation for {split} client {customer_id}"
+            )
         try:
             prediction = int(record["predicted"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -238,7 +245,11 @@ def _validate_split_outputs(
             )
 
     for customer_id, record in claims.items():
-        if record.get("error") or record.get("error_type"):
+        if (
+            record.get("error")
+            or record.get("error_type")
+            or record.get("terminal_content_failure")
+        ):
             raise ValueError(f"Failed claims for {split} client {customer_id}")
         values = record.get("claims")
         if not isinstance(values, list) or not values or any(

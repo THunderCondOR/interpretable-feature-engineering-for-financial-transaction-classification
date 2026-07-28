@@ -41,6 +41,13 @@ def _share(part: float, whole: float) -> float:
     return float(part) / float(whole) if whole else 0.0
 
 
+def _currency_bucket(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    if normalized in {"RUR", "USD", "EUR"}:
+        return normalized
+    return "unknown"
+
+
 def _observation_end(config: dict, train_df: pd.DataFrame | None = None) -> pd.Timestamp | None:
     value = config["dataset"].get("observation_end")
     if value:
@@ -94,18 +101,41 @@ def client_numeric_profile(
 
     semantics = amount_semantics(config)
     if semantics == "signed_cashflow":
-        inflow = amounts[amounts > 0]
-        outflow = -amounts[amounts < 0]
-        profile.update({
-            "total_inflow": float(inflow.sum()),
-            "mean_inflow": float(inflow.mean()) if len(inflow) else 0.0,
-            "median_inflow": float(inflow.median()) if len(inflow) else 0.0,
-            "total_outflow": float(outflow.sum()),
-            "mean_outflow": float(outflow.mean()) if len(outflow) else 0.0,
-            "median_outflow": float(outflow.median()) if len(outflow) else 0.0,
-            "inflow_operation_share": _share(len(inflow), n_txn),
-            "outflow_operation_share": _share(len(outflow), n_txn),
-        })
+        if config["dataset"].get("currency_aware_amounts") and currency_column:
+            currency = c[currency_column].map(_currency_bucket)
+            numeric_amounts = pd.to_numeric(c["amount"], errors="coerce")
+            for bucket in ("RUR", "USD", "EUR", "unknown"):
+                bucket_amounts = numeric_amounts[currency.eq(bucket)].dropna()
+                inflow = bucket_amounts[bucket_amounts > 0]
+                outflow = -bucket_amounts[bucket_amounts < 0]
+                prefix = bucket.lower()
+                profile.update({
+                    f"{prefix}_operation_count": int(len(bucket_amounts)),
+                    f"{prefix}_operation_share": _share(
+                        len(bucket_amounts), n_txn
+                    ),
+                    f"{prefix}_total_inflow": float(inflow.sum()),
+                    f"{prefix}_median_inflow": (
+                        float(inflow.median()) if len(inflow) else 0.0
+                    ),
+                    f"{prefix}_total_outflow": float(outflow.sum()),
+                    f"{prefix}_median_outflow": (
+                        float(outflow.median()) if len(outflow) else 0.0
+                    ),
+                })
+        else:
+            inflow = amounts[amounts > 0]
+            outflow = -amounts[amounts < 0]
+            profile.update({
+                "total_inflow": float(inflow.sum()),
+                "mean_inflow": float(inflow.mean()) if len(inflow) else 0.0,
+                "median_inflow": float(inflow.median()) if len(inflow) else 0.0,
+                "total_outflow": float(outflow.sum()),
+                "mean_outflow": float(outflow.mean()) if len(outflow) else 0.0,
+                "median_outflow": float(outflow.median()) if len(outflow) else 0.0,
+                "inflow_operation_share": _share(len(inflow), n_txn),
+                "outflow_operation_share": _share(len(outflow), n_txn),
+            })
     else:
         values = amounts.abs()
         profile.update({
@@ -164,7 +194,8 @@ def client_feature_frame(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 
 
 def _top_categories(client_df: pd.DataFrame, *, n: int = 12) -> list[tuple[str, int, float]]:
-    counts = client_df["mcc_code_desc"].value_counts().head(n)
+    counts = client_df["mcc_code_desc"].value_counts()
+    counts = counts[counts > 0].head(n)
     total = max(len(client_df), 1)
     return [
         (english_category(category), int(count), float(count / total))
@@ -219,25 +250,71 @@ def format_client_profile(client_df: pd.DataFrame, config: dict) -> str:
         expenses = client_df.loc[client_df["amount"] < 0].copy()
         if not expenses.empty:
             expenses["outflow"] = -expenses["amount"]
-            by_category = (
-                expenses.groupby("mcc_code_desc", observed=True)["outflow"]
-                .sum()
-                .sort_values(ascending=False)
-                .head(12)
+            if (
+                config["dataset"].get("currency_aware_amounts")
+                and currency_column
+            ):
+                expenses["_currency_bucket"] = expenses[currency_column].map(
+                    _currency_bucket
+                )
+                lines.append(
+                    "* Leading outflow categories within each currency:"
+                )
+                for bucket, group in expenses.groupby(
+                    "_currency_bucket", observed=True
+                ):
+                    by_category = (
+                        group.groupby("mcc_code_desc", observed=True)["outflow"]
+                        .sum()
+                        .sort_values(ascending=False)
+                        .head(6)
+                    )
+                    lines.extend(
+                        f"  - [{bucket}] {english_category(cat)}: "
+                        f"{float(value):.2f}"
+                        for cat, value in by_category.items()
+                    )
+            else:
+                by_category = (
+                    expenses.groupby("mcc_code_desc", observed=True)["outflow"]
+                    .sum()
+                    .sort_values(ascending=False)
+                    .head(12)
+                )
+                lines.append(
+                    "* Outflow categories by total positive outflow magnitude:"
+                )
+                lines.extend(
+                    f"  - {english_category(cat)}: {float(value):.2f}"
+                    for cat, value in by_category.items()
+                )
+        if config["dataset"].get("currency_aware_amounts") and currency_column:
+            lines.append(
+                "* Currency-specific cash flow (amounts are never summed "
+                "across currencies):"
             )
-            lines.append("* Outflow categories by total positive outflow magnitude:")
-            lines.extend(
-                f"  - {english_category(cat)}: {float(value):.2f}"
-                for cat, value in by_category.items()
-            )
-        lines.extend([
-            f"* Total inflow: {p['total_inflow']:.2f}",
-            f"* Mean inflow per inflow operation: {p['mean_inflow']:.2f}",
-            f"* Median inflow per inflow operation: {p['median_inflow']:.2f}",
-            f"* Total outflow (positive magnitude): {p['total_outflow']:.2f}",
-            f"* Mean outflow per outflow operation: {p['mean_outflow']:.2f}",
-            f"* Median outflow per outflow operation: {p['median_outflow']:.2f}",
-        ])
+            for bucket in ("RUR", "USD", "EUR", "unknown"):
+                prefix = bucket.lower()
+                count = int(p[f"{prefix}_operation_count"])
+                if not count:
+                    continue
+                lines.append(
+                    f"  - {bucket}: {count} operations "
+                    f"({p[f'{prefix}_operation_share']:.1%}); "
+                    f"total inflow={p[f'{prefix}_total_inflow']:.2f}; "
+                    f"median inflow={p[f'{prefix}_median_inflow']:.2f}; "
+                    f"total outflow={p[f'{prefix}_total_outflow']:.2f}; "
+                    f"median outflow={p[f'{prefix}_median_outflow']:.2f}"
+                )
+        else:
+            lines.extend([
+                f"* Total inflow: {p['total_inflow']:.2f}",
+                f"* Mean inflow per inflow operation: {p['mean_inflow']:.2f}",
+                f"* Median inflow per inflow operation: {p['median_inflow']:.2f}",
+                f"* Total outflow (positive magnitude): {p['total_outflow']:.2f}",
+                f"* Mean outflow per outflow operation: {p['mean_outflow']:.2f}",
+                f"* Median outflow per outflow operation: {p['median_outflow']:.2f}",
+            ])
     else:
         lines.extend([
             f"* Total transaction value: {p['total_transaction_value']:.2f}",

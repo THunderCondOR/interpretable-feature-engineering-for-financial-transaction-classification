@@ -97,8 +97,10 @@ def summarize_prediction_rows(rows: list[dict], *, split: str) -> dict:
         if len(np.unique(y_true)) == 2:
             # Direct label-only APIs do not expose calibrated probabilities.
             # This is therefore a label-score ROC-AUC, recorded explicitly.
-            result["roc_auc"] = float(roc_auc_score(y_true, y_pred))
-            result["roc_auc_input"] = "hard_predicted_label"
+            result["hard_label_auc"] = float(roc_auc_score(y_true, y_pred))
+            result["hard_label_auc_note"] = (
+                "Diagnostic only; not comparable to probability-score ROC-AUC"
+            )
     return result
 
 

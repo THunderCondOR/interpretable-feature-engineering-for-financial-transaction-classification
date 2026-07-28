@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -15,6 +16,8 @@ from src.data.benchmark_registry import (
     normalize_berka,
 )
 from src.data.loader import load_dataset
+from src.data.profiles import format_client_profile
+from src.pipeline.llm_eval import summarize_prediction_rows
 from src.evaluation.prompt_pilot import (
     paired_primary_metric_delta,
     select_prompt_variant_by_metric,
@@ -23,7 +26,10 @@ from src.experiments.artifacts import atomic_write_json, fingerprint
 from src.experiments.config_builder import load_yaml
 from src.experiments.cv_config import build_cv_runtime_config
 from scripts.cv_preflight import validate_prepared
-from scripts.run_cv_llm_queue import jobs as cv_queue_jobs
+from scripts.run_cv_llm_queue import (
+    jobs as cv_queue_jobs,
+    valid_output as valid_cv_output,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -42,6 +48,83 @@ def test_gpt_pilot_selector_does_not_replace_full_qwen_profile():
     assert pilot[pilot.index("--pilot-config") + 1] == "configs/v2/gpt_oss.yaml"
     assert pilot[pilot.index("--qwen-config") + 1] == "configs/v2/qwen.yaml"
     assert pilot[pilot.index("--gpt-config") + 1] == "configs/v2/gpt_oss.yaml"
+
+
+def test_default_v5_queues_run_qwen_pilots_but_not_gpt_pilots():
+    qwen = cv_queue_jobs(
+        model="qwen",
+        run_id="parallel-test",
+        qwen_config=Path("configs/v2/qwen.yaml"),
+        gpt_config=Path("configs/v2/gpt_oss.yaml"),
+    )
+    gpt = cv_queue_jobs(
+        model="gpt_oss",
+        run_id="parallel-test",
+        qwen_config=Path("configs/v2/qwen.yaml"),
+        gpt_config=Path("configs/v2/gpt_oss.yaml"),
+    )
+    assert any(job["kind"] == "pilot" for job in qwen)
+    assert all(job["kind"] == "full" for job in gpt)
+    assert [job["dataset"] for job in qwen].index(
+        "datafusion_education"
+    ) > [job["dataset"] for job in qwen].index("berka")
+
+
+def test_cv_completion_reuse_rejects_wrong_model(tmp_path):
+    path = tmp_path / "completion.json"
+    split_evidence = {}
+    for split in ("train", "test"):
+        artifacts = {}
+        for index in range(5):
+            artifact = tmp_path / f"{split}_{index}.json"
+            artifact.write_text(f"{split}-{index}", encoding="utf-8")
+            artifacts[str(artifact)] = {
+                "exists": True,
+                "size": artifact.stat().st_size,
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            }
+        split_evidence[split] = {
+            "expected_clients": 1,
+            "artifacts": artifacts,
+        }
+    identity = {
+        "run_id": "run",
+        "dataset": "berka",
+        "model_slug": "qwen",
+        "variant": "guided_zero_shot_v5",
+        "protocol": "unittab_70_30_5seed",
+        "fold": 0,
+        "split_evidence": split_evidence,
+    }
+    path.write_text(
+        json.dumps({
+            "status": "completed",
+            **identity,
+            "completion_signature": fingerprint(identity),
+            "completed_at": "now",
+        }),
+        encoding="utf-8",
+    )
+    assert valid_cv_output(
+        path,
+        run_id="run",
+        job={
+            "kind": "full",
+            "dataset": "berka",
+            "fold": 0,
+            "model": "qwen",
+        },
+    )
+    assert not valid_cv_output(
+        path,
+        run_id="run",
+        job={
+            "kind": "full",
+            "dataset": "berka",
+            "fold": 0,
+            "model": "gpt_oss",
+        },
+    )
 
 
 def test_berka_normalization_is_strictly_preloan_and_removes_uver(tmp_path):
@@ -166,6 +249,65 @@ def test_datafusion_streaming_normalizer_preserves_opaque_ids(tmp_path):
     assert events["currency_name"].tolist() == ["RUR", "RUR"]
 
 
+def test_categorical_top_k_never_includes_unused_zero_categories():
+    frame = pd.DataFrame({
+        "customer_id": ["1", "1", "1"],
+        "tr_datetime": pd.to_datetime(
+            ["2020-01-01", "2020-01-02", "2020-01-03"]
+        ),
+        "amount": [10.0, -2.0, -3.0],
+        "mcc_code_desc": pd.Categorical(
+            ["Books", "Books", "Taxi"],
+            categories=["Books", "Taxi", "Unused"],
+        ),
+        "label": [0, 0, 0],
+        "operation_type": ["credit", "debit", "debit"],
+        "balance": [10.0, 8.0, 5.0],
+    })
+    profile = format_client_profile(frame, load_yaml("configs/v5/berka.yaml"))
+    category_block = profile.split(
+        "* Observed top-2 operation and payment-purpose categories:", 1
+    )[1].split("* Coverage note", 1)[0]
+    assert "Unused" not in category_block
+    assert "0 transactions" not in category_block
+    assert category_block.count("\n  - ") == 2
+
+
+def test_datafusion_profile_never_sums_different_currencies():
+    frame = pd.DataFrame({
+        "customer_id": ["client"] * 4,
+        "tr_datetime": pd.to_datetime(
+            ["2020-01-01", "2020-01-02", "2020-01-03", "2020-01-04"]
+        ),
+        "amount": [100.0, -50.0, 7.0, -3.0],
+        "mcc_code_desc": ["A", "B", "C", "D"],
+        "currency_name": ["RUR", "RUR", "USD", "USD"],
+        "label": [0, 0, 0, 0],
+    })
+    profile = format_client_profile(
+        frame, load_yaml("configs/v5/datafusion_education.yaml")
+    )
+    assert "amounts are never summed across currencies" in profile
+    assert "RUR: 2 operations" in profile
+    assert "total inflow=100.00" in profile
+    assert "USD: 2 operations" in profile
+    assert "total inflow=7.00" in profile
+    assert "Total inflow: 107.00" not in profile
+
+
+def test_direct_binary_metrics_do_not_publish_probability_roc_auc():
+    metrics = summarize_prediction_rows(
+        [
+            {"label": 0, "predicted": 0, "error": None},
+            {"label": 1, "predicted": 1, "error": None},
+        ],
+        split="test",
+    )
+    assert "roc_auc" not in metrics
+    assert metrics["hard_label_auc"] == 1.0
+    assert "not comparable" in metrics["hard_label_auc_note"]
+
+
 def test_parquet_loader_pushes_string_id_filter(tmp_path):
     path = tmp_path / "events.parquet"
     pd.DataFrame({
@@ -269,6 +411,7 @@ def test_cv_config_binds_pilot_to_inner_train_only(tmp_path):
     assert config["dataset"]["client_ids_by_split"]["train"].endswith(
         "inner_train_ids.json"
     )
+    assert "/runs/test-v5/" in config["output"]["base_dir"]
 
 
 def test_v5_runners_are_dry_run_without_artifacts(tmp_path):

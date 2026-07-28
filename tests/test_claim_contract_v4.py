@@ -173,3 +173,82 @@ def test_claims_defer_bad_content_without_replaying_good_requests(
     )
     assert stats["content_validation"]["error_types"] == {"EmptyClaims": 1}
     assert stats["content_validation"]["unique_rejected_requests"] == 1
+
+
+def test_claims_empty_response_stops_after_configured_attempts(
+    tmp_path, monkeypatch
+):
+    explanations = tmp_path / "explanations.jsonl"
+    claims = tmp_path / "claims.jsonl"
+    explanations.write_text(
+        json.dumps({
+            "customer_id": "opaque-id",
+            "label": 0,
+            "label_name": "female",
+            "sample_id": 0,
+            "explanation": (
+                "The client maintains regular transaction activity.\n"
+                "Final: \\boxed{female}"
+            ),
+            "prompt_hash": "prompt",
+            "client_stats_hash": "client",
+            "summary_stats_hash": "summary",
+            "generation_signature": "explanation",
+            "min_behavioral_explanation_chars": 1,
+            "error": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    calls = 0
+
+    async def always_empty(dialogues, model, llm_config, *, on_batch_complete):
+        nonlocal calls
+        calls += 1
+        result = _result("[]")
+        on_batch_complete([(0, result)])
+        return [result]
+
+    monkeypatch.setattr(
+        "src.pipeline.claims_extractor.batched_query", always_empty
+    )
+    config = {
+        "llm": {"default_model": "test"},
+        "execution": {
+            "until_complete": True,
+            "content_primary_attempts": 1,
+            "content_repair_attempts": 1,
+        },
+        "claims_generation": {"model": "test", "max_tokens": 128},
+        "experiment": {"run_id": "test", "model_slug": "test"},
+        "dataset": {
+            "name": "gender",
+            "label_names": {"0": "female", "1": "male"},
+            "claim_forbidden_terms": [],
+        },
+        "pipeline": {"n_claims_samples": 1},
+        "prompts": {
+            "base_dir": ".",
+            "claims_system": "prompts/common/claims_extraction/system_prompt.txt",
+            "claims_user": "prompts/common/claims_extraction/user_prompt.txt",
+        },
+        "output": {
+            "base_dir": str(tmp_path),
+            "explanations": "explanations.jsonl",
+            "claims": "claims.jsonl",
+        },
+    }
+
+    run_claims_extraction(
+        config, input_path=explanations, output_path=claims
+    )
+
+    assert calls == 2
+    record = json.loads(claims.read_text(encoding="utf-8"))
+    assert record["terminal_content_failure"] is True
+    stats = json.loads(
+        claims.with_suffix(".generation_stats.json").read_text(encoding="utf-8")
+    )
+    assert stats["content_validation"]["max_attempts_for_one_request"] == 2
+    assert next(iter(stats["content_validation"]["attempts_by_request"])).startswith(
+        "opaque-id:0:"
+    )

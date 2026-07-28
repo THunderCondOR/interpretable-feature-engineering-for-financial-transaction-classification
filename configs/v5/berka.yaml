@@ -32,6 +32,7 @@ dataset:
   num_labels: 2
   metric: positive_f1
   primary_metric: positive_f1
+  direct_selection_metric: positive_f1
   positive_label: 1
   splits: {}
 
@@ -61,7 +62,7 @@ pipeline:
   claims_max_tokens: 2048
   few_shot_per_class: 0
   embedding_model: "all-MiniLM-L6-v2"
-  min_behavioral_explanation_chars: 1
+  min_behavioral_explanation_chars: 40
 
 output:
   base_dir: results/v5/berka
