@@ -38,17 +38,33 @@ def main() -> None:
     )
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
-    stages = [
-        "wait_lora_gpu", "v2_cluster_seeds", "v2_granularity",
-        "berka_cluster_stability", "wait_datafusion_api",
-        "datafusion_offline", "datafusion_cluster_stability",
+    v2_cells = [
+        (dataset, model)
+        for dataset in ("rosbank", "gender", "age")
+        for model in ("qwen", "gpt_oss")
     ]
+    stages = ["wait_lora_gpu"]
+    for dataset, model in v2_cells:
+        stages.extend([
+            f"v2_cluster_seeds_{dataset}_{model}",
+            f"v2_granularity_{dataset}_{model}",
+        ])
+    stages.extend([
+        "berka_cluster_stability",
+        "datafusion_offline_qwen",
+        "datafusion_offline_gpt_oss",
+        "wait_datafusion_api",
+        "datafusion_cluster_stability",
+        "resume_lora",
+    ])
     plan = {
         "mode": "execute" if args.execute else "dry-run", "stages": stages,
         "seeds": [17, 101, 947], "cluster_counts": [100, 200, 400, 800],
         "embedding_model": "intfloat/multilingual-e5-large",
         "datafusion_protocol": "public_kfold5_seed100",
         "datafusion_run_id": args.datafusion_run_id,
+        "priority": "datafusion at every completed stability-cell boundary",
+        "resume_after_stability": "reviewer_v10_lora_all_datasets",
     }
     print(json.dumps(plan, indent=2))
     if not args.execute:
@@ -77,19 +93,55 @@ def main() -> None:
             time.sleep(max(5.0, args.poll_seconds))
 
     stage("wait_lora_gpu", wait_lora)
-    stage("v2_cluster_seeds", lambda: run([
-        "scripts/run_v4_cluster_seed_stability.py", "--derived-root", str(V2_ROOT),
-        "--seeds", "17", "101", "947", "--execute",
-    ]))
 
-    def v2_granularity() -> None:
-        for dataset in ("rosbank", "gender", "age"):
-            for model in ("qwen", "gpt_oss"):
-                run([
-                    "scripts/run_v4_stability.py", "--derived-cell",
-                    str(V2_ROOT / dataset / model / "seed_17"), "--execute",
-                ])
-    stage("v2_granularity", v2_granularity)
+    def datafusion_ready(model: str) -> bool:
+        return valid_dataset_completion(
+            Path("logs/runs") / args.datafusion_run_id / "completion"
+            / f"{model}_datafusion_education_dataset.json",
+            run_id=args.datafusion_run_id,
+            dataset="datafusion_education",
+            model=model,
+        )
+
+    def datafusion_offline(model: str) -> None:
+        run([
+            "scripts/run_cv_offline_pipeline.py",
+            "--datasets", "datafusion_education",
+            "--models", model,
+            "--folds", "0,1,2,3,4",
+            "--run-id", args.datafusion_run_id,
+            "--derived-root", str(DATAFUSION_ROOT),
+            "--embedding-model", "intfloat/multilingual-e5-large",
+            "--execute",
+        ])
+
+    def run_ready_datafusion() -> None:
+        # This function is called between every bounded stability cell.  It
+        # never interrupts an in-flight embedding/clustering operation, but a
+        # newly completed Data Fusion model gets the GPU before the next cell.
+        for model in ("qwen", "gpt_oss"):
+            name = f"datafusion_offline_{model}"
+            if name not in completed and datafusion_ready(model):
+                stage(name, lambda model=model: datafusion_offline(model))
+
+    for dataset, model in v2_cells:
+        run_ready_datafusion()
+        stage(f"v2_cluster_seeds_{dataset}_{model}", lambda dataset=dataset, model=model: run([
+            "scripts/run_v4_cluster_seed_stability.py",
+            "--derived-root", str(V2_ROOT),
+            "--datasets", dataset,
+            "--model", model,
+            "--seeds", "17", "101", "947",
+            "--execute",
+        ]))
+        run_ready_datafusion()
+        stage(f"v2_granularity_{dataset}_{model}", lambda dataset=dataset, model=model: run([
+            "scripts/run_v4_stability.py",
+            "--derived-cell", str(V2_ROOT / dataset / model / "seed_17"),
+            "--execute",
+        ]))
+
+    run_ready_datafusion()
     stage("berka_cluster_stability", lambda: run([
         "scripts/run_cv_cluster_stability.py", "--dataset", "berka",
         "--run-id", "reviewer-v5-fixed-new-datasets",
@@ -97,28 +149,31 @@ def main() -> None:
     ]))
 
     def wait_datafusion() -> None:
-        while True:
-            ready = all(valid_dataset_completion(
-                Path("logs/runs") / args.datafusion_run_id / "completion"
-                / f"{model}_datafusion_education_dataset.json",
-                run_id=args.datafusion_run_id, dataset="datafusion_education",
-                model=model,
-            ) for model in ("qwen", "gpt_oss"))
-            if ready:
-                return
-            time.sleep(max(5.0, args.poll_seconds))
+        while any(
+            f"datafusion_offline_{model}" not in completed
+            for model in ("qwen", "gpt_oss")
+        ):
+            run_ready_datafusion()
+            if any(
+                f"datafusion_offline_{model}" not in completed
+                for model in ("qwen", "gpt_oss")
+            ):
+                time.sleep(max(5.0, args.poll_seconds))
+
     stage("wait_datafusion_api", wait_datafusion)
-    stage("datafusion_offline", lambda: run([
-        "scripts/run_cv_offline_pipeline.py", "--datasets", "datafusion_education",
-        "--models", "qwen,gpt_oss", "--folds", "0,1,2,3,4",
-        "--run-id", args.datafusion_run_id, "--derived-root", str(DATAFUSION_ROOT),
-        "--embedding-model", "intfloat/multilingual-e5-large", "--execute",
-    ]))
     stage("datafusion_cluster_stability", lambda: run([
         "scripts/run_cv_cluster_stability.py", "--dataset", "datafusion_education",
         "--run-id", args.datafusion_run_id, "--derived-root", str(DATAFUSION_ROOT),
         "--execute",
     ]))
+    stage("resume_lora", lambda: subprocess.run(
+        [
+            "bash", "scripts/launch_all_lora_queue.sh",
+            "--run-id", "reviewer-v10-lora-all-datasets", "--execute",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    ))
     state["state"] = "completed"
     state["current"] = None
     state["finished_at"] = datetime.now(timezone.utc).isoformat()
