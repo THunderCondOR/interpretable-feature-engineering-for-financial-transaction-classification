@@ -21,7 +21,9 @@ import pandas as pd
 import yaml
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.cluster import MiniBatchKMeans
+from sklearn.decomposition import PCA
 from sklearn.feature_selection import mutual_info_classif
+from sklearn.preprocessing import normalize
 from xgboost import XGBClassifier
 
 from src.experiments.artifacts import (
@@ -40,6 +42,11 @@ from src.experiments.derived_artifacts import (
 from src.experiments.events import append_event
 from src.models.ml_baseline import run_ml_baseline, xgb_objective
 from src.pipeline.cot_features import load_claim_records
+from src.pipeline.clustering_backends import (
+    fit_hdbscan_pca,
+    fit_spherical_kmeans,
+    parse_hdbscan_candidate,
+)
 from src.pipeline.semantic_features import (
     build_semantic_model_from_partition,
     cut_agglomerative_hierarchy,
@@ -62,7 +69,13 @@ def choose_clustering_backend(
     *,
     exact_claim_limit: int = DEFAULT_EXACT_CLAIM_LIMIT,
 ) -> str:
-    if requested not in {"auto", "agglomerative", "minibatch_kmeans"}:
+    if requested not in {
+        "auto",
+        "agglomerative",
+        "minibatch_kmeans",
+        "spherical_kmeans",
+        "hdbscan_pca",
+    }:
         raise ValueError(f"Unsupported clustering backend: {requested}")
     if requested != "auto":
         return requested
@@ -79,10 +92,15 @@ def compatible_candidates(
 ) -> list[str]:
     if backend == "agglomerative":
         return candidates
-    supported = [item for item in candidates if item.startswith("k_")]
+    if backend == "hdbscan_pca":
+        supported = [
+            item for item in candidates if item.startswith("pca")
+        ]
+    else:
+        supported = [item for item in candidates if item.startswith("k_")]
     if not supported:
         raise ValueError(
-            "minibatch_kmeans requires at least one fixed-K candidate"
+            f"{backend} has no compatible clustering candidate"
         )
     return supported
 
@@ -137,6 +155,56 @@ def atomic_copy(source: Path, target: Path) -> None:
     with open(temporary, "rb") as file:
         os.fsync(file.fileno())
     temporary.replace(target)
+
+
+def transform_embedding_geometry(
+    embeddings: dict[str, np.ndarray],
+    *,
+    mode: str,
+    base_signature: str,
+    seed: int,
+) -> tuple[dict[str, np.ndarray], str]:
+    """Fit an optional geometry transform on train embeddings only."""
+    if mode == "raw":
+        return embeddings, fingerprint({
+            "base_embedding_signature": base_signature,
+            "geometry": "raw",
+        })
+    train = np.asarray(embeddings["train"], dtype=np.float32)
+    if mode == "centered":
+        center = train.mean(axis=0, keepdims=True)
+        transformed = {
+            split: normalize(
+                np.asarray(values, dtype=np.float32) - center
+            ).astype(np.float32, copy=False)
+            for split, values in embeddings.items()
+        }
+    elif mode.startswith("pca_whiten_"):
+        requested = int(mode.removeprefix("pca_whiten_"))
+        dimensions = min(requested, train.shape[1], len(train) - 1)
+        if dimensions < 2:
+            raise ValueError("PCA whitening requires at least two dimensions")
+        transformer = PCA(
+            n_components=dimensions,
+            whiten=True,
+            svd_solver="randomized",
+            random_state=int(seed),
+        ).fit(train)
+        transformed = {
+            split: normalize(
+                transformer.transform(
+                    np.asarray(values, dtype=np.float32)
+                )
+            ).astype(np.float32, copy=False)
+            for split, values in embeddings.items()
+        }
+    else:
+        raise ValueError(f"Unknown embedding geometry: {mode}")
+    return transformed, fingerprint({
+        "base_embedding_signature": base_signature,
+        "geometry": mode,
+        "seed": int(seed),
+    })
 
 
 def load_source(source_root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -400,6 +468,7 @@ def stage_path(output_root: Path, stage: str) -> Path:
 def materialize_embeddings(
     *,
     output_root: Path,
+    artifact_root: Path | None = None,
     source: dict[str, Any],
     config: dict[str, Any],
     records: dict[str, list[dict[str, Any]]],
@@ -412,7 +481,8 @@ def materialize_embeddings(
         ),
     )
     spaces = {split: unique_claim_space(rows) for split, rows in records.items()}
-    embedding_dir = output_root / "embeddings"
+    artifact_root = artifact_root or output_root
+    embedding_dir = artifact_root / "embeddings"
     outputs = [
         embedding_dir / f"unique_claims_{split}.parquet"
         for split in ("train", "val", "test")
@@ -427,7 +497,7 @@ def materialize_embeddings(
         configuration={"embedding_model": embedding_model, "normalization": "v1"},
         repo_root=REPO_ROOT,
     )
-    manifest_path = stage_path(output_root, "embeddings")
+    manifest_path = stage_path(artifact_root, "embeddings")
     if compatible_stage(manifest_path, identity):
         embeddings = {
             split: np.load(
@@ -490,6 +560,8 @@ def materialize_hierarchy(
     train_embeddings: np.ndarray,
     embedding_stage: dict[str, Any],
     backend: str,
+    embedding_geometry_signature: str,
+    embedding_artifact_root: Path | None = None,
 ) -> dict[str, Any]:
     hierarchy_path = output_root / "hierarchy" / "train_hierarchy.npz"
     identity = stage_identity(
@@ -498,11 +570,13 @@ def materialize_hierarchy(
         inputs={
             "embedding_stage_signature": embedding_stage["stage_signature"],
             "train_embeddings": files_fingerprint([
-                output_root / "embeddings" / "embeddings_train.npy"
+                (embedding_artifact_root or output_root)
+                / "embeddings" / "embeddings_train.npy"
             ]),
         },
         configuration={
             "backend": backend,
+            "embedding_geometry_signature": embedding_geometry_signature,
             "metric": "cosine" if backend == "agglomerative" else "euclidean_on_unit_vectors",
             "linkage": "average" if backend == "agglomerative" else None,
         },
@@ -559,12 +633,13 @@ def run_candidate(
     hierarchy: dict[str, Any],
     embedding_signature: str,
     hierarchy_signature: str,
+    clustering_seed: int,
 ) -> dict[str, Any]:
     candidate_dir = output_root / "candidates" / candidate
     if hierarchy["backend"] == "agglomerative":
         labels, overlay = candidate_partition(hierarchy, candidate)
         overlay["algorithm"] = "agglomerative_average_cosine"
-    else:
+    elif hierarchy["backend"] in {"minibatch_kmeans", "spherical_kmeans"}:
         if not candidate.startswith("k_"):
             raise ValueError(
                 f"{candidate} is not supported by minibatch_kmeans"
@@ -573,28 +648,56 @@ def run_candidate(
             int(candidate.removeprefix("k_")),
             int(hierarchy["n_samples"]),
         )
-        labels = MiniBatchKMeans(
-            n_clusters=count,
-            batch_size=4096,
-            n_init=3,
-            max_iter=200,
-            random_state=17,
-            reassignment_ratio=0.01,
-        ).fit_predict(np.asarray(embeddings["train"], dtype=np.float32))
-        overlay = {
+        if hierarchy["backend"] == "minibatch_kmeans":
+            labels = MiniBatchKMeans(
+                n_clusters=count,
+                batch_size=4096,
+                n_init=3,
+                max_iter=200,
+                random_state=int(clustering_seed),
+                reassignment_ratio=0.01,
+            ).fit_predict(
+                np.asarray(embeddings["train"], dtype=np.float32)
+            )
+            overlay = {
+                "algorithm": "minibatch_kmeans_unit_embeddings",
+                "n_clusters": count,
+            }
+        else:
+            labels, overlay = fit_spherical_kmeans(
+                embeddings["train"],
+                n_clusters=count,
+                seed=int(clustering_seed),
+            )
+        overlay.update({
             # Retained as inert compatibility metadata; fixed-K formation does
             # not consult this threshold.
             "distance_threshold": 0.01,
-            "n_clusters": count,
-            "algorithm": "minibatch_kmeans_unit_embeddings",
-        }
+            "clustering_seed": int(clustering_seed),
+        })
+    elif hierarchy["backend"] == "hdbscan_pca":
+        parameters = parse_hdbscan_candidate(candidate)
+        labels, overlay = fit_hdbscan_pca(
+            embeddings["train"],
+            **parameters,
+            seed=int(clustering_seed),
+        )
+        overlay.update({
+            "distance_threshold": 0.01,
+            "clustering_seed": int(clustering_seed),
+        })
+    else:
+        raise ValueError(
+            f"Unsupported clustering backend: {hierarchy['backend']}"
+        )
     candidate_config = copy.deepcopy(config)
-    candidate_config.setdefault("clustering", {}).update({
+    clustering_config = candidate_config.setdefault("clustering", {})
+    clustering_config.update({
         **overlay,
         "mode": "label_agnostic",
         "feature_encoding": "binary",
-        "min_client_coverage": 5,
     })
+    clustering_config.setdefault("min_client_coverage", 5)
     identity = stage_identity(
         stage=f"candidate:{candidate}",
         source=source,
@@ -664,6 +767,11 @@ def run_candidate(
         "n_clusters": len(model["feature_names"]),
         "train_assignment_coverage": float(train_assignments["assigned"].mean()),
         "val_assignment_coverage": float(val_assignments["assigned"].mean()),
+        "largest_val_cluster_share": float(
+            val_assignments.loc[val_assignments["assigned"], "cluster_index"]
+            .value_counts(normalize=True)
+            .max()
+        ) if val_assignments["assigned"].any() else 1.0,
     }
     complete_stage(
         manifest_path,
@@ -679,12 +787,31 @@ def run_candidate(
 
 
 def choose_candidate(rows: list[dict[str, Any]], tie_margin: float) -> dict[str, Any]:
-    best_score = max(row["validation_balanced_accuracy"] for row in rows)
-    eligible = [
+    eligible_quality = [
         row
         for row in rows
+        if 50 <= int(row["n_clusters"]) <= 1000
+        and float(row.get("val_assignment_coverage", 1.0)) >= 0.90
+        and float(row.get("largest_val_cluster_share", 0.0)) <= 0.20
+    ]
+    if not eligible_quality:
+        raise ValueError(
+            "No clustering candidate passed cluster-count, coverage, and "
+            "largest-cluster quality gates"
+        )
+    best_score = max(row["validation_balanced_accuracy"] for row in rows)
+    eligible = [
+        row for row in eligible_quality
         if best_score - row["validation_balanced_accuracy"] <= tie_margin
     ]
+    if not eligible:
+        quality_best = max(
+            row["validation_balanced_accuracy"] for row in eligible_quality
+        )
+        eligible = [
+            row for row in eligible_quality
+            if quality_best - row["validation_balanced_accuracy"] <= tie_margin
+        ]
     return sorted(
         eligible,
         key=lambda row: (
@@ -693,6 +820,15 @@ def choose_candidate(rows: list[dict[str, Any]], tie_margin: float) -> dict[str,
             row["candidate"],
         ),
     )[0]
+
+
+def quality_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        row for row in rows
+        if 50 <= int(row["n_clusters"]) <= 1000
+        and float(row.get("val_assignment_coverage", 1.0)) >= 0.80
+        and float(row.get("largest_val_cluster_share", 0.0)) <= 0.20
+    ]
 
 
 def materialize_selected(
@@ -706,35 +842,103 @@ def materialize_selected(
     rows: list[dict[str, Any]],
     tie_margin: float,
 ) -> dict[str, Any]:
-    selected_cluster = choose_candidate(rows, tie_margin)
-    candidate_dir = Path(selected_cluster["candidate_dir"])
-    model = load_model(
-        candidate_dir / "cluster_model.json",
-        candidate_dir / "centroids.npz",
-    )
-    train_assignments = pd.read_parquet(
-        candidate_dir / "claim_assignments_train.parquet"
-    )
-    val_assignments = pd.read_parquet(
-        candidate_dir / "claim_assignments_val.parquet"
-    )
-    representation, representation_rows, selected_frames = (
-        sweep_representations(
+    cluster_rows = quality_candidates(rows)
+    if not cluster_rows:
+        raise ValueError(
+            "No clustering candidate passed cluster-count, coverage, and "
+            "largest-cluster quality gates"
+        )
+    joint_options = []
+    representation_rows = []
+    cached = {}
+    for cluster_row in cluster_rows:
+        candidate = cluster_row["candidate"]
+        candidate_dir = Path(cluster_row["candidate_dir"])
+        candidate_model = load_model(
+            candidate_dir / "cluster_model.json",
+            candidate_dir / "centroids.npz",
+        )
+        candidate_train_assignments = pd.read_parquet(
+            candidate_dir / "claim_assignments_train.parquet"
+        )
+        candidate_val_assignments = pd.read_parquet(
+            candidate_dir / "claim_assignments_val.parquet"
+        )
+        representation, candidate_representation_rows, selected_frames = sweep_representations(
             records=records,
             assignments={
-                "train": train_assignments,
-                "val": val_assignments,
+                "train": candidate_train_assignments,
+                "val": candidate_val_assignments,
             },
-            model=model,
+            model=candidate_model,
             config=config,
             tie_margin=tie_margin,
         )
+        representation_rows.extend([
+            {
+                **item,
+                "candidate": candidate,
+                "n_clusters": int(cluster_row["n_clusters"]),
+            }
+            for item in candidate_representation_rows
+        ])
+        option = {
+            **representation,
+            "candidate": candidate,
+            "n_clusters": int(cluster_row["n_clusters"]),
+            "raw_cluster_validation_balanced_accuracy": float(
+                cluster_row["validation_balanced_accuracy"]
+            ),
+        }
+        joint_options.append(option)
+        cached[candidate] = {
+            "cluster": cluster_row,
+            "candidate_dir": candidate_dir,
+            "model": candidate_model,
+            "train_assignments": candidate_train_assignments,
+            "val_assignments": candidate_val_assignments,
+            "selected_frames": selected_frames,
+            "representation": representation,
+        }
+    best_joint = max(
+        row["validation_balanced_accuracy"] for row in joint_options
     )
+    eligible_joint = [
+        row for row in joint_options
+        if best_joint - row["validation_balanced_accuracy"] <= tie_margin
+    ]
+    selected_joint = sorted(
+        eligible_joint,
+        key=lambda row: (
+            row["n_features"],
+            row["n_clusters"],
+            0 if row["encoding"] == "binary" else 1,
+            -row["validation_balanced_accuracy"],
+            row["candidate"],
+        ),
+    )[0]
+    selected_cluster = cached[selected_joint["candidate"]]["cluster"]
+    candidate_dir = cached[selected_joint["candidate"]]["candidate_dir"]
+    model = cached[selected_joint["candidate"]]["model"]
+    train_assignments = cached[selected_joint["candidate"]][
+        "train_assignments"
+    ]
+    val_assignments = cached[selected_joint["candidate"]]["val_assignments"]
+    selected_frames = cached[selected_joint["candidate"]]["selected_frames"]
+    representation = cached[selected_joint["candidate"]]["representation"]
     selection_payload = {
         "selection_split": "val",
         "cluster_selection_metric": "balanced_accuracy",
+        "selection_mode": "joint_cluster_and_representation",
         "tie_margin": tie_margin,
         "candidates": rows,
+        "joint_candidates": [
+            {
+                key: value for key, value in row.items()
+                if key != "selected_feature_names"
+            }
+            for row in joint_options
+        ],
         "selected_candidate": selected_cluster["candidate"],
         "selected_validation_balanced_accuracy": selected_cluster[
             "validation_balanced_accuracy"
@@ -843,7 +1047,9 @@ def run_ml(
     output_root: Path,
     source: dict[str, Any],
     config: dict[str, Any],
+    experiments: list[str] | None = None,
 ) -> None:
+    experiments = experiments or ["standard", "handcrafted", "cot", "concat"]
     derived = copy.deepcopy(config)
     derived["output"]["base_dir"] = str(output_root)
     derived.setdefault("input", {})["cot_features_base_dir"] = str(output_root)
@@ -859,7 +1065,7 @@ def run_ml(
             for split in ("train", "val", "test")
         ]),
         configuration={
-            "experiments": ["standard", "handcrafted", "cot", "concat"],
+            "experiments": experiments,
             "evaluation": derived["evaluation"],
             "optuna": derived["optuna"],
         },
@@ -871,7 +1077,7 @@ def run_ml(
         return
     run_ml_baseline(
         derived,
-        experiments=["standard", "handcrafted", "cot", "concat"],
+        experiments=experiments,
     )
     complete_stage(manifest_path, identity, outputs=outputs)
 
@@ -892,8 +1098,26 @@ def main() -> None:
     parser.add_argument("--tie-margin", type=float, default=0.005)
     parser.add_argument(
         "--clustering-backend",
-        choices=("auto", "agglomerative", "minibatch_kmeans"),
+        choices=(
+            "auto",
+            "agglomerative",
+            "minibatch_kmeans",
+            "spherical_kmeans",
+            "hdbscan_pca",
+        ),
         default="auto",
+    )
+    parser.add_argument("--clustering-seed", type=int, default=17)
+    parser.add_argument("--min-client-coverage", type=int, default=5)
+    parser.add_argument("--max-assign-distance", type=float, default=0.45)
+    parser.add_argument(
+        "--assignment-quantile",
+        type=float,
+        default=None,
+        help=(
+            "Optional train-derived per-cluster assignment radius quantile "
+            "(for example 0.95)."
+        ),
     )
     parser.add_argument(
         "--exact-claim-limit",
@@ -901,6 +1125,40 @@ def main() -> None:
         default=DEFAULT_EXACT_CLAIM_LIMIT,
     )
     parser.add_argument("--skip-ml", action="store_true")
+    parser.add_argument(
+        "--embedding-model",
+        default=None,
+        help="Override the source config embedding model.",
+    )
+    parser.add_argument(
+        "--embedding-transform",
+        choices=("raw", "centered", "pca_whiten_64", "pca_whiten_128"),
+        default="raw",
+    )
+    parser.add_argument(
+        "--embedding-cache-cell",
+        type=Path,
+        help=(
+            "Optional compatible cell root that owns reusable embedding "
+            "artifacts and its embeddings stage manifest."
+        ),
+    )
+    parser.add_argument(
+        "--ml-experiments",
+        nargs="+",
+        choices=(
+            "standard",
+            "llm_profile",
+            "standard_profile",
+            "handcrafted",
+            "cot",
+            "concat",
+            "standard_cot",
+            "all_nonclaim",
+            "all_features",
+        ),
+        default=["standard", "handcrafted", "cot", "concat"],
+    )
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
 
@@ -917,15 +1175,35 @@ def main() -> None:
         "output_root": str(output_root),
         "candidates": args.candidates,
         "clustering_backend": args.clustering_backend,
+        "clustering_seed": args.clustering_seed,
+        "min_client_coverage": args.min_client_coverage,
+        "max_assign_distance": args.max_assign_distance,
+        "assignment_quantile": args.assignment_quantile,
         "exact_claim_limit": args.exact_claim_limit,
+        "embedding_model": args.embedding_model,
+        "embedding_transform": args.embedding_transform,
+        "embedding_cache_cell": (
+            str(args.embedding_cache_cell)
+            if args.embedding_cache_cell
+            else None
+        ),
         "selection": "validation balanced accuracy; simplest within 0.005",
-        "ml": not args.skip_ml,
+        "ml": None if args.skip_ml else args.ml_experiments,
     }
     print(json.dumps(plan, indent=2, ensure_ascii=False))
     if not args.execute:
         return
 
     manifest, config = load_source(args.source_root)
+    if args.embedding_model:
+        config.setdefault("clustering", {})["embedding_model"] = (
+            args.embedding_model
+        )
+    config.setdefault("clustering", {}).update({
+        "min_client_coverage": int(args.min_client_coverage),
+        "max_assign_distance": float(args.max_assign_distance),
+        "assignment_quantile": args.assignment_quantile,
+    })
     output_root.mkdir(parents=True, exist_ok=True)
     atomic_write_json(output_root / "source_manifest.json", {
         "source_contract": source,
@@ -940,13 +1218,22 @@ def main() -> None:
 
     spaces, embeddings, embedding_signature = materialize_embeddings(
         output_root=output_root,
+        artifact_root=args.embedding_cache_cell,
         source=source,
         config=config,
         records=records,
     )
+    embeddings, embedding_signature = transform_embedding_geometry(
+        embeddings,
+        mode=args.embedding_transform,
+        base_signature=embedding_signature,
+        seed=args.clustering_seed,
+    )
     offline_event(output_root, source, stage="embeddings")
     embedding_stage = json.loads(
-        stage_path(output_root, "embeddings").read_text(encoding="utf-8")
+        stage_path(
+            args.embedding_cache_cell or output_root, "embeddings"
+        ).read_text(encoding="utf-8")
     )
     backend = choose_clustering_backend(
         len(spaces["train"]["texts"]),
@@ -968,6 +1255,8 @@ def main() -> None:
         train_embeddings=embeddings["train"],
         embedding_stage=embedding_stage,
         backend=backend,
+        embedding_geometry_signature=embedding_signature,
+        embedding_artifact_root=args.embedding_cache_cell,
     )
     offline_event(output_root, source, stage="hierarchy")
     hierarchy_stage = json.loads(
@@ -985,6 +1274,7 @@ def main() -> None:
             hierarchy=hierarchy,
             embedding_signature=embedding_signature,
             hierarchy_signature=hierarchy_stage["stage_signature"],
+            clustering_seed=args.clustering_seed,
         )
         for candidate in candidates
     ]
@@ -1016,6 +1306,7 @@ def main() -> None:
             output_root=output_root,
             source=source,
             config=config,
+            experiments=args.ml_experiments,
         )
         offline_event(output_root, source, stage="ml")
     verify_source_unchanged(source)

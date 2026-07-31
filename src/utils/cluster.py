@@ -13,6 +13,14 @@ import torch
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def embedding_input_prefix(model_name: str) -> str:
+    """Return the model-prescribed prefix for non-retrieval feature tasks."""
+    if model_name.startswith("intfloat/multilingual-e5"):
+        return "query: "
+    return ""
+
+
 def embed_texts(texts, model_name="tf-idf"):
     if model_name == "tf-idf":
         # Fallback: simple TF-IDF based embeddings
@@ -31,9 +39,25 @@ def embed_texts(texts, model_name="tf-idf"):
         return embeddings
 
     print("Encoding texts with SentenceTransformer...")
-    model = SentenceTransformer(model_name, device=device)
+    model_kwargs = {
+        "device": device,
+        "trust_remote_code": model_name.startswith("Alibaba-NLP/"),
+    }
+    try:
+        # Resumed runs must not require a fresh metadata request for a model
+        # that is already present in the Hugging Face cache.
+        model = SentenceTransformer(
+            model_name,
+            local_files_only=True,
+            **model_kwargs,
+        )
+    except OSError:
+        # Permit the normal download path only for a genuinely new model.
+        model = SentenceTransformer(model_name, **model_kwargs)
+    prefix = embedding_input_prefix(model_name)
+    prepared = [f"{prefix}{text}" for text in texts]
     return np.asarray(model.encode(
-        list(texts), batch_size=256,
+        prepared, batch_size=256,
         normalize_embeddings=True, show_progress_bar=True,
     ))
 

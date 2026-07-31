@@ -5,6 +5,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -17,7 +18,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.evaluation.reviewer_metrics import cluster_occlusion, surrogate_fidelity
-from src.experiments.artifacts import atomic_write_json, files_fingerprint
+from src.experiments.artifacts import (
+    atomic_write_json,
+    files_fingerprint,
+)
+from src.experiments.derived_artifacts import (
+    compatible_stage,
+    complete_stage,
+    stage_identity,
+)
 
 
 def read_predictions(path: Path) -> pd.DataFrame:
@@ -95,17 +104,86 @@ def teacher_probabilities(frame):
     return values
 
 
-def models(seed, n_classes):
+def surrogate_specs(seed: int, n_classes: int) -> list[dict[str, Any]]:
     objective = "binary:logistic" if n_classes == 2 else "multi:softprob"
-    return {
-        "logistic_regression": LogisticRegression(max_iter=2000, random_state=seed),
-        "xgboost": XGBClassifier(
-            n_estimators=250, max_depth=4, learning_rate=0.05, subsample=0.9,
-            colsample_bytree=0.9, random_state=seed, tree_method="hist",
-            objective=objective, eval_metric="logloss", n_jobs=2,
+    specs: list[dict[str, Any]] = []
+    for complexity, regularization in enumerate((0.1, 1.0)):
+        specs.append({
+            "family": "logistic_regression",
+            "name": f"logistic_c_{regularization:g}",
+            "complexity": complexity,
+            "factory": lambda c=regularization: LogisticRegression(
+                C=c, max_iter=2000, random_state=seed
+            ),
+        })
+    for complexity, depth in enumerate((2, 4)):
+        specs.append({
+            "family": "xgboost",
+            "name": f"xgboost_depth_{depth}",
+            "complexity": complexity,
+            "factory": lambda d=depth: XGBClassifier(
+                n_estimators=250, max_depth=d, learning_rate=0.05,
+                subsample=0.9, colsample_bytree=0.9,
+                random_state=seed, tree_method="hist",
+                objective=objective, eval_metric="logloss", n_jobs=2,
+            ),
+        })
+    for complexity, (depth, leaf) in enumerate(((3, 40), (4, 20))):
+        specs.append({
+            "family": "shallow_tree",
+            "name": f"tree_depth_{depth}_leaf_{leaf}",
+            "complexity": complexity,
+            "factory": lambda d=depth, l=leaf: DecisionTreeClassifier(
+                max_depth=d, min_samples_leaf=l, random_state=seed
+            ),
+        })
+    return specs
+
+
+def rank_features_for_teacher(
+    values: np.ndarray,
+    probabilities: np.ndarray,
+) -> np.ndarray:
+    """Rank train features by association with teacher probabilities only."""
+    x = np.asarray(values, dtype=float)
+    targets = np.asarray(probabilities, dtype=float)
+    centered_x = x - x.mean(axis=0, keepdims=True)
+    x_norm = np.sqrt(np.square(centered_x).sum(axis=0))
+    scores = np.zeros(x.shape[1], dtype=float)
+    for class_index in range(targets.shape[1]):
+        target = targets[:, class_index]
+        centered_target = target - target.mean()
+        denominator = x_norm * np.sqrt(np.square(centered_target).sum())
+        correlation = np.divide(
+            np.abs(centered_x.T @ centered_target),
+            denominator,
+            out=np.zeros_like(denominator),
+            where=denominator > 0,
+        )
+        scores = np.maximum(scores, correlation)
+    return np.argsort(-scores, kind="stable")
+
+
+def select_candidate(
+    candidates: list[dict[str, Any]],
+    *,
+    tie_margin: float,
+) -> dict[str, Any]:
+    best = max(row["hard_agreement"] for row in candidates)
+    eligible = [
+        row for row in candidates
+        if best - row["hard_agreement"] <= float(tie_margin)
+    ]
+    return sorted(
+        eligible,
+        key=lambda row: (
+            row["jensen_shannon_divergence"],
+            row["probability_mae"],
+            row["n_features"],
+            row["complexity"],
+            row["candidate"],
         ),
-        "shallow_tree": DecisionTreeClassifier(max_depth=4, min_samples_leaf=20, random_state=seed),
-    }
+    )[0]
 
 
 def fit_soft_classifier(model, values, probabilities):
@@ -129,6 +207,82 @@ def aligned_probabilities(model, values, n_classes):
     aligned = np.zeros((len(values), n_classes), dtype=float)
     aligned[:, model.classes_.astype(int)] = raw
     return aligned
+
+
+def bootstrap_fidelity(
+    teacher, surrogate, labels, *, samples=1000, seed=17
+):
+    rng = np.random.default_rng(seed)
+    rows = []
+    for _ in range(samples):
+        indices = rng.integers(0, len(labels), size=len(labels))
+        metrics = surrogate_fidelity(
+            teacher[indices], surrogate[indices], labels[indices]
+        )
+        rows.append(metrics)
+    result = {}
+    for metric in (
+        "hard_agreement",
+        "probability_mae",
+        "probability_rmse",
+        "jensen_shannon_divergence",
+    ):
+        values = np.asarray([row[metric] for row in rows], dtype=float)
+        result[metric] = {
+            "mean": float(values.mean()),
+            "ci_low": float(np.quantile(values, 0.025)),
+            "ci_high": float(np.quantile(values, 0.975)),
+        }
+    return result
+
+
+def ranked_occlusion(
+    model,
+    values,
+    features,
+    n_classes,
+    max_clusters,
+    *,
+    encoding="binary",
+):
+    active = np.flatnonzero(values != 0)
+    if not len(active):
+        return None
+    row = np.asarray(values, dtype=float).reshape(1, -1)
+    base = aligned_probabilities(model, row, n_classes)[0]
+    predicted = int(base.argmax())
+    masked = np.repeat(row, len(active), axis=0)
+    masked[np.arange(len(active)), active] = 0
+    if encoding == "normalized_count":
+        totals = masked.sum(axis=1, keepdims=True)
+        masked = np.divide(
+            masked,
+            totals,
+            out=np.zeros_like(masked),
+            where=totals > 0,
+        )
+    impacts = base[predicted] - aligned_probabilities(
+        model, masked, n_classes
+    )[:, predicted]
+    order = np.argsort(-np.abs(impacts), kind="stable")
+    ranked = active[order][:max_clusters].tolist()
+    analyses = {}
+    for count in (1, 3, 5, 10):
+        shown = ranked[:count]
+        if shown:
+            analyses[str(count)] = cluster_occlusion(
+                lambda x: aligned_probabilities(model, x, n_classes),
+                values,
+                shown,
+                encoding=encoding,
+            )
+    return {
+        "ranked_features": [features[index] for index in ranked],
+        "ranked_signed_impacts": [
+            float(impacts[index]) for index in order[:max_clusters]
+        ],
+        "top_k": analyses,
+    }
 
 
 
@@ -183,15 +337,40 @@ def main():
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--cluster-metadata", type=Path)
     parser.add_argument("--max-shown-clusters", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--bootstrap-samples", type=int, default=1000)
+    parser.add_argument("--permutation-controls", type=int, default=20)
+    parser.add_argument("--teacher-seed", type=int, default=17)
+    parser.add_argument("--surrogate-seed", type=int, default=17)
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Deprecated alias for --surrogate-seed.",
+    )
+    parser.add_argument(
+        "--feature-counts", nargs="+", type=int, default=[50, 100],
+    )
+    parser.add_argument("--selection-tie-margin", type=float, default=0.005)
+    parser.add_argument(
+        "--encoding",
+        choices=("binary", "raw_count", "normalized_count"),
+        default="binary",
+    )
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
+    if args.seed is not None:
+        args.surrogate_seed = int(args.seed)
     teacher_filters = {}
     if args.teacher_selection:
         selection = json.loads(args.teacher_selection.read_text(encoding="utf-8"))
         paths = selection["selected"]["paths"]
         validate_selected_teacher(selection, paths)
         teacher_filters = selection["selected"].get("filters", {})
+        if (
+            "seed" in teacher_filters
+            and int(teacher_filters["seed"]) != int(args.teacher_seed)
+        ):
+            raise ValueError(
+                "Teacher selection filter seed does not match --teacher-seed"
+            )
         args.train_teacher = Path(paths["train"])
         args.val_teacher = Path(paths["val"])
         args.test_teacher = Path(paths["test"])
@@ -204,53 +383,240 @@ def main():
     plan = {
         "teacher_selection": "frozen validation-selected teacher inputs",
         "training_target": "teacher probability distribution via weighted label expansion",
+        "surrogate_selection": (
+            "validation hard agreement; Jensen-Shannon and simplicity tie-breaks"
+        ),
         "surrogates": ["logistic_regression", "xgboost", "shallow_tree"],
+        "feature_selection": "train-only association with teacher probabilities",
+        "teacher_seed": int(args.teacher_seed),
+        "surrogate_seed": int(args.surrogate_seed),
+        "encoding": args.encoding,
         "metrics": ["hard agreement", "probability MAE/RMSE", "Jensen-Shannon", "outcome quadrants"],
     }
     if not args.execute:
         print(json.dumps({"mode": "dry-run", **plan}, indent=2))
         return
 
+    input_paths = [
+        args.train_features, args.val_features, args.test_features,
+        args.train_teacher, args.val_teacher, args.test_teacher,
+        Path(__file__),
+        REPO_ROOT / "src/evaluation/reviewer_metrics.py",
+    ]
+    if args.teacher_selection:
+        input_paths.append(args.teacher_selection)
+    if args.cluster_metadata:
+        input_paths.append(args.cluster_metadata)
+    identity = stage_identity(
+        stage="fidelity_v2",
+        source={
+            "teacher_selection": (
+                str(args.teacher_selection) if args.teacher_selection else None
+            ),
+            "teacher_seed": int(args.teacher_seed),
+        },
+        inputs=files_fingerprint(input_paths),
+        configuration={
+            **plan,
+            "feature_counts": args.feature_counts,
+            "selection_tie_margin": args.selection_tie_margin,
+            "bootstrap_samples": args.bootstrap_samples,
+            "permutation_controls": args.permutation_controls,
+        },
+        repo_root=REPO_ROOT,
+    )
+    stage_path = args.output_dir / "fidelity_stage.json"
+    if compatible_stage(stage_path, identity):
+        print(f"Reused compatible fidelity analysis -> {args.output_dir}")
+        return
+
     train = load_cell(args.train_features, args.train_teacher, filters=teacher_filters, split="train")
     val = load_cell(args.val_features, args.val_teacher, filters=teacher_filters, split="val")
     test = load_cell(args.test_features, args.test_teacher, filters=teacher_filters, split="test")
     features = [column for column in train if column.startswith("cot_")]
+    if not features:
+        raise ValueError("Fidelity requires at least one cot_ feature")
+    for split, frame in (("train", train), ("val", val), ("test", test)):
+        if list(frame[features].columns) != features:
+            raise ValueError(f"Feature order mismatch for split={split}")
+        if not np.isfinite(frame[features].to_numpy(float)).all():
+            raise ValueError(f"Non-finite claim features for split={split}")
     n_classes = teacher_probabilities(train).shape[1]
     train_teacher_probabilities = teacher_probabilities(train)
+    train_values = train[features].to_numpy(float)
+    val_values = val[features].to_numpy(float)
+    ranking = rank_features_for_teacher(
+        train_values, train_teacher_probabilities
+    )
+    feature_counts = sorted({
+        min(int(value), len(features))
+        for value in [*args.feature_counts, len(features)]
+        if int(value) > 0
+    })
+    candidate_rows: dict[str, list[dict[str, Any]]] = {}
+    for spec in surrogate_specs(args.surrogate_seed, n_classes):
+        for count in feature_counts:
+            indices = ranking[:count]
+            model = fit_soft_classifier(
+                spec["factory"](),
+                train_values[:, indices],
+                train_teacher_probabilities,
+            )
+            probabilities = aligned_probabilities(
+                model, val_values[:, indices], n_classes
+            )
+            metrics = surrogate_fidelity(
+                teacher_probabilities(val),
+                probabilities,
+                val["label"].to_numpy(int),
+            )
+            candidate_rows.setdefault(spec["family"], []).append({
+                "candidate": spec["name"],
+                "family": spec["family"],
+                "complexity": int(spec["complexity"]),
+                "n_features": int(count),
+                **{
+                    key: metrics[key] for key in (
+                        "hard_agreement",
+                        "probability_mae",
+                        "probability_rmse",
+                        "jensen_shannon_divergence",
+                    )
+                },
+                "_model": model,
+                "_indices": indices,
+                "_spec": spec,
+            })
+    selected_internal = {
+        family: select_candidate(
+            rows, tie_margin=args.selection_tie_margin
+        )
+        for family, rows in candidate_rows.items()
+    }
+    overall = select_candidate(
+        list(selected_internal.values()),
+        tie_margin=args.selection_tie_margin,
+    )
+    selected_surrogate = str(overall["family"])
+    clean = lambda row: {
+        key: value for key, value in row.items() if not key.startswith("_")
+    }
+    selection_payload = {
+        "selection_split": "validation",
+        "primary_metric": "hard_agreement",
+        "tie_margin": args.selection_tie_margin,
+        "selected_surrogate": selected_surrogate,
+        "selected_candidate": clean(overall),
+        "selected_by_family": {
+            family: clean(row)
+            for family, row in selected_internal.items()
+        },
+        "candidates": {
+            family: [clean(row) for row in rows]
+            for family, rows in candidate_rows.items()
+        },
+    }
+
     results, predictions, occlusions = {}, [], []
-    fitted = models(args.seed, n_classes)
-    for name, model in fitted.items():
-        fit_soft_classifier(model, train[features], train_teacher_probabilities)
-        results[name] = {}
+    for family, selected in selected_internal.items():
+        model = selected["_model"]
+        indices = selected["_indices"]
+        selected_features = [features[index] for index in indices]
+        results[family] = {
+            "selected_candidate": clean(selected),
+        }
         for split, frame in (("val", val), ("test", test)):
-            probabilities = aligned_probabilities(model, frame[features], n_classes)
-            results[name][split] = surrogate_fidelity(
-                teacher_probabilities(frame), probabilities, frame["label"].to_numpy(int)
+            values = frame[features].to_numpy(float)[:, indices]
+            probabilities = aligned_probabilities(model, values, n_classes)
+            results[family][split] = surrogate_fidelity(
+                teacher_probabilities(frame), probabilities,
+                frame["label"].to_numpy(int),
+            )
+            results[family][split]["bootstrap"] = bootstrap_fidelity(
+                teacher_probabilities(frame),
+                probabilities,
+                frame["label"].to_numpy(int),
+                samples=args.bootstrap_samples,
+                seed=args.surrogate_seed,
             )
             for row_index, row in frame.reset_index(drop=True).iterrows():
                 predictions.append({
-                    "model": name, "split": split, "customer_id": int(row.customer_id),
+                    "model": family,
+                    "candidate": selected["candidate"],
+                    "split": split,
+                    "customer_id": int(row.customer_id),
                     "label": int(row.label),
-                    **{f"surrogate_prob_{i}": float(probabilities[row_index, i]) for i in range(n_classes)},
+                    **{
+                        f"surrogate_prob_{i}": float(
+                            probabilities[row_index, i]
+                        )
+                        for i in range(n_classes)
+                    },
                 })
                 if split == "test":
-                    values = frame.iloc[row_index][features].to_numpy(dtype=float)
-                    active = np.flatnonzero(values != 0)[: args.max_shown_clusters].tolist()
-                    if active:
+                    analysis = ranked_occlusion(
+                        model, values[row_index], selected_features,
+                        n_classes, args.max_shown_clusters,
+                        encoding=args.encoding,
+                    )
+                    if analysis:
                         occlusions.append({
-                            "model": name,
+                            "model": family,
+                            "candidate": selected["candidate"],
                             "customer_id": int(row.customer_id),
-                            "shown_features": [features[index] for index in active],
-                            **cluster_occlusion(
-                                lambda x: aligned_probabilities(model, x, n_classes),
-                                values,
-                                active,
-                            ),
+                            **analysis,
                         })
+    prior = train_teacher_probabilities.mean(axis=0)
+    prior_test = np.repeat(prior[None, :], len(test), axis=0)
+    results["prior_control"] = surrogate_fidelity(
+        teacher_probabilities(test), prior_test,
+        test["label"].to_numpy(int),
+    )
+    rng = np.random.default_rng(args.surrogate_seed)
+    permutation_results = []
+    control_spec = overall["_spec"]
+    control_indices = overall["_indices"]
+    for permutation in range(args.permutation_controls):
+        shuffled = train_teacher_probabilities[
+            rng.permutation(len(train_teacher_probabilities))
+        ]
+        model = fit_soft_classifier(
+            control_spec["factory"](),
+            train_values[:, control_indices],
+            shuffled,
+        )
+        probabilities = aligned_probabilities(
+            model,
+            test[features].to_numpy(float)[:, control_indices],
+            n_classes,
+        )
+        permutation_results.append(surrogate_fidelity(
+            teacher_probabilities(test), probabilities,
+            test["label"].to_numpy(int),
+        ))
+    results["permutation_control"] = {
+        "matched_surrogate": selected_surrogate,
+        "matched_candidate": overall["candidate"],
+        "n": args.permutation_controls,
+        "hard_agreement": [
+            row["hard_agreement"] for row in permutation_results
+        ],
+        "probability_mae": [
+            row["probability_mae"] for row in permutation_results
+        ],
+    }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(
         args.output_dir / "fidelity_metrics.json",
-        {"protocol": plan, "results": results},
+        {
+            "protocol": plan,
+            "surrogate_selection": selection_payload,
+            "results": results,
+        },
+    )
+    atomic_write_json(
+        args.output_dir / "surrogate_selection.json",
+        selection_payload,
     )
     predictions_path = args.output_dir / "surrogate_predictions.csv"
     predictions_tmp = predictions_path.with_suffix(predictions_path.suffix + ".tmp")
@@ -262,7 +628,10 @@ def main():
         for record in occlusions:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
     occlusion_tmp.replace(occlusion_path)
-    tree_names = features
+    tree_selected = selected_internal["shallow_tree"]
+    tree_indices = tree_selected["_indices"]
+    tree_features = [features[index] for index in tree_indices]
+    tree_names = tree_features
     if args.cluster_metadata:
         payload = json.loads(args.cluster_metadata.read_text(encoding="utf-8"))
         metadata = payload.get("cluster_meta", payload) if isinstance(payload, dict) else payload
@@ -270,11 +639,15 @@ def main():
             str(row.get("feature")): str(row.get("medoid") or row.get("feature"))
             for row in metadata
         }
-        tree_names = [medoids.get(feature, feature)[:120] for feature in features]
+        tree_names = [
+            medoids.get(feature, feature)[:120] for feature in tree_features
+        ]
     tree_path = args.output_dir / "shallow_tree.txt"
     tree_tmp = tree_path.with_suffix(tree_path.suffix + ".tmp")
     tree_tmp.write_text(
-        export_text(fitted["shallow_tree"], feature_names=tree_names),
+        export_text(
+            tree_selected["_model"], feature_names=tree_names
+        ),
         encoding="utf-8",
     )
     tree_tmp.replace(tree_path)
@@ -282,10 +655,29 @@ def main():
     decision_tmp = decision_path.with_suffix(decision_path.suffix + ".tmp")
     with open(decision_tmp, "w", encoding="utf-8") as file:
         for record in tree_decision_paths(
-            fitted["shallow_tree"], test, features, tree_names
+            tree_selected["_model"],
+            test[["customer_id", "label", *tree_features]],
+            tree_features,
+            tree_names,
         ):
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
     decision_tmp.replace(decision_path)
+    complete_stage(
+        stage_path,
+        identity,
+        outputs=[
+            args.output_dir / "fidelity_metrics.json",
+            args.output_dir / "surrogate_selection.json",
+            predictions_path,
+            occlusion_path,
+            tree_path,
+            decision_path,
+        ],
+        metrics={
+            "selected_surrogate": selected_surrogate,
+            "selected_candidate": clean(overall),
+        },
+    )
     print(f"Saved fidelity analysis -> {args.output_dir}")
 
 

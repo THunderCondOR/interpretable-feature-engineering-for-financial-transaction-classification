@@ -62,9 +62,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--split-backend",
-        choices=("pyspark", "sklearn_approx"),
-        default="pyspark",
-        help="Data Fusion only; pyspark is required for the reference protocol.",
+        choices=("sklearn_public", "pyspark", "sklearn_approx"),
+        default="sklearn_public",
+        help=("Data Fusion only; sklearn_public exactly reproduces the public "
+              "KFold(n_splits=5, shuffle=True, random_state=100) protocol."),
     )
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--execute", action="store_true")

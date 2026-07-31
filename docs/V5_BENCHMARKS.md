@@ -5,8 +5,8 @@ changing legacy Gender, Age, or Rosbank artifacts.
 
 ## Protocols
 
-- `datafusion_education / mbd_5fold_seed42`: 8,509 labeled clients, five
-  MBD-style folds, transaction-only input, ROC-AUC primary.
+- `datafusion_education / public_kfold5_seed100`: 8,509 labeled clients, five
+  public-notebook KFold splits, transaction-only input, ROC-AUC primary.
 - `berka / unittab_70_30_5seed`: 682 loans, five 478/204 repeated splits,
   A/C versus B/D, positive-class F1 primary. Transactions are cut strictly
   before loan origination and `UVER` loan-payment records are removed.
@@ -27,7 +27,7 @@ python scripts/prepare_benchmark_dataset.py \
 
 python scripts/prepare_benchmark_dataset.py \
   --dataset datafusion_education \
-  --download --split-backend pyspark --execute
+  --download --split-backend sklearn_public --execute
 
 bash scripts/launch_cv_model_queues.sh \
   --run-id reviewer-v5-fixed-new-datasets
@@ -43,9 +43,11 @@ python scripts/summarize_cv_benchmarks.py \
   --run-id reviewer-v5-fixed-new-datasets --execute
 ```
 
-The exact Data Fusion reference preparation requires `pyspark==3.3.3`.
+The exact public Data Fusion notebook protocol uses scikit-learn
+`KFold(n_splits=5, shuffle=True, random_state=100)` on the original `train.csv`
+row order. The old Spark seed-42 split is retained only in legacy artifacts.
 `--split-backend sklearn_approx` is provided only for diagnostics and its
-results must not be presented as an exact MBD reproduction. The Berka
+results must not be presented as an exact public-notebook reproduction. The Berka
 comparison is protocol-matched but not ID-identical because UniTTab does not
 publish the five test-ID lists.
 

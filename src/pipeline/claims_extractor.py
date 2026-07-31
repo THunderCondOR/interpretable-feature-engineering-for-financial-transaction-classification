@@ -230,6 +230,57 @@ def _parse_claim_result(
         return [], "InvalidAPIResponse", str(exc)
 
 
+def _repair_dialogue(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    rationale: str,
+    forbidden_labels: set[str],
+    attempt: int,
+    primary_attempts: int,
+    max_attempts: int,
+) -> tuple[list[dict[str, str]], str]:
+    """Return an increasingly constrained prompt for content-only retries."""
+    if attempt < primary_attempts:
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ], "primary"
+
+    forbidden = "\n".join(f"- {label}" for label in sorted(forbidden_labels))
+    if attempt < max_attempts - 1:
+        strict = (
+            f"{user_prompt}\n\n"
+            "REPAIR INSTRUCTION:\n"
+            "The previous response could not be parsed. Return only one valid "
+            "JSON array of short atomic claims. Do not add Markdown, prose, or "
+            "an empty array. Every item must begin with \"The client\"."
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": strict},
+        ], "strict_json"
+
+    final_prompt = (
+        "Extract exactly one factual behavioral claim supported by the rationale "
+        "below. Return a JSON array containing exactly one string. The string "
+        "must begin with \"The client\", must be in English, must not contain "
+        "exact numbers, and must not name or imply any target label.\n\n"
+        f"Forbidden target terms:\n{forbidden}\n\n"
+        f"Rationale:\n{rationale}"
+    )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You repair atomic-claim extraction. Output only a non-empty "
+                "JSON array with exactly one factual claim."
+            ),
+        },
+        {"role": "user", "content": final_prompt},
+    ], "exactly_one"
+
+
 def _write_claim_records(
     path: Path,
     ordered_clients: list[EntityId],
@@ -395,10 +446,18 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
         }
 
     existing = _load_successful_claims(save_path, expected_signatures)
-    terminal_existing = _load_terminal_claims(
-        save_path,
-        expected_signatures,
-        max_content_attempts=max_content_attempts,
+    # Exhausted content failures are deliberately not reused in
+    # --until-complete mode. Successful compatible records remain immutable,
+    # while only failed clients enter the new repair protocol.
+    reuse_terminal = bool(llm_cfg.get("reuse_terminal_content_failures", False))
+    terminal_existing = (
+        _load_terminal_claims(
+            save_path,
+            expected_signatures,
+            max_content_attempts=max_content_attempts,
+        )
+        if reuse_terminal
+        else {}
     )
     claims_by_client = {
         customer_id: record
@@ -463,6 +522,8 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                 "source_prompt_hashes": expected_signatures[cid]["source_prompt_hashes"],
                 "source_client_stats_hashes": expected_signatures[cid]["source_client_stats_hashes"],
                 "source_summary_stats_hashes": expected_signatures[cid]["source_summary_stats_hashes"],
+                "rationale": rationale,
+                "user_prompt": user_prompt,
             })
 
     print(
@@ -533,15 +594,33 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
             (
                 f"{canonical_entity_id(item['customer_id'])}:"
                 f"{int(item.get('sample_id', 0))}:"
-                f"{str(item['source_explanation_hash'])[:16]}"
+                f"{str(item['source_explanation_hash'])[:16]}:"
+                "multistage-repair-v1"
             )
             for item in meta
         ]
 
         while pending_indices:
             pass_indices = list(pending_indices)
-            pass_dialogues = [all_dialogues[index] for index in pass_indices]
             pass_meta = [meta[index] for index in pass_indices]
+            pass_modes = []
+            pass_dialogues = []
+            primary_attempts = int(
+                llm_cfg.get("content_primary_attempts", 3)
+            )
+            for original_index, item_meta in zip(pass_indices, pass_meta):
+                request_key = stable_request_keys[original_index]
+                dialogue, mode = _repair_dialogue(
+                    system_prompt=claims_sys,
+                    user_prompt=str(item_meta["user_prompt"]),
+                    rationale=str(item_meta["rationale"]),
+                    forbidden_labels=forbidden_labels,
+                    attempt=int(content_error_attempts.get(request_key, 0)),
+                    primary_attempts=primary_attempts,
+                    max_attempts=max_content_attempts,
+                )
+                pass_dialogues.append(dialogue)
+                pass_modes.append(mode)
             llm_cfg["request_keys"] = [
                 stable_request_keys[index] for index in pass_indices
             ]
@@ -549,6 +628,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                 {
                     "claims_signature": generation_signature,
                     "request_keys": llm_cfg["request_keys"],
+                    "repair_modes": pass_modes,
                 }
             )
 
@@ -586,6 +666,7 @@ def run_claims_extraction(config: dict, *, split: str | None = None, input_path:
                                 "reason": reason,
                                 "attempt": content_error_attempts[request_key],
                                 "terminal": terminal,
+                                "repair_mode": pass_modes[idx],
                             }
                         )
                         if until_complete and not terminal:

@@ -65,3 +65,20 @@ def test_surrogate_fidelity_and_cluster_occlusion():
     assert result["predicted_class"] == 1
     assert result["comprehensiveness"] > 0
     assert result["sufficiency_probability"] == result["base_probability"]
+
+
+def test_normalized_count_occlusion_renormalizes_remaining_features():
+    seen = []
+
+    def predict_proba(x):
+        seen.extend(np.asarray(x, dtype=float).sum(axis=1).tolist())
+        score = np.clip(0.2 + 0.4 * x[:, 0], 0, 1)
+        return np.column_stack([1 - score, score])
+
+    cluster_occlusion(
+        predict_proba,
+        np.array([0.6, 0.4]),
+        [0],
+        encoding="normalized_count",
+    )
+    assert all(np.isclose(value, 1.0) for value in seen)

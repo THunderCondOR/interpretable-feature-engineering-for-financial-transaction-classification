@@ -129,3 +129,69 @@ The gender and age tasks raise ethical concerns because the method may surface o
 ## Confidence
 
 **3**
+
+# AI review
+
+## PAPER SUMMARY
+
+The paper proposes a pipeline for transaction classification that converts LLM-generated Chain-of-Thought rationales into structured, human-readable behavioral features. The method extracts atomic claims from rationales, clusters semantically similar claims, and uses cluster-count vectors with classical classifiers. Experiments on three public banking transaction datasets compare the proposed features with direct few-shot LLMs, LoRA-tuned LLMs, and XGBoost models using aggregate or handcrafted features.
+
+## SUMMARY OF STRENGTHS
+
+    The paper addresses a clear practical problem: financial transaction models often need both predictive utility and inspectable representations. The proposed use of LLM rationales as an intermediate feature-generation source, rather than as final predictions, is a coherent framing for this problem.
+
+    The pipeline’s intended representation is naturally inspectable: each feature corresponds to a cluster of natural-language behavioral claims. Figures 2–3 give concrete examples of claim clusters and a decision tree over CoT-derived features, which helps illustrate the intended audit trail from text claims to model inputs.
+
+    The evaluation includes three public transaction datasets with different targets, and Table 1 shows a consistent pattern: XGBoost on CoT-derived features outperforms direct few-shot LLM inference on all three tasks. This supports the narrower claim that distilling LLM rationales into structured features can use the rationales more effectively than using the same prompted LLMs as direct classifiers.
+
+    The paper acknowledges several important limitations, including dependence on LLM rationale quality, clustering sensitivity, and the lack of faithfulness evaluation.
+
+## SUMMARY OF WEAKNESSES
+
+    The evaluation protocol leaves a serious unresolved risk of label leakage. Section 3 states that the LLM receives “dataset-level summaries,” and Figure 6 prompts the model with “summary data for the entire dataset with user transactions, divided into male and female groups.” If those class-conditioned summaries include validation or test users, the generated rationales and downstream CoT features indirectly use held-out label information. Similarly, Section 5.1 and Figure 12 discuss filtering clusters by class-proportion difference, but it is not specified whether cluster statistics and threshold selection are computed strictly from the training split.
+
+    The auditability claims are stronger than the evidence supports. The abstract claims “fully auditable decision logic,” and Section 2 claims an alternative “without the reliability issues of raw LLM outputs,” yet the pipeline still depends on LLM-generated rationales and LLM-based claim extraction. The decision-tree example in Figure 3 is faithful to that particular tree’s rules by construction, but the main quantitative results use XGBoost, where feature importance is only a partial summary; moreover, the paper does not empirically validate whether claim clusters are consistently meaningful to human auditors or whether the LLM-derived claims are faithful to the data-generating evidence. The wording should distinguish “human-readable intermediate features” from stronger claims of fully audited or faithful decision logic.
+
+    Key details needed to reproduce and evaluate the CoT feature construction are underspecified. Section 3 says claims are “embedded and clustered into semantic groups,” and Appendix A.1 gives broad hyperparameter ranges, but the paper does not specify the embedding model, clustering algorithm, distance metric, selected hyperparameters per dataset, train/test fitting procedure, or exact threshold-selection protocol. Figure 11 gives a cluster-summary prompt for the gender setting, but it remains unclear which model produced cluster summaries and whether analogous prompts/procedures were used for age and churn. The handcrafted and standard aggregate baselines are also underdefined, especially given the description of handcrafted features as “manually engineered and optimized over several iterations” in Section 4.2.
+
+    The empirical reporting limits interpretation of the results. Table 1 reports only accuracy, although macro-F1 or balanced accuracy would be important for class-specific behavior, and AUROC would be informative for the binary tasks. Section 4.2 mentions “10 independent runs,” but Table 1 reports no standard deviations, confidence intervals, or paired significance tests, so small differences such as Handcrafted + CoT versus Handcrafted on Gender and Churn are hard to interpret.
+
+    The results do not show that CoT features add predictive value to strong tabular features. In Table 1, adding CoT features to handcrafted features lowers accuracy on Gender and Churn and changes Age by only $0.001$ relative to handcrafted features alone; the combined representation is also below the best aggregate or handcrafted XGBoost baseline on all tasks. This does not undermine the paper’s accuracy–interpretability trade-off framing, but claims about complementarity to strong tabular features should be stated cautiously.
+
+    The related-work positioning omits several formally published, directly relevant lines of work. LLM-based tabular feature engineering is closely related to the paper’s core framing (Hollmann et al., 2023; Han et al., 2024), and concept bottleneck models are relevant to the claim-cluster representation as a human-readable intermediate feature space (Oikarinen et al., 2023; Espinosa Zarlenga et al., 2023). Rationale or Chain-of-Thought distillation is also important background for using LLM rationales as intermediate supervision (Hsieh et al., 2023). These works affect how the novelty boundary should be drawn; if they predate the submission deadline by the ACL three-month threshold, their omission is material for positioning.
+
+## CLARIFICATION QUESTIONS
+
+    Were all class-conditioned dataset summaries used in prompts, few-shot examples, claim clusters, cluster summaries, cluster-filtering statistics, and filtering thresholds computed using only the training split?
+
+    What exact embedding model, clustering algorithm, distance metric, cluster-filtering criterion, and selected hyperparameters were used for each dataset?
+
+    Were the age and churn prompts identical to the gender prompts except for label names and dataset summaries, or were task-specific prompts used?
+
+    How were the standard aggregate and handcrafted feature sets constructed, and were their hyperparameters tuned under the same validation protocol as the CoT-feature models?
+
+    Are the Table 1 results single runs, means over runs, or best validation-selected runs? What is the variance across independent runs and stochastic LLM decoding seeds?
+
+## ADDITIONAL RELATED WORK
+
+    Hollmann, N., Müller, S., & Hutter, F. (2023). Large language models for automated data science: Introducing CAAFE for context-aware automated feature engineering. In Advances in Neural Information Processing Systems 36. This work is directly relevant because it uses LLMs to generate semantically meaningful tabular features for downstream models.
+
+    Han, S., Yoon, J., Arik, S. O., & Pfister, T. (2024). Large language models can automatically engineer features for few-shot tabular learning. In Proceedings of the 41st International Conference on Machine Learning. This is relevant to the paper’s framing of LLMs as feature generators rather than final predictors.
+
+    Oikarinen, T., Das, S., Nguyen, L. M., & Weng, T.-W. (2023). Label-free concept bottleneck models. In International Conference on Learning Representations. This work is relevant because the proposed claim-cluster counts function as an automatically induced, human-readable intermediate concept space.
+
+    Espinosa Zarlenga, M., Shams, Z., Nelson, M. E., Kim, B., & Jamnik, M. (2023). TabCBM: Concept-based interpretable neural networks for tabular data. Transactions on Machine Learning Research. This is particularly relevant for positioning concept-based interpretability in tabular prediction settings.
+
+    Hsieh, C.-Y., Li, C.-L., Yeh, C.-K., Nakhost, H., Fujii, Y., Ratner, A., Krishna, R., Lee, C.-Y., & Pfister, T. (2023). Distilling step-by-step! Outperforming larger language models with less training data and smaller model sizes. In Findings of the Association for Computational Linguistics: ACL 2023. This work is relevant prior art on using LLM rationales as supervision for smaller downstream models.
+
+    Paul, D., West, R., Bosselut, A., & Faltings, B. (2024). Making reasoning matter: Measuring and improving faithfulness of chain-of-thought reasoning. In Findings of the Association for Computational Linguistics: EMNLP 2024. This work is relevant to the paper’s discussion of CoT faithfulness and the distinction between readable rationales and faithful causal explanations.
+
+## ADDITIONAL DETAIL-ORIENTED FEEDBACK
+
+    Figure 9 prohibits negative or absence claims, but Figure 10 gives the example atomic fact “The client practically does not spend money on everyday purchases.” This inconsistency could affect claim extraction behavior.
+
+    Figure 8 reports “Total transactions: 657,” “Total expenses: -29633111,” and “Average expense per transaction: 218947,” which are not numerically consistent under the usual definition of average expense per transaction. The intended denominator should be clarified.
+
+    Figure 5 is described as a “Pareto front,” but the plotted CoT-feature curve appears dominated by the binary-feature decision-tree curve under the shown axes. A label such as “accuracy–complexity trade-off curves” would be more precise unless only nondominated points are plotted.
+
+    Some figures are difficult to inspect at the printed scale, especially the decision tree in Figure 3. A table listing split feature IDs, representative cluster summaries, and class distributions would make the interpretability example clearer.

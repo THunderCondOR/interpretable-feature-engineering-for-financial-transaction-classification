@@ -384,6 +384,7 @@ def run_fold(
     prepared_root: Path,
     derived_root: Path,
     exact_claim_limit: int,
+    embedding_model: str | None,
     skip_ml: bool,
 ) -> None:
     spec = BENCHMARKS[dataset]
@@ -395,6 +396,10 @@ def run_fold(
     selected_config = load_yaml(
         prompt_selection["selected_configs"][model]["path"]
     )
+    if embedding_model:
+        selected_config.setdefault("clustering", {})[
+            "embedding_model"
+        ] = embedding_model
     source_root = Path(selected_config["output"]["base_dir"])
     fold_manifest = json.loads(
         (
@@ -491,6 +496,11 @@ def main() -> None:
         default=Path("results/v5/derived/cv_main"),
     )
     parser.add_argument("--exact-claim-limit", type=int, default=45_000)
+    parser.add_argument(
+        "--embedding-model",
+        default=None,
+        help="Override the embedding model stored in the generated API config.",
+    )
     parser.add_argument("--skip-ml", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
@@ -507,6 +517,7 @@ def main() -> None:
         "folds": folds,
         "selection": "inner_train -> inner_validation",
         "final_fit": "outer_train -> frozen outer_test transform",
+        "embedding_model": args.embedding_model or "from selected config",
         "ml": not args.skip_ml,
     }, indent=2))
     if not args.execute:
@@ -522,6 +533,7 @@ def main() -> None:
                     prepared_root=args.prepared_root,
                     derived_root=args.derived_root,
                     exact_claim_limit=args.exact_claim_limit,
+                    embedding_model=args.embedding_model,
                     skip_ml=args.skip_ml,
                 )
 

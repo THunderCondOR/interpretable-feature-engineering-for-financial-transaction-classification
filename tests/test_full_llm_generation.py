@@ -8,6 +8,7 @@ import yaml
 
 from scripts.run_full_llm_generation import (
     LLM_STEPS,
+    compatible_preparation_exists,
     completion_payload,
     pipeline_command,
     validate_completion,
@@ -107,6 +108,44 @@ def test_runtime_config_has_independent_seeds_counts_and_exact_paths(tmp_path):
     assert config["output"]["paths_by_split"]["test"]["claims"].endswith(
         "claims_test.jsonl"
     )
+
+
+def test_fast_resume_requires_exact_stats_prompts_and_prompt_hashes(tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    config = {
+        "output": {
+            "base_dir": str(output),
+            "clients_stats": "clients_stats.jsonl",
+            "prompts": "prompts.jsonl",
+        }
+    }
+    expected = {"train": {1, 2}}
+    (output / "clients_stats_train.jsonl").write_text(
+        "".join(
+            json.dumps({"customer_id": customer_id}) + "\n"
+            for customer_id in (1, 2)
+        ),
+        encoding="utf-8",
+    )
+    prompt_path = output / "prompts_train.jsonl"
+    prompt_path.write_text(
+        "".join(
+            json.dumps(
+                {"customer_id": customer_id, "prompt_hash": f"hash-{customer_id}"}
+            )
+            + "\n"
+            for customer_id in (1, 2)
+        ),
+        encoding="utf-8",
+    )
+    assert compatible_preparation_exists(config, ["train"], expected)
+
+    prompt_path.write_text(
+        json.dumps({"customer_id": 1, "prompt_hash": "hash-1"}) + "\n",
+        encoding="utf-8",
+    )
+    assert not compatible_preparation_exists(config, ["train"], expected)
 
 
 def test_full_runner_is_dry_run_and_does_not_materialize_files(tmp_path):

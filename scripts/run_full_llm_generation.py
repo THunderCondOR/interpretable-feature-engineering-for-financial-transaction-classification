@@ -76,19 +76,50 @@ def split_artifact_path(config: dict[str, Any], key: str, split: str) -> Path:
     return output_dir / f"{base.stem}_{split}{base.suffix or '.jsonl'}"
 
 
-def pipeline_command(config_path: Path, splits: list[str]) -> list[str]:
+def pipeline_command(
+    config_path: Path,
+    splits: list[str],
+    *,
+    steps: tuple[str, ...] = LLM_STEPS,
+) -> list[str]:
     return [
         sys.executable,
         "run_pipeline.py",
         "--config",
         str(config_path),
         "--steps",
-        ",".join(LLM_STEPS),
+        ",".join(steps),
         "--splits",
         ",".join(splits),
         "--execute",
         "--until-complete",
     ]
+
+
+def compatible_preparation_exists(
+    config: dict[str, Any],
+    splits: list[str],
+    expected_ids: dict[str, set[EntityId]],
+) -> bool:
+    """Allow watchdog restarts to reuse exact, provenance-bearing prompt inputs."""
+    try:
+        for split in splits:
+            _records_by_customer(
+                split_artifact_path(config, "clients_stats", split),
+                expected_ids[split],
+            )
+            prompts = _records_by_customer(
+                split_artifact_path(config, "prompts", split),
+                expected_ids[split],
+            )
+            if any(
+                not record.get("prompt_hash")
+                for record in prompts.values()
+            ):
+                return False
+    except (FileNotFoundError, ValueError):
+        return False
+    return True
 
 
 def _selected_client_ids(
@@ -384,6 +415,14 @@ def main() -> None:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--execute-api", action="store_true")
     parser.add_argument("--until-complete", action="store_true")
+    parser.add_argument(
+        "--fast-resume",
+        action="store_true",
+        help=(
+            "Reuse exact existing stats/prompts after a watchdog restart; "
+            "falls back to the full preparation pipeline if validation fails."
+        ),
+    )
     args = parser.parse_args()
 
     splits = parse_splits(args.splits)
@@ -540,6 +579,19 @@ def main() -> None:
 
     validate_prompt_inputs(config)
     expected_ids = expected_ids_by_split(config, splits)
+    if args.fast_resume and compatible_preparation_exists(
+        config, splits, expected_ids
+    ):
+        command = pipeline_command(
+            runtime_config,
+            splits,
+            steps=("cot", "llm_eval", "claims"),
+        )
+        print(
+            "[FAST RESUME] Reusing compatible client stats and prompts; "
+            "continuing explanations/direct evaluation/claims.",
+            flush=True,
+        )
     # A failed rerun must not leave a stale success signal for the queue.
     completion_marker.unlink(missing_ok=True)
     if not args.selected_config:

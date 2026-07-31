@@ -34,11 +34,12 @@ def test_compare_clusters_dry_run_does_not_touch_inputs_or_output(tmp_path):
 
 def test_grounding_suite_executes_sample_preparation(monkeypatch, tmp_path):
     calls = []
-    monkeypatch.setattr(
-        run_grounding_suite.subprocess,
-        "run",
-        lambda command, check: calls.append(command),
-    )
+    sample = tmp_path / "grounding_samples.jsonl"
+    def fake_run(command, check):
+        calls.append(command)
+        if command[1] == "scripts/prepare_grounding_sample.py":
+            sample.write_text("", encoding="utf-8")
+    monkeypatch.setattr(run_grounding_suite.subprocess, "run", fake_run)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -47,10 +48,8 @@ def test_grounding_suite_executes_sample_preparation(monkeypatch, tmp_path):
             "--execute",
             "--datasets",
             "gender",
-            "--run-roots",
-            "results",
-            "--run-names",
-            "qwen",
+            "--sources-config",
+            str(tmp_path / "sources.yaml"),
             "--output-dir",
             str(tmp_path),
         ],
@@ -58,10 +57,27 @@ def test_grounding_suite_executes_sample_preparation(monkeypatch, tmp_path):
 
     run_grounding_suite.main()
 
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0][1] == "scripts/prepare_grounding_sample.py"
     assert "--execute" in calls[0]
+    assert calls[1][1] == "scripts/build_grounding_annotation.py"
     assert (tmp_path / "grounding.commands.json").exists()
+
+
+def test_grounding_cost_guard_counts_both_fresh_judges(tmp_path):
+    sample = tmp_path / "sample.jsonl"
+    row = {
+        "sample_id": "s", "client_stats": "x" * 1000,
+        "train_reference_summary": "summary", "field_semantics": "amount",
+        "claim": "The client is active.",
+    }
+    import json
+    sample.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    estimate = run_grounding_suite.estimate_cost(
+        sample, run_grounding_suite.DEFAULT_JUDGES, 192,
+    )
+    assert set(estimate["models"]) == set(run_grounding_suite.DEFAULT_JUDGES)
+    assert estimate["estimated_total_usd"] > 0
 
 
 def test_robustness_api_guard_precedes_side_effects(monkeypatch, tmp_path):

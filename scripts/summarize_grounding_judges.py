@@ -69,6 +69,12 @@ def validate_judge_records(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", nargs="+", required=True, type=Path)
+    parser.add_argument("--expected-judges", nargs="+")
+    parser.add_argument(
+        "--adjudication",
+        type=Path,
+        help="Optional Codex JSON array used only for flagged items.",
+    )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--output-prefix", required=True, type=Path)
     args = parser.parse_args()
@@ -97,7 +103,10 @@ def main() -> None:
     # Each source claim has two initial judges: OpenRouter and the opposite
     # local model. The union of input files contains three judge names, but no
     # individual sample should be forced to have all three.
-    validate_judge_records(df)
+    validate_judge_records(
+        df,
+        set(args.expected_judges) if args.expected_judges else None,
+    )
     args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
 
     grouped_rows = []
@@ -137,6 +146,33 @@ def main() -> None:
             )
 
     item_df = pd.DataFrame(grouped_rows)
+    adjudication_by_id = {}
+    if args.adjudication:
+        payload = json.loads(args.adjudication.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("Adjudication must be a JSON array")
+        for record in payload:
+            sample_id = str(record.get("sample_id"))
+            if sample_id in adjudication_by_id:
+                raise ValueError(f"Duplicate adjudication sample_id={sample_id}")
+            if record.get("verdict") not in GROUNDING_VERDICTS[:-1]:
+                raise ValueError(f"Invalid adjudication verdict for {sample_id}")
+            adjudication_by_id[sample_id] = record
+        expected = set(item_df.loc[item_df["needs_adjudication"], "sample_id"].astype(str))
+        if set(adjudication_by_id) != expected:
+            raise ValueError(
+                "Adjudication IDs do not exactly match disagreement/unsupported tasks"
+            )
+    item_df["final_verdict"] = [
+        adjudication_by_id.get(str(row.sample_id), {}).get(
+            "verdict", row.majority_verdict
+        )
+        for row in item_df.itertuples()
+    ]
+    item_df["verdict_source"] = [
+        "codex_adjudication" if str(sample_id) in adjudication_by_id else "initial_consensus"
+        for sample_id in item_df["sample_id"]
+    ]
     summary_rows = []
     aggregate_metrics = {}
     for keys, group in item_df.groupby(["run_name", "dataset"], dropna=False):
@@ -144,13 +180,20 @@ def main() -> None:
         total = len(group)
         row = {"run_name": run_name, "dataset": dataset, "n": int(total)}
         for verdict in VERDICTS + ["missing"]:
-            row[verdict] = int((group["majority_verdict"] == verdict).sum())
-            row[f"{verdict}_share"] = float((group["majority_verdict"] == verdict).mean()) if total else 0.0
+            row[verdict] = int((group["final_verdict"] == verdict).sum())
+            row[f"{verdict}_share"] = float((group["final_verdict"] == verdict).mean()) if total else 0.0
         row["strict_consensus_share"] = float(group["strict_consensus"].mean()) if total else 0.0
         row["disagreement_share"] = float(group["has_disagreement"].mean()) if total else 0.0
         summary_rows.append(row)
         source = df[(df["run_name"] == run_name) & (df["dataset"] == dataset)]
         _, metrics = grounding_summary(source)
+        metrics["adjudicated"] = {
+            verdict: {
+                "count": int((group["final_verdict"] == verdict).sum()),
+                "share": float((group["final_verdict"] == verdict).mean()),
+            }
+            for verdict in VERDICTS
+        }
         aggregate_metrics[f"{run_name}/{dataset}"] = metrics
 
     item_path = args.output_prefix.with_suffix(".items.csv")

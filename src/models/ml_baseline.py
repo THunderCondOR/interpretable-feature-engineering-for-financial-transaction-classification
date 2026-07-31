@@ -5,6 +5,7 @@ Supported feature sets:
 - llm_profile: the label-agnostic client facts shown in the LLM prompt;
 - standard_profile: standard + llm_profile;
 - handcrafted: deterministic transaction aggregates;
+- all_nonclaim: namespaced standard + prompt-profile + handcrafted features;
 - cot: train-fitted CoT cluster features;
 - concat: handcrafted + CoT features merged by customer_id and label.
 """
@@ -37,6 +38,7 @@ EXPERIMENTS = {
     "cot",
     "concat",
     "standard_cot",
+    "all_nonclaim",
     "all_features",
 }
 
@@ -458,19 +460,30 @@ def merge_feature_frames(cot: pd.DataFrame, handcrafted: pd.DataFrame) -> pd.Dat
 
 def evaluate(model, x: np.ndarray, y: np.ndarray) -> dict:
     preds = model.predict(x)
+    observed_labels = set(
+        np.asarray(np.concatenate([np.asarray(y), np.asarray(preds)]), dtype=int)
+        .tolist()
+    )
+    is_binary_zero_one = observed_labels.issubset({0, 1})
     result = {
         "n": int(len(y)),
         "accuracy": float(accuracy_score(y, preds)),
         "balanced_accuracy": float(balanced_accuracy_score(y, preds)),
         "f1_macro": float(f1_score(y, preds, average="macro", zero_division=0)),
         "f1_weighted": float(f1_score(y, preds, average="weighted", zero_division=0)),
-        "positive_f1": float(
-            f1_score(y, preds, pos_label=1, zero_division=0)
-        ),
         "mcc": float(matthews_corrcoef(y, preds)),
         "confusion_matrix": confusion_matrix(y, preds).tolist(),
     }
-    if hasattr(model, "predict_proba") and len(np.unique(y)) == 2:
+    if is_binary_zero_one:
+        result["positive_f1"] = float(
+            f1_score(y, preds, pos_label=1, zero_division=0)
+        )
+    if (
+        is_binary_zero_one
+        and hasattr(model, "predict_proba")
+        and len(np.unique(y)) == 2
+        and np.asarray(model.predict_proba(x)).shape[1] == 2
+    ):
         result["roc_auc"] = float(roc_auc_score(y, model.predict_proba(x)[:, 1]))
     return result
 
@@ -555,7 +568,10 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
     }
 
     feature_sets = {}
-    if requested & {"standard", "standard_profile", "standard_cot", "all_features"}:
+    if requested & {
+        "standard", "standard_profile", "standard_cot",
+        "all_nonclaim", "all_features",
+    }:
         standard_train_raw = build_standard_features(train_df)
         standard_val_raw = build_standard_features(val_df)
         standard_test_raw = build_standard_features(test_df)
@@ -569,7 +585,9 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
         if "standard" in requested:
             feature_sets["standard"] = standard_pack
 
-    if requested & {"llm_profile", "standard_profile", "all_features"}:
+    if requested & {
+        "llm_profile", "standard_profile", "all_nonclaim", "all_features",
+    }:
         profile_train_raw = build_llm_profile_features(train_df, config)
         profile_val_raw = build_llm_profile_features(val_df, config)
         profile_test_raw = build_llm_profile_features(test_df, config)
@@ -597,7 +615,9 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
                 ],
             }
 
-    if "handcrafted" in requested or requested & {"concat", "all_features"}:
+    if "handcrafted" in requested or requested & {
+        "concat", "all_nonclaim", "all_features",
+    }:
         hc_train_raw = build_handcrafted_features(train_df, config)
         hc_val_raw = build_handcrafted_features(val_df, config)
         hc_test_raw = build_handcrafted_features(test_df, config)
@@ -656,16 +676,49 @@ def build_feature_sets(config: dict, experiments: list[str]) -> dict[str, dict]:
             ],
         }
 
+    def namespaced(frame: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        return frame.rename(columns={
+            column: f"{prefix}__{column}"
+            for column in frame.columns
+            if column not in {"customer_id", "label"}
+        })
+
+    nonclaim_combined = None
+    if requested & {"all_nonclaim", "all_features"}:
+        nonclaim_combined = {}
+        for split, hc_frame in (
+            ("train", hc_train),
+            ("val", hc_val),
+            ("test", hc_test),
+        ):
+            merged = merge_feature_frames(
+                namespaced(standard_pack[split], "standard"),
+                namespaced(profile_pack[split], "profile"),
+            )
+            nonclaim_combined[split] = merge_feature_frames(
+                merged, namespaced(hc_frame, "handcrafted")
+            )
+
+    if "all_nonclaim" in requested:
+        feature_sets["all_nonclaim"] = {
+            **nonclaim_combined,
+            "columns": [
+                column for column in nonclaim_combined["train"]
+                if column not in {"customer_id", "label"}
+            ],
+        }
+
     if "all_features" in requested:
         combined = {}
-        for split, cot_frame, hc_frame in (
-            ("train", cot_train, hc_train),
-            ("val", cot_val, hc_val),
-            ("test", cot_test, hc_test),
+        for split, cot_frame in (
+            ("train", cot_train),
+            ("val", cot_val),
+            ("test", cot_test),
         ):
-            merged = merge_feature_frames(standard_pack[split], profile_pack[split])
-            merged = merge_feature_frames(merged, hc_frame)
-            combined[split] = merge_feature_frames(merged, cot_frame)
+            combined[split] = merge_feature_frames(
+                nonclaim_combined[split],
+                namespaced(cot_frame, "claims"),
+            )
         feature_sets["all_features"] = {
             **combined,
             "columns": [

@@ -1,0 +1,49 @@
+field_semantics:
+  gender: >-
+    Signed cashflow. Negative amounts denote outflow and positive amounts denote
+    inflow. Category lists are top-k summaries, so an omitted category is not
+    evidence that the client never used it.
+  age: >-
+    Amount is unsigned transaction value, not income or expense. Age labels are
+    ordered proxy groups without exact age boundaries. Demographic or life-stage
+    interpretations require transaction evidence.
+  rosbank: >-
+    Transaction direction is defined by operation type. Recency is measured from
+    the fixed train-derived observation end. Category lists are top-k summaries.
+  berka: >-
+    The profile summarizes account transactions and related account attributes.
+    Amount direction and operation semantics must be interpreted only as stated
+    in the profile. Omitted top-k categories are unknown, not absent.
+  datafusion_education: >-
+    Amount is transaction value and category/activity fields describe only the
+    observed transaction history. Education-related interpretations must be
+    supported by the supplied evidence; lifestyle facts cannot be assumed.
+
+sources:
+  - run_name: qwen
+    dataset: gender
+    root: results/v2/gender/guided_zero_shot_v4/qwen/seed_17
+  - run_name: gpt_oss
+    dataset: gender
+    root: results/v2/gender/guided_zero_shot_v4/gpt_oss/seed_17
+  - run_name: qwen
+    dataset: rosbank
+    root: results/v2/rosbank/guided_zero_shot_v4/qwen/seed_17
+  - run_name: gpt_oss
+    dataset: rosbank
+    root: results/v2/rosbank/guided_zero_shot_v4/gpt_oss/seed_17
+  - run_name: qwen
+    dataset: age
+    root: results/v2/age/guided_zero_shot_v4__age_opaque/qwen/seed_17
+  - run_name: gpt_oss
+    dataset: age
+    root: results/v2/age/guided_zero_shot_v4__age_opaque/gpt_oss/seed_17
+
+  - run_name: qwen
+    dataset: berka
+    root_glob: results/v5/runs/reviewer-v5-fixed-new-datasets/berka/unittab_70_30_5seed/fold_*/guided_*_v5/qwen/seed_17
+    expected_roots: 5
+  - run_name: gpt_oss
+    dataset: berka
+    root_glob: results/v5/runs/reviewer-v5-fixed-new-datasets/berka/unittab_70_30_5seed/fold_*/guided_*_v5/gpt_oss/seed_17
+    expected_roots: 5

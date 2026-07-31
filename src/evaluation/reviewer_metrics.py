@@ -195,20 +195,45 @@ def surrogate_fidelity(teacher_probabilities, surrogate_probabilities, labels):
     return result
 
 
-def cluster_occlusion(predict_proba: Callable[[np.ndarray], np.ndarray], x: np.ndarray, shown_indices: list[int]):
+def _occlusion_intervention(
+    row: np.ndarray,
+    removed_indices: list[int],
+    *,
+    encoding: str,
+) -> np.ndarray:
+    changed = np.asarray(row, dtype=float).copy()
+    changed[0, removed_indices] = 0.0
+    if encoding == "normalized_count":
+        total = float(changed.sum())
+        if total > 0:
+            changed /= total
+    return changed
+
+
+def cluster_occlusion(
+    predict_proba: Callable[[np.ndarray], np.ndarray],
+    x: np.ndarray,
+    shown_indices: list[int],
+    *,
+    encoding: str = "binary",
+):
     """Classifier-level occlusion, comprehensiveness, and sufficiency."""
     row = np.asarray(x, dtype=float).reshape(1, -1)
     base = predict_proba(row)[0]
     predicted = int(base.argmax())
     per_cluster = {}
     for index in shown_indices:
-        masked = row.copy()
-        masked[0, index] = 0
+        masked = _occlusion_intervention(
+            row, [index], encoding=encoding
+        )
         per_cluster[str(index)] = float(base[predicted] - predict_proba(masked)[0, predicted])
-    removed = row.copy()
-    removed[0, shown_indices] = 0
+    removed = _occlusion_intervention(
+        row, shown_indices, encoding=encoding
+    )
     only = np.zeros_like(row)
     only[0, shown_indices] = row[0, shown_indices]
+    if encoding == "normalized_count" and float(only.sum()) > 0:
+        only /= float(only.sum())
     return {
         "predicted_class": predicted,
         "base_probability": float(base[predicted]),

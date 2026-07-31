@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 
+import httpx
 from openai import OpenAI
 import yaml
 
@@ -37,7 +38,12 @@ def main() -> None:
     key = os.path.expandvars(os.environ.get("API_KEY", "")).strip()
     if not base.startswith(("http://", "https://")) or not key:
         raise RuntimeError("Resolved API_BASE_URL and API_KEY are required")
-    client = OpenAI(base_url=base, api_key=key, timeout=60.0)
+    client = OpenAI(
+        base_url=base,
+        api_key=key,
+        timeout=60.0,
+        http_client=httpx.Client(trust_env=False),
+    )
     for profile in profiles:
         generation = profile["generation"]
         kwargs = {

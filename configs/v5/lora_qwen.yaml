@@ -1,0 +1,27 @@
+defaults:
+  max_length: 1024
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  learning_rate: 0.0001
+  batch_size: 1
+  eval_batch_size: 2
+  gradient_accumulation_steps: 16
+  num_epochs: 3
+  weight_decay: 0.01
+  warmup_steps: 50
+  logging_steps: 10
+  load_in_4bit: true
+  bf16: true
+  fp16: false
+  optim: paged_adamw_32bit
+  gradient_checkpointing: true
+  save_total_limit: 2
+  seed: 17
+
+models:
+  - name: qwen3_8b
+    model_name: Qwen/Qwen3-8B
+  - name: qwen3_32b
+    model_name: Qwen/Qwen3-32B

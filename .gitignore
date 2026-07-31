@@ -3,6 +3,11 @@ results/
 /data/
 logs/runs/
 reports/*/status.html
+# Runtime analysis exports can be regenerated from immutable result artifacts.
+reports/reviewer-v5-benchmarks-e5/
+reports/reviewer-v8-grounding-ready/
+reports/reviewer-v9-grounding-official-ready/
+*.zip
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

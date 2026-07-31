@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 import openai
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -264,7 +265,12 @@ def main() -> None:
     prompt_record = build_prompts(target, prompt_config, summary, "")[0]
 
     base_url, api_key = _api_environment()
-    client = openai.OpenAI(base_url=base_url, api_key=api_key, max_retries=2)
+    client = openai.OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        max_retries=2,
+        http_client=httpx.Client(trust_env=False),
+    )
     results: list[dict[str, Any]] = []
     try:
         for model_path in args.model_config:

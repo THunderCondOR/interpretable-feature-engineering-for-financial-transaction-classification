@@ -33,7 +33,15 @@ from src.utils.async_api import batched_query
 from src.experiments.artifacts import fingerprint
 
 
-GROUNDING_PROTOCOL_VERSION = 3
+GROUNDING_PROTOCOL_VERSION = 4
+
+CLAIM_TYPES = {
+    "direct_observation",
+    "train_relative_comparison",
+    "temporal_or_activity_interpretation",
+    "higher_level_behavioral_interpretation",
+    "demographic_or_social_inference",
+}
 
 
 SYSTEM_PROMPT = """You are an auditor for claim-level grounding in a financial transaction study.
@@ -56,8 +64,16 @@ relevant transaction-based basis. A verdict is:
 - not_verifiable: the necessary field is genuinely omitted, truncated, or
   semantically ambiguous, so the claim cannot be assessed.
 
-Return only valid JSON with keys verdict, confidence, evidence, and reason.
-confidence must be an integer from 1 to 5. Keep evidence and reason short."""
+Also classify the CLAIM itself with exactly one claim_type:
+- direct_observation;
+- train_relative_comparison;
+- temporal_or_activity_interpretation;
+- higher_level_behavioral_interpretation;
+- demographic_or_social_inference.
+
+Return only valid JSON with keys verdict, claim_type, confidence, evidence, and
+reason. confidence must be an integer from 1 to 5. Keep evidence and reason
+short."""
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -82,14 +98,17 @@ def load_existing(path: Path) -> dict[str, dict[str, Any]]:
 
 
 def make_dialogue(record: dict[str, Any]) -> list[dict[str, str]]:
-    user = f"""CLIENT TRANSACTION SUMMARY:
-{record["client_stats"]}
-
-TRAIN-ONLY REFERENCE SUMMARY:
+    # Put the dataset-level prefix before client-specific evidence. This keeps
+    # the semantics unchanged while allowing providers to cache the repeated
+    # prefix across claims from the same dataset.
+    user = f"""TRAIN-ONLY REFERENCE SUMMARY:
 {record.get("train_reference_summary", "not supplied")}
 
 FIELD SEMANTICS:
 {record.get("field_semantics", "not supplied")}
+
+CLIENT TRANSACTION SUMMARY:
+{record["client_stats"]}
 
 CLAIM:
 {record["claim"]}
@@ -165,7 +184,7 @@ def normalize_verdict(value: Any) -> str:
 def validate_judgment(payload: dict[str, Any] | None) -> str | None:
     if not isinstance(payload, dict):
         return "judgment_not_an_object"
-    missing = {"verdict", "confidence", "evidence", "reason"} - set(payload)
+    missing = {"verdict", "claim_type", "confidence", "evidence", "reason"} - set(payload)
     if missing:
         return "missing_keys:" + ",".join(sorted(missing))
     confidence = payload.get("confidence")
@@ -179,7 +198,22 @@ def validate_judgment(payload: dict[str, Any] | None) -> str | None:
         return "evidence_or_reason_not_string"
     if normalize_verdict(payload.get("verdict")) == "parse_error":
         return "invalid_verdict"
+    if payload.get("claim_type") not in CLAIM_TYPES:
+        return "invalid_claim_type"
     return None
+
+
+def response_usage(result: dict[str, Any]) -> dict[str, int | float | None]:
+    """Extract portable usage fields from an OpenAI-compatible response."""
+    response = result.get("response")
+    usage = getattr(response, "usage", None) if response is not None else None
+    if usage is None:
+        return {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
+    return {
+        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+        "completion_tokens": getattr(usage, "completion_tokens", None),
+        "total_tokens": getattr(usage, "total_tokens", None),
+    }
 
 
 def write_records(path: Path, records: list[dict[str, Any]]) -> None:
@@ -191,6 +225,16 @@ def write_records(path: Path, records: list[dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
+def append_repair_attempts(path: Path, records: list[dict[str, Any]]) -> None:
+    """Keep failed responses for diagnosis without treating them as complete."""
+    if not records:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as file:
+        for record in records:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 async def main_async() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path)
@@ -198,11 +242,18 @@ async def main_async() -> None:
     parser.add_argument("--judge-name", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--api-base-url", required=True)
+    parser.add_argument(
+        "--proxy-url",
+        default=os.environ.get("OPENROUTER_PROXY_URL", "http://127.0.0.1:5300"),
+        help="Explicit proxy used for OpenRouter requests",
+    )
     parser.add_argument("--api-key-env", default=None)
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--max-concurrent", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--max-tokens", type=int, default=192)
+    parser.add_argument("--repair-max-tokens", type=int, default=512)
+    parser.add_argument("--max-repair-rounds", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--source-run-names", nargs="+")
@@ -232,6 +283,8 @@ async def main_async() -> None:
         "model": args.model,
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
+        "reasoning_enabled": False,
+        "response_format": "json_object",
     }, sort_keys=True).encode()).hexdigest()
     loaded_existing = load_existing(args.output)
     sample_by_id = {str(sample["sample_id"]): sample for sample in samples}
@@ -250,7 +303,6 @@ async def main_async() -> None:
     if not pending:
         return
 
-    dialogues = [make_dialogue(record) for record in pending]
     llm_config = {
         "api_base_url": args.api_base_url,
         "api_key": api_key,
@@ -272,6 +324,11 @@ async def main_async() -> None:
         "log_errors": True,
         "log_retries": True,
         "until_complete": True,
+        # Grounding judgments are independent. A malformed answer must not
+        # discard valid paid answers from the same transport batch.
+        "atomic_windows": False,
+        "proxy_url": args.proxy_url,
+        "use_env_proxy": False,
         "request_keys": [str(record["sample_id"]) for record in pending],
         "generation_signature": hashlib.sha256(
             json.dumps({
@@ -283,24 +340,55 @@ async def main_async() -> None:
         ).hexdigest(),
         "scheduler_state_dir": str(args.output.parent / ".scheduler" / args.output.stem),
         "events_path": str(args.output.parent / ".scheduler" / f"{args.output.stem}.events.jsonl"),
+        # Grounding is a short evidence-classification task. Disabling hidden
+        # reasoning keeps frontier judges within the declared token budget and
+        # avoids consuming the JSON output allowance with reasoning tokens.
+        "extra_body": {
+            "reasoning": {"enabled": False},
+            "response_format": {"type": "json_object"},
+        },
     }
 
-    all_records = list(existing.values())
+    all_records = dict(existing)
+    repair_path = args.output.with_name(args.output.stem + ".repair_attempts.jsonl")
+    repair_round = 0
 
-    def checkpoint(batch_results: list[tuple[int, dict[str, Any]]]) -> None:
-        nonlocal all_records
-        staged = []
-        for idx, result in batch_results:
-            sample = pending[idx]
-            content = extract_content(result)
-            parsed, parse_error = parse_json_object(content)
-            validation_error = validate_judgment(parsed)
-            if not parse_error and validation_error:
-                parse_error = validation_error
-            verdict = normalize_verdict(parsed.get("verdict") if parsed else None)
-            if parse_error:
-                verdict = "parse_error"
-            staged.append({
+    while pending:
+        repair_round += 1
+        if repair_round > args.max_repair_rounds + 1:
+            unresolved_path = args.output.with_name(
+                args.output.stem + ".unresolved.jsonl"
+            )
+            write_records(unresolved_path, pending)
+            raise RuntimeError(
+                f"Grounding repair exhausted for {len(pending)} judgments; "
+                f"saved unresolved items to {unresolved_path}"
+            )
+        dialogues = [make_dialogue(record) for record in pending]
+        # The first pass keeps the reviewed cost estimate. Only malformed or
+        # truncated answers get a larger response allowance on repair passes.
+        llm_config["max_tokens"] = (
+            args.max_tokens if repair_round == 1 else args.repair_max_tokens
+        )
+        print(
+            f"judge={args.judge_name} repair_round={repair_round} "
+            f"pending={len(pending)} saved={len(all_records)}"
+        )
+
+        def checkpoint(batch_results: list[tuple[int, dict[str, Any]]]) -> None:
+            staged_valid = []
+            staged_invalid = []
+            for idx, result in batch_results:
+                sample = pending[idx]
+                content = extract_content(result)
+                parsed, parse_error = parse_json_object(content)
+                validation_error = validate_judgment(parsed)
+                if not parse_error and validation_error:
+                    parse_error = validation_error
+                verdict = normalize_verdict(parsed.get("verdict") if parsed else None)
+                if parse_error:
+                    verdict = "parse_error"
+                row = {
                     **sample,
                     "judge_name": args.judge_name,
                     "judge_model": args.model,
@@ -308,6 +396,7 @@ async def main_async() -> None:
                     "grounding_protocol_version": GROUNDING_PROTOCOL_VERSION,
                     "judgment_signature": judgment_signature(sample, judge_signature),
                     "verdict": verdict,
+                    "claim_type": parsed.get("claim_type") if parsed else None,
                     "confidence": parsed.get("confidence") if parsed else None,
                     "evidence": parsed.get("evidence") if parsed else "",
                     "reason": parsed.get("reason") if parsed else "",
@@ -316,16 +405,47 @@ async def main_async() -> None:
                     "transport_error": result.get("error"),
                     "transport_error_type": result.get("error_type"),
                     "execution_time": result.get("execution_time"),
-                })
-        invalid = [row for row in staged if row["verdict"] == "parse_error" or row["transport_error"]]
-        if invalid:
-            raise RuntimeError(f"repairable grounding window errors: {len(invalid)}")
-        all_records.extend(staged)
-        write_records(args.output, all_records)
-        counts = Counter(r["verdict"] for r in all_records)
-        print(f"checkpoint saved={len(all_records)} verdicts={dict(counts)} -> {args.output}")
+                    "usage": response_usage(result),
+                    "response_max_tokens": llm_config["max_tokens"],
+                    "repair_round": repair_round,
+                }
+                if row["verdict"] == "parse_error" or row["transport_error"]:
+                    staged_invalid.append(row)
+                else:
+                    staged_valid.append(row)
 
-    await batched_query(dialogues, args.model, llm_config, on_batch_complete=checkpoint)
+            for row in staged_valid:
+                all_records[str(row["sample_id"])] = row
+            if staged_valid:
+                write_records(
+                    args.output,
+                    [all_records[str(sample["sample_id"])] for sample in samples
+                     if str(sample["sample_id"]) in all_records],
+                )
+            append_repair_attempts(repair_path, staged_invalid)
+            counts = Counter(r["verdict"] for r in all_records.values())
+            error_counts = Counter(
+                (r.get("transport_error_type") or r.get("parse_error") or "unknown")
+                for r in staged_invalid
+            )
+            print(
+                f"checkpoint saved={len(all_records)} valid_in_batch={len(staged_valid)} "
+                f"repair_in_batch={len(staged_invalid)} errors={dict(error_counts)} "
+                f"verdicts={dict(counts)} -> {args.output}"
+            )
+
+        await batched_query(
+            dialogues, args.model, llm_config, on_batch_complete=checkpoint
+        )
+        pending = [
+            record for record in samples
+            if str(record["sample_id"]) not in all_records
+        ]
+        if pending:
+            print(
+                f"repair queue: {len(pending)} judgments remain after round "
+                f"{repair_round}; valid results are already durable"
+            )
 
 
 def main() -> None:

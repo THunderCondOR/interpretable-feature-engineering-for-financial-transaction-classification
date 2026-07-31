@@ -21,6 +21,7 @@ from scripts.run_v4_offline_pipeline import (
     choose_representation,
     compatible_candidates,
     features_from_assignments,
+    transform_embedding_geometry,
 )
 
 
@@ -149,6 +150,20 @@ def test_nearest_centroid_assignment_respects_batch_boundaries():
     assert np.all(distances < 0.1)
 
 
+def test_nearest_centroid_assignment_supports_per_cluster_radii():
+    embeddings = np.asarray([
+        [0.98, 0.20],
+        [0.20, 0.98],
+    ], dtype=np.float32)
+    embeddings /= np.linalg.norm(embeddings, axis=1, keepdims=True)
+    assignments, _ = nearest_centroid_assignments(
+        embeddings,
+        np.eye(2, dtype=np.float32),
+        max_distance=np.asarray([0.01, 0.03], dtype=np.float32),
+    )
+    assert assignments.tolist() == [-1, 1]
+
+
 def test_completed_stage_rejects_modified_output(tmp_path):
     output = tmp_path / "result.json"
     output.write_text('{"value": 1}', encoding="utf-8")
@@ -235,3 +250,19 @@ def test_assignment_features_support_binary_count_and_normalized():
         normalized[["cot_a", "cot_b"]].to_numpy(),
         [[2 / 3, 1 / 3], [0.0, 0.0]],
     )
+
+
+def test_centered_embedding_geometry_is_fitted_from_train_only():
+    embeddings = {
+        "train": np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+        "val": np.asarray([[1.0, 1.0]], dtype=np.float32),
+        "test": np.asarray([[2.0, 0.0]], dtype=np.float32),
+    }
+    transformed, signature = transform_embedding_geometry(
+        embeddings, mode="centered", base_signature="base", seed=17
+    )
+    np.testing.assert_allclose(
+        transformed["train"].mean(axis=0), [0.0, 0.0], atol=1e-6
+    )
+    assert np.isclose(np.linalg.norm(transformed["test"][0]), 1.0)
+    assert signature

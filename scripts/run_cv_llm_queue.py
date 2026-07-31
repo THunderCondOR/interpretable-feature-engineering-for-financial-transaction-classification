@@ -89,8 +89,9 @@ def full_command(
     model: str,
     run_id: str,
     model_config: Path,
+    fast_resume: bool = False,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "scripts/run_full_llm_generation.py",
         "--dataset", dataset,
@@ -105,6 +106,9 @@ def full_command(
         str(completion_path(run_id, dataset, fold, model)),
         "--execute", "--execute-api", "--until-complete",
     ]
+    if fast_resume:
+        command.append("--fast-resume")
+    return command
 
 
 def jobs(
@@ -115,6 +119,7 @@ def jobs(
     gpt_config: Path,
     datasets: tuple[str, ...] = DATASET_ORDER,
     run_pilots: bool = False,
+    fast_resume: bool = False,
 ) -> list[dict[str, Any]]:
     result = []
     profile = qwen_config if model == "qwen" else gpt_config
@@ -154,6 +159,7 @@ def jobs(
                     model=model,
                     run_id=run_id,
                     model_config=profile,
+                    fast_resume=fast_resume,
                 ),
             })
     return result
@@ -343,6 +349,7 @@ def main() -> None:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--execute-api", action="store_true")
     parser.add_argument("--until-complete", action="store_true")
+    parser.add_argument("--fast-resume", action="store_true")
     args = parser.parse_args()
     datasets = tuple(
         value.strip() for value in args.datasets.split(",") if value.strip()
@@ -357,6 +364,7 @@ def main() -> None:
         gpt_config=args.gpt_config,
         datasets=datasets,
         run_pilots=args.run_pilots,
+        fast_resume=args.fast_resume,
     )
     plan = {
         "mode": "execute" if args.execute else "dry-run",
@@ -372,8 +380,18 @@ def main() -> None:
             }
             for job in queue
         ],
-        "main_api_requests_both_models": 183_820,
-        "pilot_requests_qwen": 3 * (5 * 100 + 5 * 400),
+        # Each fold generates one explanation and one claims response for the
+        # complete train+test population; both source models repeat all folds.
+        "main_api_requests_both_models": sum(
+            BENCHMARKS[dataset].n_entities * len(FOLDS) * 2 * 2
+            for dataset in datasets
+        ),
+        "pilot_requests_qwen": sum(
+            3 * len(FOLDS) * (
+                400 if dataset == "datafusion_education" else 100
+            )
+            for dataset in datasets
+        ),
     }
     print(json.dumps(plan, indent=2))
     if not args.execute:

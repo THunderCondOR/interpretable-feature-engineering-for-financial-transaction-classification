@@ -70,6 +70,25 @@ def test_default_v5_queues_run_qwen_pilots_but_not_gpt_pilots():
     ) > [job["dataset"] for job in qwen].index("berka")
 
 
+def test_datafusion_only_queue_has_exact_request_budget():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_cv_llm_queue.py",
+            "--model", "qwen",
+            "--run-id", "budget-test",
+            "--datasets", "datafusion_education",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    plan = json.loads(result.stdout)
+    assert plan["main_api_requests_both_models"] == 170_180
+    assert plan["pilot_requests_qwen"] == 6_000
+
+
 def test_cv_completion_reuse_rejects_wrong_model(tmp_path):
     path = tmp_path / "completion.json"
     split_evidence = {}
@@ -218,6 +237,25 @@ def test_datafusion_approximate_folds_are_disjoint_and_complete():
         assert not set(train) & set(test)
         assert len(set(train) | set(test)) == 101
     assert set().union(*(set(test) for _, test in folds)) == set(
+        labels["customer_id"]
+    )
+
+
+def test_datafusion_public_folds_match_sklearn_kfold_on_original_row_order():
+    labels = pd.DataFrame({
+        "customer_id": [f"id-{value}" for value in [8, 2, 9, 1, 7, 3, 6, 4, 5, 0]],
+        "label": np.arange(10) % 2,
+    })
+    expected_tests = []
+    from sklearn.model_selection import KFold
+
+    for _, test_index in KFold(
+        n_splits=5, shuffle=True, random_state=100
+    ).split(labels):
+        expected_tests.append(set(labels.iloc[test_index]["customer_id"]))
+    actual = datafusion_folds(labels, backend="sklearn_public")
+    assert [set(test) for _, test in actual] == expected_tests
+    assert set().union(*(set(test) for _, test in actual)) == set(
         labels["customer_id"]
     )
 
@@ -461,7 +499,7 @@ def test_paid_preflight_rejects_approximate_datafusion_folds(tmp_path):
     prepared = tmp_path / "prepared"
     for dataset, protocol, count, backend in (
         ("berka", "unittab_70_30_5seed", 682, "numpy_random_state_protocol_match"),
-        ("datafusion_education", "mbd_5fold_seed42", 8509, "sklearn_approx"),
+        ("datafusion_education", "public_kfold5_seed100", 8509, "sklearn_approx"),
     ):
         root = prepared / dataset / protocol
         root.mkdir(parents=True)
@@ -488,5 +526,5 @@ def test_paid_preflight_rejects_approximate_datafusion_folds(tmp_path):
                     "counts": {},
                 },
             )
-    with pytest.raises(RuntimeError, match="pyspark==3.3.3"):
+    with pytest.raises(RuntimeError, match="public notebook folds"):
         validate_prepared(prepared)

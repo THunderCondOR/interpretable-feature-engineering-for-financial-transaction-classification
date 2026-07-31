@@ -31,9 +31,11 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     BitsAndBytesConfig,
+    DataCollatorWithPadding,
     Trainer,
     TrainingArguments,
 )
+from transformers.trainer_utils import get_last_checkpoint
 
 from src.data.aggregator import get_summary_fn
 from src.data.loader import add_features, load_dataset
@@ -80,6 +82,22 @@ def _resolve_lora_runs(config: dict, model_names: list[str] | None = None) -> li
     return selected
 
 
+def _build_lora_instruction(config: dict) -> str:
+    """Task instruction for a sequence-classification head, not generation."""
+    dataset = config["dataset"]
+    label_names = {str(k): v for k, v in dataset["label_names"].items()}
+    options = ", ".join(
+        f"{key} ({value})"
+        for key, value in sorted(label_names.items(), key=lambda item: int(item[0]))
+    )
+    return (
+        "Classify the client using only the observed transaction profile. "
+        f"Task: {dataset['prompt_task_description']} "
+        f"Dataset guidance: {dataset['prompt_dataset_guidance']} "
+        f"Allowed labels: {options}."
+    )
+
+
 def _build_input_text(client_df: pd.DataFrame, config: dict, system_prompt: str) -> str:
     """Build the input text for LoRA from one client's aggregated transaction profile."""
     category_label = config["dataset"].get(
@@ -88,14 +106,8 @@ def _build_input_text(client_df: pd.DataFrame, config: dict, system_prompt: str)
     summary_fn = get_summary_fn(config)
     summary = summary_fn(client_df, category_label)
 
-    label_names = {str(k): v for k, v in config["dataset"]["label_names"].items()}
-    options = ", ".join(
-        f"{k} ({v})" for k, v in sorted(label_names.items(), key=lambda x: int(x[0]))
-    )
-
     return (
-        f"{system_prompt}\n\nCLIENT TRANSACTION PROFILE\n{summary}\n\n"
-        f"ALLOWED LABELS: {options}."
+        f"{system_prompt}\n\nCLIENT TRANSACTION PROFILE\n{summary}"
     )
 
 
@@ -108,8 +120,9 @@ def _prepare_hf_dataset(
 ) -> Dataset:
     """One HF dataset row per client."""
     records = []
-    for cid in df["customer_id"].unique():
-        client_df = df[df["customer_id"] == cid]
+    # Boolean-filtering the complete event table once per client is O(C*N)
+    # and becomes prohibitive for Data Fusion's millions of rows. Group once.
+    for cid, client_df in df.groupby("customer_id", sort=False, observed=True):
         records.append({
             "text": _build_input_text(client_df, config, system_prompt),
             "label": int(client_df["label"].iloc[0]),
@@ -121,7 +134,7 @@ def _prepare_hf_dataset(
         enc = tokenizer(
             batch["text"],
             truncation=True,
-            padding="max_length",
+            padding=False,
             max_length=max_length,
         )
         enc["labels"] = batch["label"]
@@ -130,7 +143,12 @@ def _prepare_hf_dataset(
     return hf_ds.map(tokenize, batched=True, remove_columns=["text"])
 
 
-def _classification_metrics(labels: np.ndarray, logits: np.ndarray, num_labels: int) -> dict:
+def _classification_metrics(
+    labels: np.ndarray,
+    logits: np.ndarray,
+    num_labels: int,
+    positive_label: int = 1,
+) -> dict:
     labels = np.asarray(labels, dtype=int)
     logits = np.asarray(logits)
     preds = logits.argmax(axis=-1)
@@ -143,6 +161,10 @@ def _classification_metrics(labels: np.ndarray, logits: np.ndarray, num_labels: 
         "mcc": float(matthews_corrcoef(labels, preds)),
         "confusion_matrix": confusion_matrix(labels, preds).tolist(),
     }
+    if num_labels == 2:
+        metrics["f1_positive"] = float(
+            f1_score(labels, preds, pos_label=positive_label, zero_division=0)
+        )
 
     try:
         probs = torch.softmax(torch.tensor(logits, dtype=torch.float32), dim=-1).numpy()
@@ -161,10 +183,13 @@ def _classification_metrics(labels: np.ndarray, logits: np.ndarray, num_labels: 
 def _make_compute_metrics(config: dict):
     """Trainer callback: always returns accuracy plus auxiliary metrics."""
     num_labels = int(config["dataset"]["num_labels"])
+    positive_label = int(config["dataset"].get("positive_label", 1))
 
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
-        return _classification_metrics(labels, logits, num_labels)
+        return _classification_metrics(
+            labels, logits, num_labels, positive_label=positive_label
+        )
 
     return compute_metrics
 
@@ -181,8 +206,7 @@ def _load_system_prompt(config: dict) -> str:
 def _build_training_args(run_dir: Path, run_cfg: dict, metric_for_best_model: str) -> TrainingArguments:
     return TrainingArguments(
         output_dir=str(run_dir / "checkpoints"),
-        eval_strategy="steps",
-        eval_steps=int(run_cfg.get("eval_steps", 50)),
+        eval_strategy=str(run_cfg.get("eval_strategy", "epoch")),
         save_strategy="epoch",
         learning_rate=float(run_cfg.get("learning_rate", 2e-4)),
         per_device_train_batch_size=int(run_cfg.get("batch_size", 4)),
@@ -197,9 +221,13 @@ def _build_training_args(run_dir: Path, run_cfg: dict, metric_for_best_model: st
         max_grad_norm=float(run_cfg.get("max_grad_norm", 1.0)),
         optim=str(run_cfg.get("optim", "paged_adamw_32bit")),
         report_to=[],
-        load_best_model_at_end=False,
+        load_best_model_at_end=True,
         metric_for_best_model=metric_for_best_model,
         greater_is_better=True,
+        save_total_limit=int(run_cfg.get("save_total_limit", 2)),
+        seed=int(run_cfg.get("seed", 17)),
+        data_seed=int(run_cfg.get("seed", 17)),
+        gradient_checkpointing=bool(run_cfg.get("gradient_checkpointing", True)),
     )
 
 
@@ -266,7 +294,11 @@ def _train_one(
     model.print_trainable_parameters()
 
     metric_for_best_model = config["dataset"].get("metric", "accuracy")
-    if metric_for_best_model not in {"accuracy", "balanced_accuracy", "f1_macro", "roc_auc"}:
+    if metric_for_best_model == "positive_f1":
+        metric_for_best_model = "f1_positive"
+    if metric_for_best_model not in {
+        "accuracy", "balanced_accuracy", "f1_macro", "f1_positive", "roc_auc"
+    }:
         metric_for_best_model = "accuracy"
 
     training_args = _build_training_args(run_dir, run_cfg, metric_for_best_model)
@@ -278,6 +310,10 @@ def _train_one(
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=_make_compute_metrics(config),
+        data_collator=DataCollatorWithPadding(
+            tokenizer=tokenizer,
+            pad_to_multiple_of=8,
+        ),
     )
     version = tuple(int(x) for x in transformers.__version__.split(".")[:2])
     if version >= (4, 46):
@@ -288,7 +324,15 @@ def _train_one(
     trainer = Trainer(**trainer_kwargs)
 
     print("Training...")
-    trainer.train()
+    checkpoint_root = run_dir / "checkpoints"
+    last_checkpoint = (
+        get_last_checkpoint(str(checkpoint_root))
+        if checkpoint_root.is_dir()
+        else None
+    )
+    if last_checkpoint:
+        print(f"Resuming LoRA training from {last_checkpoint}")
+    trainer.train(resume_from_checkpoint=last_checkpoint)
 
     final_dir = run_dir / "final"
     trainer.save_model(str(final_dir))
@@ -327,14 +371,15 @@ def train(config: dict, model_names: list[str] | None = None) -> None:
     """Train one or more LoRA runs and evaluate each on validation and test splits."""
     runs = _resolve_lora_runs(config, model_names=model_names)
     print("Loading data...")
-    train_df = add_features(load_dataset(config, "train"))
-    val_df = add_features(load_dataset(config, "val"))
-    test_df = add_features(load_dataset(config, "test"))
+    minimal = config.get("pipeline", {}).get("event_features") == "minimal"
+    train_df = add_features(load_dataset(config, "train"), minimal=minimal)
+    val_df = add_features(load_dataset(config, "val"), minimal=minimal)
+    test_df = add_features(load_dataset(config, "test"), minimal=minimal)
     print(f"  train: {train_df['customer_id'].nunique()} clients")
     print(f"  val:   {val_df['customer_id'].nunique()} clients")
     print(f"  test:  {test_df['customer_id'].nunique()} clients")
 
-    system_prompt = _load_system_prompt(config)
+    system_prompt = _build_lora_instruction(config)
     summary = {}
     summary_path = Path(config["output"]["base_dir"]) / "lora_metrics.json"
     if summary_path.exists():

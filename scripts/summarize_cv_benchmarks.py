@@ -24,6 +24,15 @@ from src.experiments.artifacts import atomic_write_json
 from src.experiments.config_builder import load_yaml
 
 
+MODEL_INDEPENDENT_EXPERIMENTS = {
+    "standard",
+    "llm_profile",
+    "standard_profile",
+    "handcrafted",
+    "all_nonclaim",
+}
+
+
 def summary(values: list[float]) -> dict[str, Any]:
     array = np.asarray(values, dtype=float)
     return {
@@ -97,23 +106,77 @@ def ml_rows(
                         "seed": int(seed),
                         "metrics": run["test"],
                     })
+        optional_path = path.with_name("optional_booster_metrics.json")
+        if not optional_path.is_file():
+            continue
+        optional = json.loads(optional_path.read_text(encoding="utf-8"))
+        for feature_set, feature_payload in optional.get(
+            "feature_sets", {}
+        ).items():
+            for classifier, classifier_payload in feature_payload.items():
+                for seed, metrics in classifier_payload.get(
+                    "runs", {}
+                ).items():
+                    rows.append({
+                        "dataset": dataset,
+                        "model": model,
+                        "experiment": feature_set,
+                        "classifier": classifier,
+                        "fold": fold,
+                        "seed": int(seed),
+                        "metrics": metrics,
+                    })
     return rows
 
 
 def aggregate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     cells: dict[tuple, list[dict[str, Any]]] = {}
     for row in rows:
+        reported_model = (
+            "shared"
+            if row["experiment"] in MODEL_INDEPENDENT_EXPERIMENTS
+            else row["model"]
+        )
         key = (
-            row["dataset"], row["model"], row["experiment"], row["classifier"]
+            row["dataset"],
+            reported_model,
+            row["experiment"],
+            row["classifier"],
         )
         cells.setdefault(key, []).append(row)
     output = []
     for key, cell in sorted(cells.items()):
+        if key[1] == "shared":
+            deduplicated = {}
+            for row in cell:
+                identity = (row["fold"], row["seed"])
+                previous = deduplicated.get(identity)
+                if previous is not None and previous["metrics"] != row["metrics"]:
+                    raise ValueError(
+                        "Model-independent feature metrics disagree across "
+                        f"source models for {key}: fold/seed={identity}"
+                    )
+                deduplicated[identity] = row
+            cell = list(deduplicated.values())
         metric_names = sorted({
             metric for row in cell for metric, value in row["metrics"].items()
             if isinstance(value, (int, float))
             and metric not in {"n", "n_rows", "n_scored", "n_skipped", "n_errors"}
         })
+        fold_metric_values: dict[str, list[float]] = {
+            metric: [] for metric in metric_names
+        }
+        for fold in sorted({row["fold"] for row in cell}):
+            fold_rows = [row for row in cell if row["fold"] == fold]
+            for metric in metric_names:
+                seed_values = [
+                    float(row["metrics"][metric])
+                    for row in fold_rows if metric in row["metrics"]
+                ]
+                if seed_values:
+                    fold_metric_values[metric].append(
+                        float(np.mean(seed_values))
+                    )
         output.append({
             "dataset": key[0],
             "model": key[1],
@@ -121,11 +184,9 @@ def aggregate(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "classifier": key[3],
             "folds": sorted({row["fold"] for row in cell}),
             "seeds": sorted({row["seed"] for row in cell}),
+            "seed_fold_runs": len(cell),
             "metrics": {
-                metric: summary([
-                    float(row["metrics"][metric])
-                    for row in cell if metric in row["metrics"]
-                ])
+                metric: summary(fold_metric_values[metric])
                 for metric in metric_names
             },
         })

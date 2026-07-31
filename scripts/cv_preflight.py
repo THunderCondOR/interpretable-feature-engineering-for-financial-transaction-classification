@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.data.benchmark_registry import BENCHMARKS
+from src.data.benchmark_registry import BENCHMARKS, DATA_FUSION_SPLIT_BACKEND
 from src.experiments.config_builder import load_yaml
 from src.pipeline.prompt_builder import validate_prompt_contract
 
@@ -69,11 +69,11 @@ def validate_prepared(prepared_root: Path) -> dict:
                 raise RuntimeError(f"Incompatible fold manifest: {path}")
             if (
                 dataset == "datafusion_education"
-                and manifest.get("split_backend") != "pyspark_3.3.3"
+                and manifest.get("split_backend") != DATA_FUSION_SPLIT_BACKEND
             ):
                 raise RuntimeError(
-                    "Paid Data Fusion runs require fold manifests prepared "
-                    "with pyspark==3.3.3; sklearn_approx is diagnostic only"
+                    "Paid Data Fusion runs require exact public notebook folds "
+                    "(KFold(5, shuffle=True, random_state=100))"
                 )
             if set(manifest["ids"]["outer_train"]) & set(
                 manifest["ids"]["outer_test"]

@@ -6,6 +6,7 @@ from scripts.run_llm_seed_stability import completed_marker
 from scripts.run_v4_cluster_seed_stability import (
     assignment_agreement,
     partition_for_seed,
+    stability_output_root,
 )
 from scripts.run_v4_ml_suite import completed_ml_intact
 
@@ -45,6 +46,17 @@ def test_assignment_agreement_aligns_by_claim_id():
     metrics = assignment_agreement(left, right)
     assert metrics["ari"] == 1.0
     assert metrics["nmi"] == 1.0
+
+
+def test_backend_override_uses_separate_stability_namespace(tmp_path):
+    selected = stability_output_root(tmp_path, None)
+    minibatch = stability_output_root(tmp_path, "minibatch_kmeans")
+    assert selected == tmp_path / "stability" / "cluster_seeds"
+    assert (
+        minibatch
+        == tmp_path / "stability" / "cluster_seeds_minibatch_kmeans"
+    )
+    assert selected != minibatch
 
 
 def test_completion_marker_requires_exact_seed(tmp_path):

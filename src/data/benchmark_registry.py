@@ -11,7 +11,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, train_test_split
 
 from src.data.mcc import MCC_TO_DESC_EN
 from src.experiments.artifacts import atomic_write_json, file_sha256, fingerprint
@@ -19,7 +19,9 @@ from src.experiments.artifacts import atomic_write_json, file_sha256, fingerprin
 
 BERKA_SEEDS = (9, 17, 101, 137, 947)
 DATA_FUSION_FOLDS = 5
-DATA_FUSION_SEED = 42
+DATA_FUSION_SEED = 100
+DATA_FUSION_PROTOCOL = "public_kfold5_seed100"
+DATA_FUSION_SPLIT_BACKEND = "sklearn_kfold_5_shuffle_seed100"
 
 
 @dataclass(frozen=True)
@@ -38,11 +40,12 @@ class BenchmarkSpec:
 BENCHMARKS: dict[str, BenchmarkSpec] = {
     "datafusion_education": BenchmarkSpec(
         name="datafusion_education",
-        protocol="mbd_5fold_seed42",
+        protocol=DATA_FUSION_PROTOCOL,
         primary_metric="roc_auc",
         direct_selection_metric="balanced_accuracy",
         entity_column="user_id",
         n_entities=8_509,
+        comparison="exact_public_notebook_cv",
     ),
     "berka": BenchmarkSpec(
         name="berka",
@@ -57,6 +60,16 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
 
 
 DATA_FUSION_BASELINES = {
+    "Public notebook LightGBM": {
+        "mean": 0.7907806245200886,
+        "sd": None,
+        "metric": "roc_auc",
+    },
+    "Public notebook LightAutoML": {
+        "mean": 0.7998594657582396,
+        "sd": None,
+        "metric": "roc_auc",
+    },
     "Aggregation": {"mean": 0.793, "sd": 0.013, "metric": "roc_auc"},
     "CoLES": {"mean": 0.784, "sd": 0.012, "metric": "roc_auc"},
     "TabBERT": {"mean": 0.762, "sd": 0.014, "metric": "roc_auc"},
@@ -393,7 +406,24 @@ def datafusion_folds(
     *,
     backend: str,
 ) -> list[tuple[list[str], list[str]]]:
-    """Create the five MBD folds, requiring Spark for the reference protocol."""
+    """Create Data Fusion folds, including the exact public-notebook CV."""
+    if backend == "sklearn_public":
+        # The public notebook applies KFold directly to train.csv. Preserve its
+        # row order: sorting opaque IDs here would silently change every fold.
+        original = labels.reset_index(drop=True)
+        splitter = KFold(
+            n_splits=DATA_FUSION_FOLDS,
+            shuffle=True,
+            random_state=DATA_FUSION_SEED,
+        )
+        return [
+            (
+                _stable_ids(original.iloc[train_idx]["customer_id"]),
+                _stable_ids(original.iloc[test_idx]["customer_id"]),
+            )
+            for train_idx, test_idx in splitter.split(original)
+        ]
+
     ordered = labels.sort_values("customer_id").reset_index(drop=True)
     if backend == "pyspark":
         try:
@@ -486,10 +516,10 @@ def prepare_benchmark(
         folds = datafusion_folds(labels, backend=split_backend)
         seeds = (DATA_FUSION_SEED,) * 5
         inner_size = 400
-        backend = (
-            "pyspark_3.3.3"
-            if split_backend == "pyspark" else split_backend
-        )
+        backend = {
+            "sklearn_public": DATA_FUSION_SPLIT_BACKEND,
+            "pyspark": "pyspark_3.3.3",
+        }.get(split_backend, split_backend)
     labels.to_parquet(dataset_root / "labels.parquet", index=False)
 
     fold_manifests = []

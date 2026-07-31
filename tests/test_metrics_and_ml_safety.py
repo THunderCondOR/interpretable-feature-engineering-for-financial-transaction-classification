@@ -1,5 +1,6 @@
 import json
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -7,6 +8,7 @@ from scripts.run_gender_v2 import _metric
 from src.models.ml_baseline import (
     build_handcrafted_features,
     build_llm_profile_features,
+    evaluate,
     merge_feature_frames,
     prediction_artifact_complete,
     validate_client_feature_frame,
@@ -27,6 +29,32 @@ def test_llm_metrics_exclude_rows_with_error_even_when_prediction_exists():
     assert result["n_skipped"] == 1
     assert result["coverage"] == 0.5
     assert result["accuracy"] == 1.0
+
+
+def test_ml_evaluator_omits_binary_only_metrics_for_multiclass_targets():
+    class MulticlassModel:
+        def predict(self, features):
+            return np.asarray([0, 2, 1, 2])
+
+        def predict_proba(self, features):
+            return np.asarray(
+                [
+                    [0.8, 0.1, 0.1],
+                    [0.1, 0.1, 0.8],
+                    [0.1, 0.8, 0.1],
+                    [0.1, 0.2, 0.7],
+                ]
+            )
+
+    metrics = evaluate(
+        MulticlassModel(),
+        np.zeros((4, 1)),
+        np.asarray([0, 1, 1, 2]),
+    )
+    assert "positive_f1" not in metrics
+    assert "roc_auc" not in metrics
+    assert metrics["accuracy"] == 0.75
+    assert metrics["f1_macro"] > 0
 
 
 def test_gender_metric_recomputes_legacy_on_exact_pilot_ids(tmp_path):

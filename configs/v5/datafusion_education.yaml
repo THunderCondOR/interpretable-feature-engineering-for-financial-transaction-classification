@@ -1,6 +1,6 @@
 dataset:
   name: datafusion_education
-  benchmark_protocol: mbd_5fold_seed42
+  benchmark_protocol: public_kfold5_seed100
   modality: transactions_only
   amount_semantics: signed_cashflow
   amount_unit: dataset_native_units

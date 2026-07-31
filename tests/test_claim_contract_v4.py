@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from src.pipeline.claims_extractor import (
     _behavioral_text,
     _parse_claim_result,
+    _repair_dialogue,
     _validate_claims,
     run_claims_extraction,
 )
@@ -83,6 +84,27 @@ def test_claim_parser_rejects_truncation_and_non_string_schema():
     claims, error_type, _ = _parse_claim_result(_result('["valid", 2]'))
     assert claims == []
     assert error_type == "InvalidClaimsSchema"
+
+
+def test_claim_repair_protocol_becomes_stricter_and_ends_with_one_claim():
+    common = {
+        "system_prompt": "Extract claims.",
+        "user_prompt": "Rationale: active client",
+        "rationale": "The client remains active.",
+        "forbidden_labels": {"retained", "churned"},
+        "primary_attempts": 2,
+        "max_attempts": 4,
+    }
+    primary, primary_mode = _repair_dialogue(attempt=0, **common)
+    strict, strict_mode = _repair_dialogue(attempt=2, **common)
+    final, final_mode = _repair_dialogue(attempt=3, **common)
+
+    assert primary_mode == "primary"
+    assert strict_mode == "strict_json"
+    assert final_mode == "exactly_one"
+    assert "REPAIR INSTRUCTION" in strict[-1]["content"]
+    assert "exactly one" in final[-1]["content"]
+    assert "retained" in final[-1]["content"]
 
 
 def test_claims_defer_bad_content_without_replaying_good_requests(
@@ -252,3 +274,85 @@ def test_claims_empty_response_stops_after_configured_attempts(
     assert next(iter(stats["content_validation"]["attempts_by_request"])).startswith(
         "opaque-id:0:"
     )
+
+
+def test_terminal_claim_is_repaired_on_next_until_complete_invocation(
+    tmp_path, monkeypatch
+):
+    explanations = tmp_path / "explanations.jsonl"
+    claims = tmp_path / "claims.jsonl"
+    explanations.write_text(
+        json.dumps({
+            "customer_id": 9,
+            "label": 0,
+            "label_name": "female",
+            "sample_id": 0,
+            "explanation": (
+                "The client maintains regular transaction activity.\n"
+                "Final: \\boxed{female}"
+            ),
+            "prompt_hash": "prompt",
+            "client_stats_hash": "client",
+            "summary_stats_hash": "summary",
+            "generation_signature": "explanation",
+            "min_behavioral_explanation_chars": 1,
+            "error": None,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    calls = 0
+
+    async def first_terminal_then_success(
+        dialogues, model, llm_config, *, on_batch_complete
+    ):
+        nonlocal calls
+        calls += 1
+        result = (
+            _result("[]")
+            if calls <= 2
+            else _result(
+                '["The client maintains regular transaction activity."]'
+            )
+        )
+        on_batch_complete([(0, result)])
+        return [result]
+
+    monkeypatch.setattr(
+        "src.pipeline.claims_extractor.batched_query",
+        first_terminal_then_success,
+    )
+    config = {
+        "llm": {"default_model": "test"},
+        "execution": {
+            "until_complete": True,
+            "content_primary_attempts": 1,
+            "content_repair_attempts": 1,
+        },
+        "claims_generation": {"model": "test", "max_tokens": 128},
+        "experiment": {"run_id": "test", "model_slug": "test"},
+        "dataset": {
+            "name": "gender",
+            "label_names": {"0": "female", "1": "male"},
+            "claim_forbidden_terms": [],
+        },
+        "pipeline": {"n_claims_samples": 1},
+        "prompts": {
+            "base_dir": ".",
+            "claims_system": "prompts/common/claims_extraction/system_prompt.txt",
+            "claims_user": "prompts/common/claims_extraction/user_prompt.txt",
+        },
+        "output": {
+            "base_dir": str(tmp_path),
+            "explanations": "explanations.jsonl",
+            "claims": "claims.jsonl",
+        },
+    }
+
+    run_claims_extraction(config, input_path=explanations, output_path=claims)
+    terminal = json.loads(claims.read_text(encoding="utf-8"))
+    assert terminal["terminal_content_failure"] is True
+
+    run_claims_extraction(config, input_path=explanations, output_path=claims)
+    repaired = json.loads(claims.read_text(encoding="utf-8"))
+    assert repaired["claims"]
+    assert not repaired.get("terminal_content_failure")

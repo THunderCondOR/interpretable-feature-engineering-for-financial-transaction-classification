@@ -90,6 +90,7 @@ def test_grounding_protocol_keeps_evidence_roles_and_verdicts_disjoint():
 def test_grounding_judgment_schema_is_strict():
     valid = {
         "verdict": "supported",
+        "claim_type": "direct_observation",
         "confidence": 4,
         "evidence": "The supplied category is present.",
         "reason": "The claim is a qualitative paraphrase.",
@@ -98,3 +99,4 @@ def test_grounding_judgment_schema_is_strict():
     assert validate_judgment({**valid, "confidence": 4.0}) == "confidence_not_integer"
     assert validate_judgment({**valid, "confidence": 6}) == "confidence_out_of_range"
     assert validate_judgment({**valid, "verdict": "maybe"}) == "invalid_verdict"
+    assert validate_judgment({**valid, "claim_type": "guess"}) == "invalid_claim_type"

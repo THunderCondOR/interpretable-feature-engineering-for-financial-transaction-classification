@@ -10,7 +10,7 @@ from sklearn.feature_selection import mutual_info_classif
 from sklearn.metrics.pairwise import cosine_distances
 
 from src.experiments.artifacts import fingerprint
-from src.utils.cluster import embed_texts
+from src.utils.cluster import embed_texts, embedding_input_prefix
 from src.data.entity_ids import canonical_entity_id
 
 Embedder = Callable[..., np.ndarray]
@@ -92,7 +92,10 @@ def fit_text_embedding_space(texts, model_name, *, embedder: Embedder = embed_te
         })
         return _normal(embeddings), transformer, signature
     embeddings = _normal(embedder(texts, model_name=model_name))
-    return embeddings, None, fingerprint({"model_name": model_name})
+    return embeddings, None, fingerprint({
+        "model_name": model_name,
+        "input_prefix": embedding_input_prefix(model_name),
+    })
 
 
 def transform_text_embedding_space(
@@ -112,14 +115,23 @@ def transform_text_embedding_space(
 
 def _settings(config):
     legacy, explicit = config.get("pipeline", {}), config.get("clustering", {})
-    return {
+    settings = {
         "distance_threshold": float(explicit.get("distance_threshold", legacy.get("distance_threshold", 0.01))),
         "n_clusters": explicit.get("n_clusters"),
         "min_client_coverage": int(explicit.get("min_client_coverage", legacy.get("min_cluster_size", 5))),
         "max_train_distance": float(explicit.get("max_train_distance", 1.0)),
         "max_assign_distance": float(explicit.get("max_assign_distance", legacy.get("max_assign_distance", 0.45))),
+        "assignment_quantile": (
+            float(explicit["assignment_quantile"])
+            if explicit.get("assignment_quantile") is not None
+            else None
+        ),
         "feature_encoding": explicit.get("feature_encoding", "binary"),
     }
+    quantile = settings["assignment_quantile"]
+    if quantile is not None and not 0.0 < quantile <= 1.0:
+        raise ValueError("assignment_quantile must be in (0, 1]")
+    return settings
 
 
 def _cluster(embeddings, settings):
@@ -254,8 +266,11 @@ def build_semantic_model_from_partition(
         "embedding_model", config.get("pipeline", {}).get("embedding_model", "tf-idf")
     )
     settings = _settings(config)
-    centroids, metadata = [], []
+    centroids, metadata, assignment_max_distances = [], [], []
     for raw_id in sorted(set(raw_ids.tolist())):
+        if int(raw_id) < 0:
+            # Density-clustering noise is intentionally left unassigned.
+            continue
         unique_indices = np.flatnonzero(raw_ids == raw_id)
         center = _centroid(embeddings[unique_indices])
         initial = cosine_distances(embeddings[unique_indices], center.reshape(1, -1)).ravel()
@@ -269,7 +284,13 @@ def build_semantic_model_from_partition(
         medoid_index = int(accepted[int(distances.argmin())])
         cluster_id = f"clu_{fingerprint(texts[medoid_index])[:12]}"
         labels = [occurrences[i]["label"] for i in occurrence_indices]
+        assignment_radius = (
+            float(np.quantile(distances, settings["assignment_quantile"]))
+            if settings["assignment_quantile"] is not None
+            else float(settings["max_assign_distance"])
+        )
         centroids.append(center)
+        assignment_max_distances.append(assignment_radius)
         metadata.append({
             "cluster_id": cluster_id, "feature": f"cot_{cluster_id}",
             "medoid": texts[medoid_index],
@@ -278,12 +299,14 @@ def build_semantic_model_from_partition(
             "unique_clients": int(len(clients)),
             "compactness_mean_distance": float(distances.mean()),
             "assignment_distance_p95": float(np.quantile(distances, 0.95)),
+            "assignment_radius": assignment_radius,
             "label_counts": {str(k): int(v) for k, v in pd.Series(labels).value_counts().sort_index().items()},
         })
     if not centroids:
         raise ValueError("No semantic clusters meet min_client_coverage")
     model = {
         "centroids": np.vstack(centroids),
+        "assignment_max_distances": assignment_max_distances,
         "feature_names": [row["feature"] for row in metadata],
         "cluster_meta": metadata, "embedding_model": model_name, "settings": settings,
         "embedding_transformer": embedding_transformer,
@@ -356,7 +379,16 @@ def nearest_centroid_assignments(
             np.arange(stop - start),
             local_nearest,
         ]
-        accepted = local_distance <= float(max_distance)
+        if np.ndim(max_distance) == 0:
+            local_threshold = float(max_distance)
+        else:
+            thresholds = np.asarray(max_distance, dtype=np.float32)
+            if len(thresholds) != len(centroids):
+                raise ValueError(
+                    "Per-cluster assignment thresholds do not match centroids"
+                )
+            local_threshold = thresholds[local_nearest]
+        accepted = local_distance <= local_threshold
         accepted_indices = np.flatnonzero(accepted) + start
         nearest[accepted_indices] = local_nearest[accepted].astype(np.int32)
         nearest_distance[start:stop] = local_distance.astype(np.float32)
@@ -379,7 +411,10 @@ def transform_precomputed_claim_space(records, space, embeddings, model):
     unique_assignments, unique_distances = nearest_centroid_assignments(
         embeddings,
         model["centroids"],
-        max_distance=model["settings"]["max_assign_distance"],
+        max_distance=model.get(
+            "assignment_max_distances",
+            model["settings"]["max_assign_distance"],
+        ),
     )
     assignment_rows = []
     for occurrence_index, row in enumerate(occurrences):

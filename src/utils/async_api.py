@@ -74,10 +74,18 @@ def _make_client(llm_config: dict) -> openai.AsyncOpenAI:
             llm_config.get("max_concurrent", 16),
         )
     )
+    proxy_url = llm_config.get("proxy_url")
     return openai.AsyncOpenAI(
         base_url=base_url,
         api_key=api_key,
         http_client=httpx.AsyncClient(
+            # External paid APIs may declare an exact proxy endpoint. Local
+            # inference does not inherit unrelated proxy environment variables.
+            proxy=str(proxy_url) if proxy_url else None,
+            trust_env=(
+                False if proxy_url
+                else bool(llm_config.get("use_env_proxy", False))
+            ),
             verify=bool(llm_config.get("verify_ssl", True)),
             limits=httpx.Limits(
                 max_connections=max_connections,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rerun frozen v4 clustering with two seeds and measure assignment stability."""
+"""Rerun frozen v4 clustering with additional seeds and measure stability."""
 from __future__ import annotations
 
 import argparse
@@ -117,7 +117,22 @@ def assignment_agreement(
     }
 
 
-def run_cell(cell: Path, seeds: list[int]) -> dict:
+def stability_output_root(cell: Path, backend_override: str | None) -> Path:
+    """Keep backend-comparison artifacts separate from selected-backend results."""
+    name = (
+        "cluster_seeds"
+        if backend_override is None
+        else f"cluster_seeds_{backend_override}"
+    )
+    return cell / "stability" / name
+
+
+def run_cell(
+    cell: Path,
+    seeds: list[int],
+    *,
+    backend_override: str | None = None,
+) -> dict:
     selection = json.loads(
         (cell / "cluster_selection.json").read_text(encoding="utf-8")
     )
@@ -130,33 +145,60 @@ def run_cell(cell: Path, seeds: list[int]) -> dict:
     _, config = load_source(source_root)
     records = {
         split: load_claim_records(source_root / f"claims_{split}.jsonl")
-        for split in ("train", "val")
+        for split in ("train", "val", "test")
     }
     spaces = {
         split: unique_claim_space(records[split])
-        for split in ("train", "val")
+        for split in ("train", "val", "test")
     }
     embeddings = {
         split: np.load(
             cell / "embeddings" / f"embeddings_{split}.npy",
             mmap_mode="r",
         )
-        for split in ("train", "val")
+        for split in ("train", "val", "test")
     }
-    backend = json.loads(
+    selected_backend = json.loads(
         (cell / "stages" / "hierarchy.json").read_text(encoding="utf-8")
     )["metrics"]["backend"]
+    backend = backend_override or selected_backend
     selected_candidate = selection["selected_candidate"]
     representation = selection["selected_representation"]
-    reference = pd.read_parquet(cell / "claim_assignments_train.parquet")
-    output_root = cell / "stability" / "cluster_seeds"
+    output_root = stability_output_root(cell, backend_override)
+    reference_seed = 17
+    requested_seeds = list(dict.fromkeys(seeds))
+    materialization_seeds = (
+        [reference_seed, *[seed for seed in requested_seeds if seed != reference_seed]]
+        if backend_override is not None
+        else requested_seeds
+    )
+    reference = (
+        None
+        if backend_override is not None
+        else pd.read_parquet(cell / "claim_assignments_train.parquet")
+    )
     rows = []
-    for seed in seeds:
+    for seed in materialization_seeds:
         seed_root = output_root / f"seed_{seed}"
         summary_path = seed_root / "summary.json"
-        if summary_path.is_file():
-            rows.append(json.loads(summary_path.read_text(encoding="utf-8")))
-            continue
+        assignments_path = seed_root / "claim_assignments_train.parquet"
+        test_features_path = seed_root / "cot_features_test.parquet"
+        test_assignments_path = seed_root / "claim_assignments_test.parquet"
+        if all(path.is_file() for path in (
+            summary_path,
+            assignments_path,
+            test_features_path,
+            test_assignments_path,
+        )):
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if (
+                summary.get("backend") == backend
+                and summary.get("candidate") == selected_candidate
+            ):
+                if seed == reference_seed and reference is None:
+                    reference = pd.read_parquet(assignments_path)
+                rows.append(summary)
+                continue
         labels = partition_for_seed(
             embeddings["train"],
             candidate=selected_candidate,
@@ -193,6 +235,15 @@ def run_cell(cell: Path, seeds: list[int]) -> dict:
         _, val_assignments = transform_precomputed_claim_space(
             records["val"], spaces["val"], embeddings["val"], model
         )
+        _, test_assignments = transform_precomputed_claim_space(
+            records["test"], spaces["test"], embeddings["test"], model
+        )
+        if reference is None:
+            if seed != reference_seed:
+                raise RuntimeError(
+                    "Backend override must materialize seed 17 first"
+                )
+            reference = train_assignments
         train_all = features_from_assignments(
             records["train"],
             train_assignments,
@@ -205,6 +256,12 @@ def run_cell(cell: Path, seeds: list[int]) -> dict:
             model,
             encoding=representation["encoding"],
         )
+        test_all = features_from_assignments(
+            records["test"],
+            test_assignments,
+            model,
+            encoding=representation["encoding"],
+        )
         ranking = rank_features_by_train_mi(
             train_all,
             encoding=representation["encoding"],
@@ -212,10 +269,14 @@ def run_cell(cell: Path, seeds: list[int]) -> dict:
         names = ranking[: int(representation["n_features"])]
         train = train_all[["customer_id", "label", *names]]
         val = val_all[["customer_id", "label", *names]]
+        test = test_all[["customer_id", "label", *names]]
         agreement = assignment_agreement(reference, train_assignments)
         summary = {
             "seed": seed,
             "backend": backend,
+            "selected_backend": selected_backend,
+            "reference_seed": reference_seed,
+            "reference_backend": backend,
             "candidate": selected_candidate,
             "n_clusters_after_coverage": len(model["feature_names"]),
             "n_selected_features": len(names),
@@ -228,22 +289,26 @@ def run_cell(cell: Path, seeds: list[int]) -> dict:
         seed_root.mkdir(parents=True, exist_ok=True)
         atomic_frame(seed_root / "cot_features_train.parquet", train)
         atomic_frame(seed_root / "cot_features_val.parquet", val)
+        atomic_frame(test_features_path, test)
         atomic_frame(
-            seed_root / "claim_assignments_train.parquet",
+            assignments_path,
             train_assignments,
         )
         atomic_frame(
             seed_root / "claim_assignments_val.parquet",
             val_assignments,
         )
+        atomic_frame(test_assignments_path, test_assignments)
         atomic_write_json(seed_root / "cluster_model.json", model_payload(model))
         atomic_npz(seed_root / "centroids.npz", centroids=model["centroids"])
         atomic_write_json(summary_path, summary)
         rows.append(summary)
     payload = {
         "cell": str(cell),
-        "reference_seed": 17,
-        "additional_seeds": seeds,
+        "selected_backend": selected_backend,
+        "evaluated_backend": backend,
+        "reference_seed": reference_seed,
+        "additional_seeds": requested_seeds,
         "rows": rows,
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -263,6 +328,21 @@ def main() -> None:
         choices=("all", "qwen", "gpt_oss"),
         default="all",
     )
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=tuple(sorted({dataset for dataset, _ in CELLS})),
+        default=None,
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("selected", "minibatch_kmeans", "agglomerative"),
+        default="selected",
+        help=(
+            "Use the cell's selected backend or rerun in a separate "
+            "backend-specific namespace."
+        ),
+    )
     parser.add_argument("--seeds", nargs="+", type=int, default=[101, 947])
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
@@ -270,11 +350,14 @@ def main() -> None:
         (dataset, model)
         for dataset, model in CELLS
         if args.model == "all" or model == args.model
+        if args.datasets is None or dataset in args.datasets
     ]
+    backend_override = None if args.backend == "selected" else args.backend
     plan = {
         "mode": "execute" if args.execute else "dry-run",
         "reference_seed": 17,
         "additional_seeds": args.seeds,
+        "backend": args.backend,
         "cells": [
             str(args.derived_root / dataset / model / "seed_17")
             for dataset, model in cells
@@ -289,10 +372,12 @@ def main() -> None:
             run_cell(
                 args.derived_root / dataset / model / "seed_17",
                 args.seeds,
+                backend_override=backend_override,
             )
         )
     atomic_write_json(
-        args.derived_root / f"cluster_seed_stability_{args.model}.json",
+        args.derived_root
+        / f"cluster_seed_stability_{args.model}_{args.backend}.json",
         {"protocol": plan, "results": results},
     )
 

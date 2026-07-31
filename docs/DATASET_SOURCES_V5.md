@@ -22,7 +22,8 @@ currency_rk.csv  7925b9f27b4605b5f25b479cb9629555dd437eeaf51bd07254ce1f080cf5b65
 ```
 
 The public data contain 8,509 labeled users and 7,636,113 transactions.
-The exact reference split command is pinned to `pyspark==3.3.3`. Locally
+The exact public-baseline split is scikit-learn
+`KFold(n_splits=5, shuffle=True, random_state=100)`. Locally
 generated `sklearn_approx` manifests are schema diagnostics only and are
 rejected by the paid-run preflight.
 
