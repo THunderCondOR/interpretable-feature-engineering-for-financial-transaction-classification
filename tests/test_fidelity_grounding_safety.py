@@ -5,6 +5,7 @@ from scripts.run_fidelity_analysis import load_cell, validate_selected_teacher
 from scripts.run_grounding_judge import (
     SYSTEM_PROMPT,
     judgment_signature,
+    parse_json_object,
     validate_judgment,
 )
 from scripts.summarize_grounding_judges import validate_judge_records
@@ -100,3 +101,19 @@ def test_grounding_judgment_schema_is_strict():
     assert validate_judgment({**valid, "confidence": 6}) == "confidence_out_of_range"
     assert validate_judgment({**valid, "verdict": "maybe"}) == "invalid_verdict"
     assert validate_judgment({**valid, "claim_type": "guess"}) == "invalid_claim_type"
+
+
+def test_grounding_parser_handles_provider_wrapped_singleton_object():
+    direct, error = parse_json_object('{"verdict": "supported"}')
+    assert error is None
+    assert direct == {"verdict": "supported"}
+
+    wrapped, error = parse_json_object('[{"verdict": "unsupported"}]')
+    assert error is None
+    assert wrapped == {"verdict": "unsupported"}
+
+    parsed, error = parse_json_object(
+        '[{"verdict": "supported"}, {"verdict": "unsupported"}]'
+    )
+    assert parsed is None
+    assert error == "json_not_object:list"

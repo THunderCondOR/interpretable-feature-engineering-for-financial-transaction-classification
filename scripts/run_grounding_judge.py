@@ -141,18 +141,27 @@ def extract_content(result: dict[str, Any]) -> str:
         return ""
 
 
+def _coerce_json_object(value: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Accept an object or an unambiguous provider-wrapped object."""
+    if isinstance(value, dict):
+        return value, None
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+        return value[0], None
+    return None, f"json_not_object:{type(value).__name__}"
+
+
 def parse_json_object(text: str) -> tuple[dict[str, Any] | None, str | None]:
     text = text.strip()
     if not text:
         return None, "empty_response"
     try:
-        return json.loads(text), None
+        return _coerce_json_object(json.loads(text))
     except Exception:
         pass
     match = re.search(r"\{.*\}", text, flags=re.S)
     if match:
         try:
-            return json.loads(match.group(0)), None
+            return _coerce_json_object(json.loads(match.group(0)))
         except Exception as exc:
             return None, f"json_parse_error:{type(exc).__name__}"
     return None, "json_not_found"
