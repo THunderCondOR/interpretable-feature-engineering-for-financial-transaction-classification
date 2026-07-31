@@ -47,10 +47,20 @@ for session in "${RUN_ID}_qwen" "${RUN_ID}_gpt_oss" "${RUN_ID}_status"; do
 done
 
 tmux -L "${SOCKET}" new-session -d -s "${RUN_ID}_qwen" \
-  "set -o pipefail; '${PYTHON_BIN}' scripts/run_cv_queue_watchdog.py --python-bin '${PYTHON_BIN}' --model qwen --run-id '${RUN_ID}' --datasets '${DATASETS}' 2>&1 | tee -a 'logs/runs/${RUN_ID}/qwen.cv_queue.log'"
+  bash -lc "set -o pipefail; '${PYTHON_BIN}' scripts/run_cv_queue_watchdog.py --python-bin '${PYTHON_BIN}' --model qwen --run-id '${RUN_ID}' --datasets '${DATASETS}' 2>&1 | tee -a 'logs/runs/${RUN_ID}/qwen.cv_queue.log'"
 tmux -L "${SOCKET}" new-session -d -s "${RUN_ID}_gpt_oss" \
-  "set -o pipefail; '${PYTHON_BIN}' scripts/run_cv_queue_watchdog.py --python-bin '${PYTHON_BIN}' --model gpt_oss --run-id '${RUN_ID}' --datasets '${DATASETS}' 2>&1 | tee -a 'logs/runs/${RUN_ID}/gpt_oss.cv_queue.log'"
+  bash -lc "set -o pipefail; '${PYTHON_BIN}' scripts/run_cv_queue_watchdog.py --python-bin '${PYTHON_BIN}' --model gpt_oss --run-id '${RUN_ID}' --datasets '${DATASETS}' 2>&1 | tee -a 'logs/runs/${RUN_ID}/gpt_oss.cv_queue.log'"
 tmux -L "${SOCKET}" new-session -d -s "${RUN_ID}_status" \
-  "'${PYTHON_BIN}' scripts/pipeline_status.py --run-id '${RUN_ID}' --results-root 'results/v5/runs/${RUN_ID}' --watch 5"
+  bash -lc "'${PYTHON_BIN}' scripts/pipeline_status.py --run-id '${RUN_ID}' --results-root 'results/v5/runs/${RUN_ID}' --watch 5"
+
+# A successful `tmux new-session` only proves that the shell was spawned.  It
+# does not prove that quoting, imports, or the worker command survived startup.
+sleep 2
+for session in "${RUN_ID}_qwen" "${RUN_ID}_gpt_oss"; do
+  if ! tmux -L "${SOCKET}" has-session -t "${session}" 2>/dev/null; then
+    echo "Worker exited during startup: ${session}" >&2
+    exit 1
+  fi
+done
 
 echo "Started tmux socket ${SOCKET}: ${RUN_ID}_qwen, ${RUN_ID}_gpt_oss, ${RUN_ID}_status"
