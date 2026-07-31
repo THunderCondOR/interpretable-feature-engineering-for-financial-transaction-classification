@@ -132,6 +132,7 @@ def run_cell(
     seeds: list[int],
     *,
     backend_override: str | None = None,
+    embedding_cache_cell: Path | None = None,
 ) -> dict:
     selection = json.loads(
         (cell / "cluster_selection.json").read_text(encoding="utf-8")
@@ -151,13 +152,37 @@ def run_cell(
         split: unique_claim_space(records[split])
         for split in ("train", "val", "test")
     }
+    embedding_cell = embedding_cache_cell or cell
+    embedding_stage_path = embedding_cell / "stages" / "embeddings.json"
+    if embedding_cache_cell is not None:
+        cache_stage = json.loads(embedding_stage_path.read_text(encoding="utf-8"))
+        if cache_stage.get("source") != source_payload["source_contract"]:
+            raise ValueError(
+                f"Embedding cache source mismatch: {embedding_cache_cell}"
+            )
+        for split in ("train", "val", "test"):
+            cached_claims = pd.read_parquet(
+                embedding_cell / "embeddings" / f"unique_claims_{split}.parquet",
+                columns=["normalized_text"],
+            )["normalized_text"].astype(str).tolist()
+            if cached_claims != list(spaces[split]["texts"]):
+                raise ValueError(
+                    f"Embedding cache claim order mismatch for {split}: "
+                    f"{embedding_cache_cell}"
+                )
     embeddings = {
         split: np.load(
-            cell / "embeddings" / f"embeddings_{split}.npy",
+            embedding_cell / "embeddings" / f"embeddings_{split}.npy",
             mmap_mode="r",
         )
         for split in ("train", "val", "test")
     }
+    for split, values in embeddings.items():
+        if len(values) != len(spaces[split]["texts"]):
+            raise ValueError(
+                f"Embedding row mismatch for {split}: {len(values)} != "
+                f"{len(spaces[split]['texts'])}"
+            )
     selected_backend = json.loads(
         (cell / "stages" / "hierarchy.json").read_text(encoding="utf-8")
     )["metrics"]["backend"]
@@ -224,7 +249,7 @@ def run_cell(
             embeddings=embeddings["train"],
             raw_ids=labels,
             embedding_state_signature=json.loads(
-                (cell / "stages" / "embeddings.json").read_text(
+                embedding_stage_path.read_text(
                     encoding="utf-8"
                 )
             )["metrics"]["embedding_state_signature"],
@@ -344,6 +369,14 @@ def main() -> None:
         ),
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=[101, 947])
+    parser.add_argument(
+        "--embedding-cache-cell",
+        type=Path,
+        help=(
+            "Optional compatible cell owning immutable unique-claim E5 "
+            "embeddings. Only valid when exactly one dataset/model cell is selected."
+        ),
+    )
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     cells = [
@@ -353,6 +386,8 @@ def main() -> None:
         if args.datasets is None or dataset in args.datasets
     ]
     backend_override = None if args.backend == "selected" else args.backend
+    if args.embedding_cache_cell is not None and len(cells) != 1:
+        raise ValueError("--embedding-cache-cell requires exactly one selected cell")
     plan = {
         "mode": "execute" if args.execute else "dry-run",
         "reference_seed": 17,
@@ -373,6 +408,7 @@ def main() -> None:
                 args.derived_root / dataset / model / "seed_17",
                 args.seeds,
                 backend_override=backend_override,
+                embedding_cache_cell=args.embedding_cache_cell,
             )
         )
     atomic_write_json(
