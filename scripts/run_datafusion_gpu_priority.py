@@ -103,33 +103,41 @@ def main() -> None:
     atomic_write_json(args.state, state)
     lora_session = args.lora_run_id.replace("-", "_").replace(".", "_")
 
-    for model in MODELS:
-        key = f"offline_{model}"
-        if key in completed:
-            continue
-        while not completion_ready(args.datafusion_run_id, model):
+    remaining = {
+        model for model in MODELS if f"offline_{model}" not in completed
+    }
+    while remaining:
+        ready = [
+            model for model in MODELS
+            if model in remaining and completion_ready(args.datafusion_run_id, model)
+        ]
+        if not ready:
             time.sleep(max(5.0, args.poll_seconds))
+            continue
         # Current stability is never preempted. LoRA is lower priority and is
         # paused only after an API completion marker makes useful work runnable.
         while session_exists(args.stability_session):
             time.sleep(max(5.0, args.poll_seconds))
-        state["state"] = "preempting_lora"
-        state["current"] = key
-        atomic_write_json(args.state, state)
         stop_lora(lora_session)
-        run_python([
-            "scripts/run_cv_offline_pipeline.py",
-            "--datasets", "datafusion_education",
-            "--models", model,
-            "--folds", "0,1,2,3,4",
-            "--run-id", args.datafusion_run_id,
-            "--derived-root", str(DATAFUSION_ROOT),
-            "--embedding-model", "intfloat/multilingual-e5-large",
-            "--execute",
-        ])
-        completed.append(key)
-        state["completed"] = completed
-        atomic_write_json(args.state, state)
+        for model in ready:
+            key = f"offline_{model}"
+            state["state"] = "preempting_lora"
+            state["current"] = key
+            atomic_write_json(args.state, state)
+            run_python([
+                "scripts/run_cv_offline_pipeline.py",
+                "--datasets", "datafusion_education",
+                "--models", model,
+                "--folds", "0,1,2,3,4",
+                "--run-id", args.datafusion_run_id,
+                "--derived-root", str(DATAFUSION_ROOT),
+                "--embedding-model", "intfloat/multilingual-e5-large",
+                "--execute",
+            ])
+            completed.append(key)
+            remaining.remove(model)
+            state["completed"] = completed
+            atomic_write_json(args.state, state)
         launch_lora(args.lora_run_id)
 
     if "datafusion_cluster_stability" not in completed:
