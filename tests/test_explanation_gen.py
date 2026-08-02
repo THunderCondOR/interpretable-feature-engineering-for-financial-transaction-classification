@@ -473,3 +473,64 @@ def test_content_failure_has_finite_attempt_limit(tmp_path, monkeypatch) -> None
     record = json.loads(output_path.read_text(encoding="utf-8"))
     assert record["terminal_content_failure"] is True
     assert record["content_attempts"] == 2
+
+
+def test_terminal_explanation_is_repaired_on_next_invocation(
+    tmp_path, monkeypatch
+) -> None:
+    prompt_path = tmp_path / "prompts.jsonl"
+    output_path = tmp_path / "explanations.jsonl"
+    prompt_path.write_text(
+        json.dumps({
+            "customer_id": 1,
+            "label": 0,
+            "label_name": "female",
+            "system_prompt": "system",
+            "user_prompt": "user",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    calls = 0
+
+    async def terminal_then_success(
+        dialogues, model, llm_config, *, on_batch_complete
+    ):
+        nonlocal calls
+        calls += 1
+        result = api_result("") if calls <= 3 else api_result(VALID_RESPONSE)
+        on_batch_complete([(0, result)])
+        return [result]
+
+    monkeypatch.setattr(
+        "src.pipeline.explanation_gen.batched_query", terminal_then_success
+    )
+    config = {
+        "llm": {"default_model": "test"},
+        "execution": {
+            "until_complete": True,
+            "content_primary_attempts": 1,
+            "content_repair_attempts": 1,
+        },
+        "experiment": {"run_id": "test", "model_slug": "test"},
+        "dataset": {"name": "gender", "label_names": LABELS},
+        "pipeline": {"n_explanation_samples": 1},
+        "output": {
+            "base_dir": str(tmp_path),
+            "prompts": "prompts.jsonl",
+            "explanations": "explanations.jsonl",
+        },
+    }
+
+    run_explanation_generation(
+        config, input_path=prompt_path, output_path=output_path
+    )
+    terminal = json.loads(output_path.read_text(encoding="utf-8"))
+    assert terminal["terminal_content_failure"] is True
+
+    run_explanation_generation(
+        config, input_path=prompt_path, output_path=output_path
+    )
+    repaired = json.loads(output_path.read_text(encoding="utf-8"))
+    assert calls == 4
+    assert _is_successful(repaired)
+    assert not repaired.get("terminal_content_failure")

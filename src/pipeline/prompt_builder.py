@@ -167,6 +167,11 @@ def build_few_shot_str(
     parts: list[str] = []
     i = 1
     labeled_df = df[df["label"] >= 0]
+    representative_profiles = (
+        client_feature_frame(labeled_df, config)
+        if strategy in {"representative", "representative_medoid"}
+        else None
+    )
 
     for label_id_str, label_name in sorted(label_names.items(), key=lambda x: int(x[0])):
         label_id = int(label_id_str)
@@ -179,6 +184,7 @@ def build_few_shot_str(
                 config,
                 label_id=label_id,
                 n_clients=n_per_class,
+                profiles=representative_profiles,
             )
         elif strategy == "random":
             sampled = rng.sample(ids, k=min(n_per_class, len(ids)))
@@ -205,9 +211,11 @@ def representative_medoid_ids(
     *,
     label_id: int,
     n_clients: int,
+    profiles: pd.DataFrame | None = None,
 ) -> list[int | str]:
     """Choose deterministic class representatives in robust-scaled profile space."""
-    profiles = client_feature_frame(train_df, config)
+    if profiles is None:
+        profiles = client_feature_frame(train_df, config)
     numeric = [
         column
         for column in profiles.select_dtypes(include=[np.number]).columns

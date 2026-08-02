@@ -62,6 +62,11 @@ def is_rate_limit(result: dict) -> bool:
     return bool(result.get("rate_limited")) or "ratelimit" in error or "too many requests" in error or " 429" in error
 
 
+def is_transient_transport(result: dict) -> bool:
+    """Connection/time-out/provider failures may indicate concurrency overload."""
+    return str(result.get("error_type") or "") in TRANSIENT_ERRORS
+
+
 def _error_details(
     batch_results: list[tuple[int, dict]],
     request_keys: list[str],
@@ -518,6 +523,60 @@ class AtomicAdaptiveScheduler:
                     previous_mode=previous_mode,
                     next_mode=mode,
                     consecutive_low_429=consecutive_low_429,
+                )
+                await self.sleep(self.cooldown)
+                continue
+            if any(is_transient_transport(result) for _, result in batch_results):
+                previous_mode = mode
+                clean_windows = 0
+                if mode == "high":
+                    mode = "fallback"
+                    consecutive_low_429 = 0
+                    probe_from = None
+                elif mode == "fallback":
+                    consecutive_low_429 += 1
+                    if consecutive_low_429 >= self.low_rate_limit_attempts:
+                        mode = "serial"
+                        consecutive_low_429 = 0
+                        probe_from = None
+                else:
+                    mode = "serial"
+                    consecutive_low_429 = 0
+                    probe_from = None
+                self._persist_state(
+                    mode=mode,
+                    clean_windows=clean_windows,
+                    consecutive_low_429=consecutive_low_429,
+                    probe_from=probe_from,
+                    not_found_retries=not_found_retries,
+                    not_found_retry_at=not_found_retry_at,
+                )
+                next_concurrency = {
+                    "high": self.high, "fallback": self.low, "serial": self.serial,
+                }[mode]
+                self._write_pending(
+                    batch_id=batch_id,
+                    keys=window_keys,
+                    start=offset,
+                    concurrency=next_concurrency,
+                    attempt=attempt,
+                    mode=mode,
+                    clean_windows=clean_windows,
+                    consecutive_low_429=consecutive_low_429,
+                    probe_from=probe_from,
+                    not_found_retries=not_found_retries,
+                    not_found_retry_at=not_found_retry_at,
+                )
+                self._event(
+                    "window_rolled_back",
+                    batch_id=batch_id,
+                    reason="transient_transport_overload",
+                    errors=dict(errors),
+                    error_details=error_details,
+                    retry_in=self.cooldown,
+                    previous_mode=previous_mode,
+                    next_mode=mode,
+                    consecutive_low_overload=consecutive_low_429,
                 )
                 await self.sleep(self.cooldown)
                 continue

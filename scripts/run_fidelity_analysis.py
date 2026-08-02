@@ -10,6 +10,7 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import balanced_accuracy_score
 from sklearn.tree import DecisionTreeClassifier, export_text
 from xgboost import XGBClassifier
 
@@ -18,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.evaluation.reviewer_metrics import cluster_occlusion, surrogate_fidelity
+from src.data.entity_ids import canonical_entity_series
 from src.experiments.artifacts import (
     atomic_write_json,
     files_fingerprint,
@@ -54,6 +56,13 @@ def load_cell(
         scores = scores[scores["split"] == split]
     if frame.empty or scores.empty:
         raise ValueError(f"Empty feature/teacher cell for split={split}")
+    # Parquet feature artifacts preserve numeric IDs, whereas imported teacher
+    # predictions may carry the same IDs as strings.  Compare and merge using
+    # the shared canonical representation while preserving opaque IDs.
+    frame = frame.copy()
+    scores = scores.copy()
+    frame["customer_id"] = canonical_entity_series(frame["customer_id"])
+    scores["customer_id"] = canonical_entity_series(scores["customer_id"])
     keys = ["customer_id", "label"]
     if frame[keys].duplicated().any():
         raise ValueError(f"Duplicate feature customer/label rows for split={split}")
@@ -102,6 +111,81 @@ def teacher_probabilities(frame):
     ):
         raise ValueError("Invalid teacher probability distributions")
     return values
+
+
+def select_binary_teacher_threshold(probabilities, labels) -> dict[str, float]:
+    """Freeze a non-degenerate teacher decision threshold on validation."""
+    positive = np.asarray(probabilities, dtype=float)[:, 1]
+    labels = np.asarray(labels, dtype=int)
+    candidates = np.unique(
+        np.r_[0.0, 0.5, 1.0, np.quantile(positive, np.linspace(0.01, 0.99, 99))]
+    )
+    rows = []
+    for threshold in candidates:
+        prediction = (positive >= float(threshold)).astype(int)
+        rows.append({
+            "threshold": float(threshold),
+            "balanced_accuracy": float(balanced_accuracy_score(labels, prediction)),
+            "positive_rate": float(prediction.mean()),
+        })
+    return max(
+        rows,
+        key=lambda row: (
+            row["balanced_accuracy"],
+            -abs(row["positive_rate"] - float(labels.mean())),
+            -abs(row["threshold"] - 0.5),
+        ),
+    )
+
+
+def select_binary_surrogate_threshold(
+    teacher_probabilities_value, surrogate_probabilities_value, teacher_threshold
+) -> dict[str, float]:
+    teacher_prediction = (
+        np.asarray(teacher_probabilities_value, dtype=float)[:, 1]
+        >= float(teacher_threshold)
+    ).astype(int)
+    positive = np.asarray(surrogate_probabilities_value, dtype=float)[:, 1]
+    candidates = np.unique(
+        np.r_[0.0, 0.5, 1.0, np.quantile(positive, np.linspace(0.01, 0.99, 99))]
+    )
+    rows = []
+    for threshold in candidates:
+        prediction = (positive >= float(threshold)).astype(int)
+        rows.append({
+            "threshold": float(threshold),
+            "hard_agreement": float((prediction == teacher_prediction).mean()),
+        })
+    return max(
+        rows,
+        key=lambda row: (row["hard_agreement"], -abs(row["threshold"] - 0.5)),
+    )
+
+
+def thresholded_binary_fidelity(
+    teacher, surrogate, labels, *, teacher_threshold, surrogate_threshold
+) -> dict[str, float]:
+    teacher_prediction = (
+        np.asarray(teacher, dtype=float)[:, 1] >= float(teacher_threshold)
+    ).astype(int)
+    surrogate_prediction = (
+        np.asarray(surrogate, dtype=float)[:, 1] >= float(surrogate_threshold)
+    ).astype(int)
+    labels = np.asarray(labels, dtype=int)
+    agreement = teacher_prediction == surrogate_prediction
+    teacher_correct = teacher_prediction == labels
+    surrogate_correct = surrogate_prediction == labels
+    return {
+        "teacher_threshold": float(teacher_threshold),
+        "surrogate_threshold": float(surrogate_threshold),
+        "hard_agreement": float(agreement.mean()),
+        "teacher_positive_rate": float(teacher_prediction.mean()),
+        "surrogate_positive_rate": float(surrogate_prediction.mean()),
+        "agree_and_correct": float((agreement & teacher_correct).mean()),
+        "agree_and_wrong": float((agreement & ~teacher_correct).mean()),
+        "teacher_only_correct": float((teacher_correct & ~surrogate_correct).mean()),
+        "surrogate_only_correct": float((~teacher_correct & surrogate_correct).mean()),
+    }
 
 
 def surrogate_specs(seed: int, n_classes: int) -> list[dict[str, Any]]:
@@ -169,10 +253,15 @@ def select_candidate(
     *,
     tie_margin: float,
 ) -> dict[str, Any]:
-    best = max(row["hard_agreement"] for row in candidates)
+    selection_key = (
+        "thresholded_hard_agreement"
+        if all("thresholded_hard_agreement" in row for row in candidates)
+        else "hard_agreement"
+    )
+    best = max(row[selection_key] for row in candidates)
     eligible = [
         row for row in candidates
-        if best - row["hard_agreement"] <= float(tie_margin)
+        if best - row[selection_key] <= float(tie_margin)
     ]
     return sorted(
         eligible,
@@ -445,6 +534,11 @@ def main():
     train_teacher_probabilities = teacher_probabilities(train)
     train_values = train[features].to_numpy(float)
     val_values = val[features].to_numpy(float)
+    teacher_threshold_selection = None
+    if n_classes == 2:
+        teacher_threshold_selection = select_binary_teacher_threshold(
+            teacher_probabilities(val), val["label"].to_numpy(int)
+        )
     ranking = rank_features_for_teacher(
         train_values, train_teacher_probabilities
     )
@@ -470,11 +564,28 @@ def main():
                 probabilities,
                 val["label"].to_numpy(int),
             )
+            surrogate_threshold_selection = None
+            thresholded = None
+            if teacher_threshold_selection is not None:
+                surrogate_threshold_selection = select_binary_surrogate_threshold(
+                    teacher_probabilities(val), probabilities,
+                    teacher_threshold_selection["threshold"],
+                )
+                thresholded = thresholded_binary_fidelity(
+                    teacher_probabilities(val), probabilities,
+                    val["label"].to_numpy(int),
+                    teacher_threshold=teacher_threshold_selection["threshold"],
+                    surrogate_threshold=surrogate_threshold_selection["threshold"],
+                )
             candidate_rows.setdefault(spec["family"], []).append({
                 "candidate": spec["name"],
                 "family": spec["family"],
                 "complexity": int(spec["complexity"]),
                 "n_features": int(count),
+                **(
+                    {"thresholded_hard_agreement": thresholded["hard_agreement"]}
+                    if thresholded is not None else {}
+                ),
                 **{
                     key: metrics[key] for key in (
                         "hard_agreement",
@@ -486,6 +597,10 @@ def main():
                 "_model": model,
                 "_indices": indices,
                 "_spec": spec,
+                "_surrogate_threshold": (
+                    surrogate_threshold_selection["threshold"]
+                    if surrogate_threshold_selection is not None else None
+                ),
             })
     selected_internal = {
         family: select_candidate(
@@ -503,7 +618,11 @@ def main():
     }
     selection_payload = {
         "selection_split": "validation",
-        "primary_metric": "hard_agreement",
+        "primary_metric": (
+            "validation-thresholded hard agreement"
+            if teacher_threshold_selection is not None else "hard_agreement"
+        ),
+        "teacher_threshold_selection": teacher_threshold_selection,
         "tie_margin": args.selection_tie_margin,
         "selected_surrogate": selected_surrogate,
         "selected_candidate": clean(overall),
@@ -532,6 +651,15 @@ def main():
                 teacher_probabilities(frame), probabilities,
                 frame["label"].to_numpy(int),
             )
+            if teacher_threshold_selection is not None:
+                results[family][split]["thresholded_decision_fidelity"] = (
+                    thresholded_binary_fidelity(
+                        teacher_probabilities(frame), probabilities,
+                        frame["label"].to_numpy(int),
+                        teacher_threshold=teacher_threshold_selection["threshold"],
+                        surrogate_threshold=selected["_surrogate_threshold"],
+                    )
+                )
             results[family][split]["bootstrap"] = bootstrap_fidelity(
                 teacher_probabilities(frame),
                 probabilities,

@@ -1,0 +1,21 @@
+sources:
+  - dataset: gender
+    run_name: qwen
+    condition: legacy
+    provenance: legacy_customer_id_join
+    root: results/gender
+  - dataset: gender
+    run_name: gpt_oss
+    condition: legacy
+    provenance: legacy_customer_id_join
+    root: results/gpt_oss_120b/gender
+  - dataset: age
+    run_name: qwen
+    condition: legacy
+    provenance: legacy_customer_id_join
+    root: results/age
+  - dataset: age
+    run_name: gpt_oss
+    condition: legacy
+    provenance: legacy_customer_id_join
+    root: results/gpt_oss_120b/age

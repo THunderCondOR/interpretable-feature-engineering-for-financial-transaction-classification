@@ -41,7 +41,11 @@ import httpx
 import openai
 from tqdm import tqdm
 
-from src.utils.atomic_scheduler import AtomicAdaptiveScheduler, is_rate_limit
+from src.utils.atomic_scheduler import (
+    AtomicAdaptiveScheduler,
+    is_rate_limit,
+    is_transient_transport,
+)
 
 
 class AsyncRateLimiter:
@@ -304,7 +308,7 @@ async def _run_atomic_batch(indexed_dialogues, model, llm_config, client, concur
         for task in asyncio.as_completed(tasks):
             item = await task
             results.append(item)
-            if is_rate_limit(item[1]):
+            if is_rate_limit(item[1]) or is_transient_transport(item[1]):
                 for pending in tasks:
                     if not pending.done():
                         pending.cancel()

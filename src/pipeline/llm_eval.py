@@ -88,13 +88,13 @@ def summarize_prediction_rows(rows: list[dict], *, split: str) -> dict:
             "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
             "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
             "f1_weighted": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
-            "positive_f1": float(
-                f1_score(y_true, y_pred, pos_label=1, zero_division=0)
-            ),
             "mcc": float(matthews_corrcoef(y_true, y_pred)),
             "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
         })
         if len(np.unique(y_true)) == 2:
+            result["positive_f1"] = float(
+                f1_score(y_true, y_pred, pos_label=1, zero_division=0)
+            )
             # Direct label-only APIs do not expose calibrated probabilities.
             # This is therefore a label-score ROC-AUC, recorded explicitly.
             result["hard_label_auc"] = float(roc_auc_score(y_true, y_pred))

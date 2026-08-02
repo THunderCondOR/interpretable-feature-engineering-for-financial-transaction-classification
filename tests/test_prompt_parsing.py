@@ -14,3 +14,9 @@ def test_age_labels_with_hyphens_are_normalized_symmetrically() -> None:
     assert normalize_text_label("26–35", AGE_LABELS) == 1
     assert normalize_text_label("36 - 45", AGE_LABELS) == 2
     assert normalize_text_label("46+", AGE_LABELS) == 3
+
+
+def test_latex_escaped_underscore_in_configured_label() -> None:
+    assert normalize_text_label(
+        r"no\_default", {"0": "no_default", "1": "default"}
+    ) == 0

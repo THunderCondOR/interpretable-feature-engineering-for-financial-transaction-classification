@@ -144,6 +144,28 @@ def test_fidelity_loader_filters_teacher_and_validates_probabilities(tmp_path):
         teacher_probabilities(merged)
 
 
+def test_fidelity_loader_canonicalizes_numeric_string_teacher_ids(tmp_path):
+    features_path = tmp_path / "features.parquet"
+    teacher_path = tmp_path / "teacher.csv"
+    pd.DataFrame({
+        "customer_id": [1, 2],
+        "label": [0, 1],
+        "cot_a": [1.0, 0.0],
+    }).to_parquet(features_path, index=False)
+    pd.DataFrame({
+        "customer_id": ["1", "2"],
+        "label": [0, 1],
+        "split": ["train", "train"],
+        "probability_0": [0.9, 0.2],
+        "probability_1": [0.1, 0.8],
+    }).to_csv(teacher_path, index=False)
+
+    merged = load_cell(features_path, teacher_path, split="train")
+
+    assert merged["customer_id"].tolist() == [1, 2]
+    assert teacher_probabilities(merged).shape == (2, 2)
+
+
 def test_tree_decision_paths_include_semantic_steps_and_leaf_distribution():
     values = np.asarray([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=float)
     labels = np.asarray([0, 0, 1, 1])

@@ -22,6 +22,19 @@ RESTARTABLE_CONNECTION_ERRORS = {
 }
 
 
+class WatchdogShutdown(Exception):
+    """Internal control flow used to clean up the child process on signals."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"watchdog received signal {signum}")
+        self.signum = int(signum)
+
+
+def request_shutdown(signum: int, _frame: Any) -> None:
+    """Turn a terminal signal into a cleanup-aware exception."""
+    raise WatchdogShutdown(signum)
+
+
 def append_event(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {"time": time.time(), **payload}
@@ -140,62 +153,85 @@ def main() -> None:
     )
     command = queue_command(args)
     restart_count = 0
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, request_shutdown)
 
-    while True:
-        offset = scheduler_events.stat().st_size if scheduler_events.is_file() else 0
-        window_sizes: dict[str, int] = {}
-        append_event(watchdog_events, {
-            "event": "queue_process_started",
-            "model": args.model,
-            "restart_count": restart_count,
-            "command": command,
-        })
-        process = subprocess.Popen(
-            command,
-            cwd=REPO_ROOT,
-            start_new_session=True,
-        )
-        restart_reason = None
-        while process.poll() is None:
-            time.sleep(max(args.poll_seconds, 0.1))
-            offset, should_restart, event = consume_events(
-                scheduler_events,
-                offset,
-                window_sizes,
-            )
-            if should_restart:
-                restart_reason = event
-                append_event(watchdog_events, {
-                    "event": "full_connection_window_detected",
-                    "model": args.model,
-                    "restart_count": restart_count,
-                    "batch_id": event.get("batch_id") if event else None,
-                    "errors": event.get("errors") if event else None,
-                })
-                terminate_process_group(
-                    process,
-                    grace_seconds=args.terminate_grace_seconds,
-                )
-                break
-
-        returncode = process.wait()
-        if restart_reason is None:
+    process: subprocess.Popen | None = None
+    try:
+        while True:
+            offset = scheduler_events.stat().st_size if scheduler_events.is_file() else 0
+            window_sizes: dict[str, int] = {}
             append_event(watchdog_events, {
-                "event": "queue_process_exited",
+                "event": "queue_process_started",
                 "model": args.model,
                 "restart_count": restart_count,
-                "returncode": returncode,
+                "command": command,
             })
-            raise SystemExit(returncode)
+            process = subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                start_new_session=True,
+            )
+            restart_reason = None
+            while process.poll() is None:
+                time.sleep(max(args.poll_seconds, 0.1))
+                offset, should_restart, event = consume_events(
+                    scheduler_events,
+                    offset,
+                    window_sizes,
+                )
+                if should_restart:
+                    restart_reason = event
+                    append_event(watchdog_events, {
+                        "event": "full_connection_window_detected",
+                        "model": args.model,
+                        "restart_count": restart_count,
+                        "batch_id": event.get("batch_id") if event else None,
+                        "errors": event.get("errors") if event else None,
+                    })
+                    terminate_process_group(
+                        process,
+                        grace_seconds=args.terminate_grace_seconds,
+                    )
+                    break
 
-        restart_count += 1
+            returncode = process.wait()
+            process = None
+            if restart_reason is None:
+                append_event(watchdog_events, {
+                    "event": "queue_process_exited",
+                    "model": args.model,
+                    "restart_count": restart_count,
+                    "returncode": returncode,
+                })
+                raise SystemExit(returncode)
+
+            restart_count += 1
+            append_event(watchdog_events, {
+                "event": "queue_restart_cooldown",
+                "model": args.model,
+                "restart_count": restart_count,
+                "seconds": args.restart_cooldown_seconds,
+            })
+            time.sleep(max(args.restart_cooldown_seconds, 0.0))
+    except WatchdogShutdown as exc:
+        # Ignore additional terminal signals while the child group receives
+        # TERM and, if necessary, KILL after its grace period.
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, signal.SIG_IGN)
+        if process is not None and process.poll() is None:
+            terminate_process_group(
+                process,
+                grace_seconds=args.terminate_grace_seconds,
+            )
         append_event(watchdog_events, {
-            "event": "queue_restart_cooldown",
+            "event": "watchdog_shutdown",
             "model": args.model,
             "restart_count": restart_count,
-            "seconds": args.restart_cooldown_seconds,
+            "signal": exc.signum,
+            "child_stopped": process is None or process.poll() is not None,
         })
-        time.sleep(max(args.restart_cooldown_seconds, 0.0))
+        raise SystemExit(128 + exc.signum) from None
 
 
 if __name__ == "__main__":

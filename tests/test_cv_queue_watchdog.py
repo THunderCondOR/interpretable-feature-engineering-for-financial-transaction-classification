@@ -1,8 +1,13 @@
 import json
+import signal
+
+import pytest
 
 from scripts.run_cv_queue_watchdog import (
+    WatchdogShutdown,
     consume_events,
     full_connection_failure,
+    request_shutdown,
 )
 
 
@@ -44,3 +49,9 @@ def test_event_consumer_uses_current_window_size(tmp_path):
     assert offset == path.stat().st_size
     assert restart
     assert event["batch_id"] == "a"
+
+
+def test_terminal_signal_enters_cleanup_path():
+    with pytest.raises(WatchdogShutdown) as caught:
+        request_shutdown(signal.SIGTERM, None)
+    assert caught.value.signum == signal.SIGTERM

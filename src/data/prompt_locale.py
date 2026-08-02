@@ -98,6 +98,15 @@ AMOUNT_SEMANTICS_DISPLAY = {
         "Transaction value with direction defined by operation type, not by "
         "the amount sign."
     ),
+    "signed_direction": (
+        "Signed transaction direction in the native currency. Positive and "
+        "negative values are described separately without assigning "
+        "unsupported accounting semantics, and currencies are never summed."
+    ),
+    "typed_unsigned_transaction_value": (
+        "Positive transaction value whose behavioral meaning is defined by "
+        "the recorded transaction type."
+    ),
 }
 
 

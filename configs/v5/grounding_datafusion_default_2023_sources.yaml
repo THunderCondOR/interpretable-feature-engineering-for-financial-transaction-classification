@@ -1,0 +1,16 @@
+field_semantics:
+  datafusion_default_2023: >-
+    The evidence contains only the supplied transaction profile. Amounts are
+    transaction values in the stated units; category and temporal summaries
+    describe observed activity only. Omitted top-k categories are unknown, not
+    absent. Personal, demographic, educational, employment, and financial-life
+    facts must not be inferred unless they are explicitly supported by the
+    supplied transaction evidence.
+
+sources:
+  - run_name: qwen
+    dataset: datafusion_default_2023
+    root: results/isolated/runs/reviewer-v11-isolated-r2/datafusion_default_2023/stratified_60_20_20_seed137/full/guided_zero_shot_v5/qwen/seed_17
+  - run_name: gpt_oss
+    dataset: datafusion_default_2023
+    root: results/isolated/runs/reviewer-v11-isolated-r2/datafusion_default_2023/stratified_60_20_20_seed137/full/guided_zero_shot_v5/gpt_oss/seed_17

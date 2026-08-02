@@ -100,29 +100,41 @@ def client_numeric_profile(
         })
 
     semantics = amount_semantics(config)
-    if semantics == "signed_cashflow":
+    if semantics in {"signed_cashflow", "signed_direction"}:
         if config["dataset"].get("currency_aware_amounts") and currency_column:
             currency = c[currency_column].map(_currency_bucket)
             numeric_amounts = pd.to_numeric(c["amount"], errors="coerce")
             for bucket in ("RUR", "USD", "EUR", "unknown"):
                 bucket_amounts = numeric_amounts[currency.eq(bucket)].dropna()
-                inflow = bucket_amounts[bucket_amounts > 0]
-                outflow = -bucket_amounts[bucket_amounts < 0]
+                positive = bucket_amounts[bucket_amounts > 0]
+                negative = -bucket_amounts[bucket_amounts < 0]
                 prefix = bucket.lower()
-                profile.update({
+                direction_profile = {
                     f"{prefix}_operation_count": int(len(bucket_amounts)),
                     f"{prefix}_operation_share": _share(
                         len(bucket_amounts), n_txn
                     ),
-                    f"{prefix}_total_inflow": float(inflow.sum()),
-                    f"{prefix}_median_inflow": (
-                        float(inflow.median()) if len(inflow) else 0.0
-                    ),
-                    f"{prefix}_total_outflow": float(outflow.sum()),
-                    f"{prefix}_median_outflow": (
-                        float(outflow.median()) if len(outflow) else 0.0
-                    ),
-                })
+                }
+                if semantics == "signed_cashflow":
+                    direction_profile.update({
+                        f"{prefix}_total_inflow": float(positive.sum()),
+                        f"{prefix}_median_inflow": float(positive.median()) if len(positive) else 0.0,
+                        f"{prefix}_total_outflow": float(negative.sum()),
+                        f"{prefix}_median_outflow": float(negative.median()) if len(negative) else 0.0,
+                    })
+                else:
+                    for name, values in (("positive", positive), ("negative", negative)):
+                        direction_profile.update({
+                            f"{prefix}_{name}_count": int(len(values)),
+                            f"{prefix}_{name}_share": _share(len(values), len(bucket_amounts)),
+                            f"{prefix}_{name}_mean": float(values.mean()) if len(values) else 0.0,
+                            f"{prefix}_{name}_median": float(values.median()) if len(values) else 0.0,
+                            f"{prefix}_{name}_q1": float(values.quantile(0.25)) if len(values) else 0.0,
+                            f"{prefix}_{name}_q3": float(values.quantile(0.75)) if len(values) else 0.0,
+                            f"{prefix}_{name}_p05": float(values.quantile(0.05)) if len(values) else 0.0,
+                            f"{prefix}_{name}_p95": float(values.quantile(0.95)) if len(values) else 0.0,
+                        })
+                profile.update(direction_profile)
         else:
             inflow = amounts[amounts > 0]
             outflow = -amounts[amounts < 0]
@@ -178,6 +190,32 @@ def client_numeric_profile(
                 if len(balance)
                 else 0.0,
             })
+    elif semantics == "typed_unsigned_transaction_value":
+        type_column = "transaction_type" if "transaction_type" in c else "mcc_code_desc"
+        types = c[type_column].astype("string").fillna("not available")
+        for transaction_type in ("Transfer", "Payment", "Withdrawal", "Deposit"):
+            profile[f"{transaction_type.lower()}_share"] = float(
+                types.eq(transaction_type).mean()
+            )
+        operational_numeric = (
+            "active_products", "app_logins_frequency", "feature_usage_diversity",
+            "credit_utilization_ratio", "international_transactions",
+            "failed_transactions", "base_satisfaction", "tx_satisfaction",
+            "product_satisfaction", "satisfaction_score", "nps_score",
+            "support_tickets_count", "resolved_tickets_ratio", "app_store_rating",
+        )
+        first = c.iloc[0]
+        for column in operational_numeric:
+            if column in c:
+                value = pd.to_numeric(pd.Series([first[column]]), errors="coerce").iloc[0]
+                profile[column] = float(value) if pd.notna(value) else np.nan
+        for column in (
+            "savings_account", "credit_card", "personal_loan", "investment_account",
+            "insurance_product", "bill_payment_user", "auto_savings_enabled",
+        ):
+            if column in c:
+                value = first[column]
+                profile[column] = float(bool(value)) if pd.notna(value) else np.nan
     return profile
 
 
@@ -205,6 +243,8 @@ def _top_categories(client_df: pd.DataFrame, *, n: int = 12) -> list[tuple[str, 
 
 def format_client_profile(client_df: pd.DataFrame, config: dict) -> str:
     """Format evidence-only client facts for prompts."""
+    if config["dataset"].get("name") == "cofinfad_operational_fidelity":
+        return _format_cofinfad_operational_profile(client_df, config)
     p = client_numeric_profile(client_df, config)
     category_label = config["dataset"].get("category_label", "transaction categories")
     lines = [
@@ -246,7 +286,32 @@ def format_client_profile(client_df: pd.DataFrame, config: dict) -> str:
         )
 
     semantics = amount_semantics(config)
-    if semantics == "signed_cashflow":
+    if semantics == "signed_direction":
+        lines.append(
+            "* Amount-sign note: positive and negative directions are factual; "
+            "the profile does not assert that they are income or expenses."
+        )
+        for bucket in ("RUR", "USD", "EUR", "unknown"):
+            prefix = bucket.lower()
+            count = int(p.get(f"{prefix}_operation_count", 0))
+            if not count:
+                continue
+            lines.append(f"* {bucket} signed-direction statistics ({count} transactions):")
+            for direction in ("positive", "negative"):
+                direction_count = int(p.get(f"{prefix}_{direction}_count", 0))
+                if not direction_count:
+                    lines.append(f"  - {direction}: no observed transactions")
+                    continue
+                lines.append(
+                    f"  - {direction}: {direction_count} ({p[f'{prefix}_{direction}_share']:.1%}); "
+                    f"mean={p[f'{prefix}_{direction}_mean']:.2f}; "
+                    f"median={p[f'{prefix}_{direction}_median']:.2f}; "
+                    f"IQR=[{p[f'{prefix}_{direction}_q1']:.2f}, "
+                    f"{p[f'{prefix}_{direction}_q3']:.2f}]; "
+                    f"P5-P95=[{p[f'{prefix}_{direction}_p05']:.2f}, "
+                    f"{p[f'{prefix}_{direction}_p95']:.2f}]"
+                )
+    elif semantics == "signed_cashflow":
         expenses = client_df.loc[client_df["amount"] < 0].copy()
         if not expenses.empty:
             expenses["outflow"] = -expenses["amount"]
@@ -342,6 +407,84 @@ def format_client_profile(client_df: pd.DataFrame, config: dict) -> str:
                 f"* Second-half / first-half activity ratio: {p['second_to_first_activity_ratio']:.3f}",
             ])
     return "\n".join(lines)
+
+
+def _display_optional(value: Any, *, percent: bool = False) -> str:
+    if value is None or pd.isna(value):
+        return "not available"
+    if percent:
+        return f"{float(value):.1%}"
+    if isinstance(value, (bool, np.bool_)):
+        return "yes" if bool(value) else "no"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):.3f}"
+    text = str(value).strip()
+    return text if text else "not available"
+
+
+def _format_cofinfad_operational_profile(client_df: pd.DataFrame, config: dict) -> str:
+    """Render only the predeclared operational COFINFAD view."""
+    p = client_numeric_profile(client_df, config)
+    first = client_df.iloc[0]
+    amounts = pd.to_numeric(client_df["amount"], errors="coerce").dropna()
+    lines = [
+        f"* Observation currency: COP",
+        f"* Total transactions: {p['transactions_per_client']}",
+        f"* Active days: {p['active_days']}",
+        f"* Calendar span: {p['calendar_span_days']} days",
+        f"* Transactions per active day: {p['transactions_per_active_day']:.3f}",
+        f"* Transaction value mean: {amounts.mean():.2f}",
+        f"* Transaction value median: {amounts.median():.2f}",
+        f"* Transaction value IQR: [{amounts.quantile(.25):.2f}, {amounts.quantile(.75):.2f}]",
+        f"* Transaction value P5-P95: [{amounts.quantile(.05):.2f}, {amounts.quantile(.95):.2f}]",
+        "* Transaction-type shares:",
+    ]
+    for name in ("transfer", "payment", "withdrawal", "deposit"):
+        lines.append(f"  - {name}: {p.get(f'{name}_share', 0.0):.1%}")
+    lines.extend([
+        "* Product use:",
+        f"  - active products: {_display_optional(first.get('active_products'))}",
+        f"  - savings account: {_display_optional(first.get('savings_account'))}",
+        f"  - credit card: {_display_optional(first.get('credit_card'))}",
+        f"  - personal loan: {_display_optional(first.get('personal_loan'))}",
+        f"  - investment account: {_display_optional(first.get('investment_account'))}",
+        f"  - insurance product: {_display_optional(first.get('insurance_product'))}",
+        f"  - bill-payment user: {_display_optional(first.get('bill_payment_user'))}",
+        f"  - automatic savings enabled: {_display_optional(first.get('auto_savings_enabled'))}",
+        "* Application and transaction engagement:",
+        f"  - app logins frequency: {_display_optional(first.get('app_logins_frequency'))}",
+        f"  - feature-use diversity: {_display_optional(first.get('feature_usage_diversity'))}",
+        f"  - credit-utilization ratio: {_display_optional(first.get('credit_utilization_ratio'), percent=True)}",
+        f"  - international transactions: {_display_optional(first.get('international_transactions'))}",
+        f"  - failed transactions: {_display_optional(first.get('failed_transactions'))}",
+        "* Satisfaction and support:",
+        f"  - base satisfaction: {_display_optional(first.get('base_satisfaction'))}",
+        f"  - transaction satisfaction: {_display_optional(first.get('tx_satisfaction'))}",
+        f"  - product satisfaction: {_display_optional(first.get('product_satisfaction'))}",
+        f"  - satisfaction score: {_display_optional(first.get('satisfaction_score'))}",
+        f"  - NPS score: {_display_optional(first.get('nps_score'))}",
+        f"  - support tickets: {_display_optional(first.get('support_tickets_count'))}",
+        f"  - resolved-ticket ratio: {_display_optional(first.get('resolved_tickets_ratio'), percent=True)}",
+        f"  - app-store rating: {_display_optional(first.get('app_store_rating'))}",
+        f"  - feedback sentiment: {_display_optional(first.get('feedback_sentiment'))}",
+        f"  - feature requests: {_display_optional(first.get('feature_requests'))}",
+        f"  - complaint topics: {_display_optional(first.get('complaint_topics'))}",
+        "* Missing-value note: 'not available' does not mean zero or absence.",
+    ])
+    rendered = "\n".join(lines)
+    forbidden = {
+        "* age:", "* gender:", "* location:", "* income bracket:",
+        "* occupation:", "* education:", "* marital status:",
+        "* household size:", "churn probability:",
+        "customer lifetime value:",
+    }
+    lowered = rendered.lower()
+    leaked = sorted(term for term in forbidden if term in lowered)
+    if leaked:
+        raise ValueError(f"Excluded COFINFAD fields leaked into prompt: {leaked}")
+    return rendered
 
 
 def robust_statistics_payload(df: pd.DataFrame, config: dict) -> dict[str, Any]:

@@ -21,6 +21,29 @@ VERDICTS = [
     "unsupported",
     "not_verifiable",
 ]
+ADJUDICATION_PROTOCOL_VERSION = 2
+BLINDED_FIELDS = (
+    "claim",
+    "client_stats",
+    "train_reference_summary",
+    "field_semantics",
+)
+
+
+def opaque_task_id(task: dict[str, Any]) -> str:
+    return "task_" + fingerprint({
+        "protocol": ADJUDICATION_PROTOCOL_VERSION,
+        "sample_id": str(task["sample_id"]),
+        "evidence_hash": task.get("evidence_hash"),
+    })[:24]
+
+
+def blinded_task(task: dict[str, Any]) -> dict[str, Any]:
+    """Projection visible to Codex; source/judge metadata stay host-side."""
+    return {
+        "task_id": opaque_task_id(task),
+        **{field: task[field] for field in BLINDED_FIELDS},
+    }
 
 
 def load_tasks(path: Path) -> list[dict[str, Any]]:
@@ -56,13 +79,13 @@ def output_schema() -> dict[str, Any]:
                     "type": "object",
                     "additionalProperties": False,
                     "required": [
-                        "sample_id",
+                        "task_id",
                         "verdict",
                         "confidence",
                         "reason",
                     ],
                     "properties": {
-                        "sample_id": {"type": "string"},
+                        "task_id": {"type": "string"},
                         "verdict": {"type": "string", "enum": VERDICTS},
                         "confidence": {
                             "type": "integer",
@@ -86,27 +109,70 @@ def validate_chunk(
     rows = payload.get("adjudications")
     if not isinstance(rows, list):
         raise ValueError("Codex output lacks adjudications array")
-    expected_ids = {str(row["sample_id"]) for row in expected}
-    observed_ids = [str(row.get("sample_id")) for row in rows]
-    if len(observed_ids) != len(set(observed_ids)) or set(observed_ids) != expected_ids:
+    expected_by_id = {opaque_task_id(row): row for row in expected}
+    if len(expected_by_id) != len(expected):
+        raise ValueError("Opaque adjudication task ID collision")
+    observed_ids = [str(row.get("task_id")) for row in rows]
+    if len(observed_ids) != len(set(observed_ids)) or set(observed_ids) != set(expected_by_id):
         raise ValueError("Codex adjudication sample IDs are incomplete or duplicated")
-    task_by_id = {str(row["sample_id"]): row for row in expected}
+    for row in rows:
+        if row.get("verdict") not in VERDICTS:
+            raise ValueError(f"Invalid Codex verdict: {row.get('verdict')!r}")
+        confidence = row.get("confidence")
+        if (
+            not isinstance(confidence, int)
+            or isinstance(confidence, bool)
+            or not 1 <= confidence <= 5
+        ):
+            raise ValueError(f"Invalid Codex confidence: {confidence!r}")
+        if not str(row.get("reason", "")).strip():
+            raise ValueError("Codex adjudication reason must be non-empty")
     return [
         {
-            **row,
-            "sample_id": str(row["sample_id"]),
+            **{key: value for key, value in row.items() if key != "task_id"},
+            "sample_id": str(expected_by_id[str(row["task_id"])]["sample_id"]),
             "judge_name": "codex_adjudicator",
             "model": model,
-            "evidence_hash": task_by_id[str(row["sample_id"])].get(
-                "evidence_hash"
-            ),
+            "evidence_hash": expected_by_id[str(row["task_id"])].get("evidence_hash"),
             "adjudication_signature": fingerprint({
+                "protocol": ADJUDICATION_PROTOCOL_VERSION,
                 "model": model,
-                "task": task_by_id[str(row["sample_id"])],
+                "task": blinded_task(expected_by_id[str(row["task_id"])]),
+                "evidence_hash": expected_by_id[str(row["task_id"])].get(
+                    "evidence_hash"
+                ),
             }),
         }
         for row in rows
     ]
+
+
+def load_resumed_chunk(
+    *,
+    expected: list[dict[str, Any]],
+    response_path: Path,
+    resume_path: Path,
+    chunk_signature: str,
+    model: str,
+    start: int,
+) -> list[dict[str, Any]] | None:
+    """Load a completed chunk only when its signature and payload validate."""
+    if not response_path.exists() or not resume_path.exists():
+        return None
+    try:
+        resume = json.loads(resume_path.read_text(encoding="utf-8"))
+        if resume.get("chunk_signature") != chunk_signature:
+            return None
+        payload = json.loads(response_path.read_text(encoding="utf-8"))
+        rows = validate_chunk(expected, payload, model=model)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        print(
+            f"Rejecting invalid Codex resume chunk at offset {start}: "
+            f"{type(error).__name__}: {error}"
+        )
+        return None
+    print(f"Reusing validated Codex chunk at offset {start}")
+    return rows
 
 
 def main() -> None:
@@ -131,7 +197,7 @@ def main() -> None:
     if not args.execute_codex:
         return
 
-    work = args.output.parent / "codex_chunks"
+    work = args.output.parent / f".{args.output.stem}.adjudication_v2_chunks"
     work.mkdir(parents=True, exist_ok=True)
     schema_path = work / "adjudication.schema.json"
     atomic_write_json(schema_path, output_schema())
@@ -140,38 +206,55 @@ def main() -> None:
         chunk = tasks[start:start + args.chunk_size]
         chunk_path = work / f"tasks_{start:05d}.json"
         response_path = work / f"response_{start:05d}.json"
-        atomic_write_json(chunk_path, chunk)
+        resume_path = work / f"response_{start:05d}.resume.json"
+        visible_chunk = [blinded_task(row) for row in chunk]
+        atomic_write_json(chunk_path, visible_chunk)
+        chunk_signature = fingerprint({
+            "protocol": ADJUDICATION_PROTOCOL_VERSION,
+            "model": args.model,
+            "schema": output_schema(),
+            "tasks": visible_chunk,
+            "evidence_hashes": [row.get("evidence_hash") for row in chunk],
+        })
         prompt = (
-            "Grounding adjudication task. Read the JSON tasks at "
-            f"{chunk_path.resolve()}. For each item, use only client_stats, "
-            "train_reference_summary and field_semantics. Resolve the judge "
-            "disagreement using supported, partially_supported, unsupported, "
-            "or not_verifiable. Do not use labels, predictions, stereotypes, "
-            "or outside facts. Return every sample_id exactly once."
+            "Independent grounding adjudication task. Read only the JSON tasks at "
+            f"{chunk_path.resolve()} and do not inspect other files. For each item, "
+            "judge the claim using only client_stats, train_reference_summary and "
+            "field_semantics. Use supported, partially_supported, unsupported, or "
+            "not_verifiable. Do not use labels, predictions, source models, prior "
+            "judge verdicts, stereotypes, or outside facts. Return every task_id "
+            "exactly once."
         )
-        command = [
-            "codex",
-            "exec",
-            "--ephemeral",
-            "--sandbox",
-            "read-only",
-            "--ask-for-approval",
-            "never",
-            "--cd",
-            str(REPO_ROOT),
-            "--model",
-            args.model,
-            "--output-schema",
-            str(schema_path.resolve()),
-            "--output-last-message",
-            str(response_path.resolve()),
-            prompt,
-        ]
-        subprocess.run(command, check=True)
-        payload = json.loads(response_path.read_text(encoding="utf-8"))
-        adjudications.extend(
-            validate_chunk(chunk, payload, model=args.model)
+        rows = load_resumed_chunk(
+            expected=chunk,
+            response_path=response_path,
+            resume_path=resume_path,
+            chunk_signature=chunk_signature,
+            model=args.model,
+            start=start,
         )
+        if rows is None:
+            command = [
+                "codex",
+                "exec",
+                "--ephemeral",
+                "--sandbox",
+                "read-only",
+                "--cd",
+                str(REPO_ROOT),
+                "--model",
+                args.model,
+                "--output-schema",
+                str(schema_path.resolve()),
+                "--output-last-message",
+                str(response_path.resolve()),
+                prompt,
+            ]
+            subprocess.run(command, check=True)
+            payload = json.loads(response_path.read_text(encoding="utf-8"))
+            rows = validate_chunk(chunk, payload, model=args.model)
+            atomic_write_json(resume_path, {"chunk_signature": chunk_signature})
+        adjudications.extend(rows)
     atomic_write_json(args.output, adjudications)
     print(f"Saved {len(adjudications)} Codex adjudications -> {args.output}")
 

@@ -310,6 +310,11 @@ async def main_async() -> None:
     pending = [record for record in samples if str(record["sample_id"]) not in existing]
     print(f"judge={args.judge_name} total={len(samples)} existing={len(existing)} pending={len(pending)}")
     if not pending:
+        unresolved_path = args.output.with_name(
+            args.output.stem + ".unresolved.jsonl"
+        )
+        if unresolved_path.exists():
+            unresolved_path.unlink()
         return
 
     llm_config = {
@@ -455,6 +460,14 @@ async def main_async() -> None:
                 f"repair queue: {len(pending)} judgments remain after round "
                 f"{repair_round}; valid results are already durable"
             )
+
+    # A later resume can complete a previously exhausted repair queue.  Do not
+    # leave the old unresolved marker behind once exact coverage is restored.
+    unresolved_path = args.output.with_name(
+        args.output.stem + ".unresolved.jsonl"
+    )
+    if unresolved_path.exists():
+        unresolved_path.unlink()
 
 
 def main() -> None:

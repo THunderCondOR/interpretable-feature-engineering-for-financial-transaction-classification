@@ -377,14 +377,27 @@ def main() -> None:
             "embeddings. Only valid when exactly one dataset/model cell is selected."
         ),
     )
+    parser.add_argument(
+        "--cells",
+        nargs="+",
+        type=Path,
+        help=(
+            "Explicit derived seed_17 cells. This supports isolated/new datasets "
+            "without changing the legacy dataset registry."
+        ),
+    )
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     cells = [
-        (dataset, model)
+        (dataset, model, args.derived_root / dataset / model / "seed_17")
         for dataset, model in CELLS
         if args.model == "all" or model == args.model
         if args.datasets is None or dataset in args.datasets
     ]
+    if args.cells:
+        if args.datasets is not None or args.model != "all":
+            raise ValueError("--cells cannot be combined with --datasets/--model")
+        cells = [(path.parent.parent.name, path.parent.name, path) for path in args.cells]
     backend_override = None if args.backend == "selected" else args.backend
     if args.embedding_cache_cell is not None and len(cells) != 1:
         raise ValueError("--embedding-cache-cell requires exactly one selected cell")
@@ -393,19 +406,16 @@ def main() -> None:
         "reference_seed": 17,
         "additional_seeds": args.seeds,
         "backend": args.backend,
-        "cells": [
-            str(args.derived_root / dataset / model / "seed_17")
-            for dataset, model in cells
-        ],
+        "cells": [str(cell) for _, _, cell in cells],
     }
     print(json.dumps(plan, ensure_ascii=False, indent=2), flush=True)
     if not args.execute:
         return
     results = []
-    for dataset, model in cells:
+    for dataset, model, cell in cells:
         results.append(
             run_cell(
-                args.derived_root / dataset / model / "seed_17",
+                cell,
                 args.seeds,
                 backend_override=backend_override,
                 embedding_cache_cell=args.embedding_cache_cell,

@@ -31,6 +31,22 @@ def test_llm_metrics_exclude_rows_with_error_even_when_prediction_exists():
     assert result["accuracy"] == 1.0
 
 
+def test_llm_evaluator_omits_binary_only_metrics_for_multiclass_targets():
+    metrics = summarize_prediction_rows(
+        [
+            {"label": 0, "predicted": 0},
+            {"label": 1, "predicted": 2},
+            {"label": 2, "predicted": 2},
+            {"label": 3, "predicted": 3},
+        ],
+        split="val",
+    )
+
+    assert "positive_f1" not in metrics
+    assert "hard_label_auc" not in metrics
+    assert metrics["f1_macro"] > 0
+
+
 def test_ml_evaluator_omits_binary_only_metrics_for_multiclass_targets():
     class MulticlassModel:
         def predict(self, features):

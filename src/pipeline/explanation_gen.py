@@ -193,36 +193,6 @@ def load_successful_existing(
     return successful
 
 
-def load_terminal_existing(
-    path: Path,
-    expected_signatures: dict[RequestKey, str],
-    *,
-    max_content_attempts: int,
-) -> dict[RequestKey, dict]:
-    """Reuse exhausted content failures until their generation signature changes."""
-    if not path.exists():
-        return {}
-    terminal = {}
-    with path.open(encoding="utf-8") as file:
-        for line in file:
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-                key = _request_key(record)
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                continue
-            if (
-                record.get("terminal_content_failure")
-                and int(record.get("content_attempts", 0))
-                >= max_content_attempts
-                and record.get("generation_signature")
-                == expected_signatures.get(key)
-            ):
-                terminal[key] = record
-    return terminal
-
-
 def build_output_record(meta: dict, result: dict, label_names: dict[str, str]) -> dict[str, Any]:
     text = ""
     error = result.get("error")
@@ -445,14 +415,9 @@ def run_explanation_generation(
     )
     reused_successful_count = len(existing)
     records_by_key = {key: record for key, record in existing.items() if key in expected_keys}
-    if resume:
-        records_by_key.update(
-            load_terminal_existing(
-                save_path,
-                expected_signatures,
-                max_content_attempts=max_content_attempts,
-            )
-        )
+    # Failed content is never a reusable artifact.  A single invocation still
+    # has a finite repair budget, but a later --until-complete/watchdog restart
+    # must retry the failed keys while preserving every successful record.
 
     keys_in_order = [_request_key(meta) for meta in ordered_meta]
     keys_to_run = [key for key in keys_in_order if key not in records_by_key]
@@ -469,6 +434,7 @@ def run_explanation_generation(
     last_batch_summary: dict[str, Any] | None = None
     content_error_counts: Counter[str] = Counter()
     content_error_attempts: Counter[RequestKey] = Counter()
+    current_run_content_attempts: Counter[RequestKey] = Counter()
     content_error_last_reasons: dict[RequestKey, str] = {}
     if stats_path.is_file():
         try:
@@ -619,10 +585,12 @@ def run_explanation_generation(
                     reason = str(record.get("error") or error_type)
                     content_error_counts[error_type] += 1
                     content_error_attempts[key] += 1
+                    current_run_content_attempts[key] += 1
                     content_error_last_reasons[key] = reason
                     terminal = (
                         not until_complete
-                        or content_error_attempts[key] >= max_content_attempts
+                        or current_run_content_attempts[key]
+                        >= max_content_attempts
                     )
                     if terminal:
                         record["terminal_content_failure"] = True

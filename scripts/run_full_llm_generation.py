@@ -42,6 +42,8 @@ from src.pipeline.explanation_gen import _has_behavioral_explanation
 DATASETS = tuple(EXPECTED_CLIENT_COUNTS) + (
     "datafusion_education",
     "berka",
+    "datafusion_default_2023",
+    "cofinfad_operational_fidelity",
 )
 SPLITS = ("train", "val", "test")
 LLM_STEPS = ("stats", "prompts", "cot", "llm_eval", "claims")

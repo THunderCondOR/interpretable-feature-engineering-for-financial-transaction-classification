@@ -36,6 +36,9 @@ def extract_boxed_answer(s: str) -> str | None:
 def _normalize_label_text(value: str) -> str:
     text = unicodedata.normalize("NFKC", str(value)).strip().lower()
     text = text.replace("ё", "е")
+    # LaTeX boxes often escape underscores in configured labels, e.g.
+    # ``no\_default``.  The escape is presentation, not class semantics.
+    text = text.replace(r"\_", "_")
     text = re.sub(r"[\s_\-\u2010-\u2015]+", " ", text)
     return text.strip(" .,:;!?'\"`|[](){}")
 

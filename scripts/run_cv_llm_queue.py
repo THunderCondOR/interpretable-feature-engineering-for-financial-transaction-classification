@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
+import os
 import subprocess
 import sys
 import time
@@ -21,10 +23,43 @@ from src.experiments.artifacts import (
     file_sha256,
     fingerprint,
 )
+from src.utils.process_lease import LeaseInUseError, ProcessLease
 
 
 DATASET_ORDER = ("berka", "datafusion_education")
 FOLDS = range(5)
+
+
+def active_model_queues(
+    model: str,
+    *,
+    proc_root: Path = Path("/proc"),
+    own_pid: int | None = None,
+) -> list[dict[str, Any]]:
+    """Find running CV queues, including processes started before leases."""
+    matches = []
+    own_pid = os.getpid() if own_pid is None else own_pid
+    if not proc_root.is_dir():
+        return matches
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == own_pid:
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+            decoded = [value.decode("utf-8", errors="replace") for value in argv]
+        except (OSError, PermissionError):
+            continue
+        if not any(
+            value.endswith("scripts/run_cv_llm_queue.py") for value in decoded
+        ):
+            continue
+        try:
+            model_index = decoded.index("--model")
+        except ValueError:
+            continue
+        if model_index + 1 < len(decoded) and decoded[model_index + 1] == model:
+            matches.append({"pid": int(entry.name), "argv": decoded})
+    return sorted(matches, key=lambda row: row["pid"])
 
 
 def selection_path(run_id: str, dataset: str, fold: int) -> Path:
@@ -403,6 +438,37 @@ def main() -> None:
     event_path = (
         Path("logs/runs") / args.run_id / f"{args.model}.cv_queue.events.jsonl"
     )
+    lease = ProcessLease(
+        REPO_ROOT / "logs" / "api_queue_leases" / f"{args.model}.lock",
+        {
+            "kind": "cv_api_model_queue",
+            "model": args.model,
+            "run_id": args.run_id,
+            "datasets": list(datasets),
+        },
+    )
+    try:
+        lease.acquire()
+    except LeaseInUseError as exc:
+        append_event(event_path, {
+            "time": time.time(),
+            "state": "duplicate_model_queue_blocked",
+            "model": args.model,
+            "reason": str(exc),
+        })
+        raise
+    atexit.register(lease.release)
+    duplicates = active_model_queues(args.model)
+    if duplicates:
+        append_event(event_path, {
+            "time": time.time(),
+            "state": "duplicate_model_queue_blocked",
+            "model": args.model,
+            "active": duplicates,
+        })
+        raise RuntimeError(
+            f"Refusing duplicate {args.model} API queue; active={duplicates}"
+        )
     for dataset_index, dataset in enumerate(datasets):
         if dataset_index:
             previous = datasets[dataset_index - 1]

@@ -1,0 +1,76 @@
+dataset:
+  name: datafusion_default_2023
+  benchmark_protocol: stratified_60_20_20_seed137
+  modality: transactions_only
+  amount_semantics: signed_direction
+  amount_unit: native_transaction_currency
+  currency_aware_amounts: true
+  columns:
+    customer_id: customer_id
+    datetime: tr_datetime
+    amount: amount
+    category: mcc_code_desc
+    label: label
+  label_names:
+    "0": no_default
+    "1": default
+  claim_forbidden_terms:
+    - no_default
+    - default
+    - defaulting
+    - non-defaulting
+  category_label: merchant categories
+  prompt_task_description: >-
+    Predict the official Data Fusion Contest 2023 binary default-risk target:
+    no_default or default.
+  prompt_dataset_guidance: >-
+    Transaction amounts are signed values in their native transaction
+    currencies. Positive and negative directions are shown separately and
+    values from different currencies are never summed. The supplied data do
+    not directly reveal delinquency, debt, salary, account balance, credit
+    history, employment, or family status. You may form cautious financial-use
+    or behavioral hypotheses from the observed transactions, but do not state
+    any of those unavailable attributes as facts.
+  label_semantics: standard
+  num_labels: 2
+  metric: roc_auc
+  primary_metric: roc_auc
+  direct_selection_metric: balanced_accuracy
+  splits: {}
+
+llm:
+  api_base_url: "${API_BASE_URL}"
+  api_key: "${API_KEY}"
+  default_model: Openai/Gpt-oss-120b
+  max_tokens: 8192
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+
+prompts:
+  base_dir: .
+  language: en
+  contract_version: evidence_bounded_v5
+  category_mapping_version: en_v1
+  system: prompts/common/explanation_generation/system_prompt.txt
+  user: prompts/common/explanation_generation/user_prompt.txt
+  claims_system: prompts/common/claims_extraction/system_prompt.txt
+  claims_user: prompts/common/claims_extraction/user_prompt.txt
+
+pipeline:
+  event_features: minimal
+  n_explanation_samples: 1
+  n_claims_samples: 1
+  claims_max_tokens: 2048
+  few_shot_per_class: 0
+  embedding_model: intfloat/multilingual-e5-large
+  min_behavioral_explanation_chars: 40
+
+output:
+  base_dir: results/datafusion_default_2023/v1
+  summary_stats: summary_stats.txt
+  clients_stats: clients_stats.jsonl
+  prompts: prompts.jsonl
+  explanations: explanations.jsonl
+  claims: claims.jsonl
+  metrics: metrics.json

@@ -1,0 +1,78 @@
+dataset:
+  name: cofinfad_operational_fidelity
+  benchmark_protocol: score_activity_stratified_7500_seed137
+  modality: transactions_plus_operational_profile
+  amount_semantics: typed_unsigned_transaction_value
+  amount_unit: COP
+  columns:
+    customer_id: customer_id
+    datetime: tr_datetime
+    amount: amount
+    category: mcc_code_desc
+    label: label
+  label_names:
+    "0": lower_risk
+    "1": moderately_lower_risk
+    "2": moderately_higher_risk
+    "3": higher_risk
+  claim_forbidden_terms:
+    - lower_risk
+    - moderately_lower_risk
+    - moderately_higher_risk
+    - higher_risk
+    - churn score
+    - churn probability
+  category_label: transaction types
+  prompt_task_description: >-
+    Predict the train-defined relative band of the published 30-day customer
+    churn-propensity score: lower_risk, moderately_lower_risk,
+    moderately_higher_risk, or higher_risk.
+  prompt_dataset_guidance: >-
+    Use the supplied transaction, product-use, application-engagement,
+    satisfaction, and support evidence only. Demographic attributes and the
+    published churn score are not supplied. Missing operational fields mean
+    not available, not zero. Treat behavioral interpretations as hypotheses
+    and never invent an observed cancellation, churn event, or personal trait.
+  label_semantics: standard
+  num_labels: 4
+  metric: r2
+  primary_metric: r2
+  direct_selection_metric: balanced_accuracy
+  splits: {}
+
+llm:
+  api_base_url: "${API_BASE_URL}"
+  api_key: "${API_KEY}"
+  default_model: Openai/Gpt-oss-120b
+  max_tokens: 8192
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+
+prompts:
+  base_dir: .
+  language: en
+  contract_version: evidence_bounded_v5
+  category_mapping_version: en_v1
+  system: prompts/common/explanation_generation/system_prompt.txt
+  user: prompts/common/explanation_generation/user_prompt.txt
+  claims_system: prompts/common/claims_extraction/system_prompt.txt
+  claims_user: prompts/common/claims_extraction/user_prompt.txt
+
+pipeline:
+  event_features: minimal
+  n_explanation_samples: 1
+  n_claims_samples: 1
+  claims_max_tokens: 2048
+  few_shot_per_class: 0
+  embedding_model: intfloat/multilingual-e5-large
+  min_behavioral_explanation_chars: 40
+
+output:
+  base_dir: results/cofinfad_operational_fidelity/v1
+  summary_stats: summary_stats.txt
+  clients_stats: clients_stats.jsonl
+  prompts: prompts.jsonl
+  explanations: explanations.jsonl
+  claims: claims.jsonl
+  metrics: metrics.json

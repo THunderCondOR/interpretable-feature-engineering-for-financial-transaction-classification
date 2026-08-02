@@ -14,6 +14,14 @@ def limited():
     return {"response": None, "error": "429 too many requests", "error_type": "RateLimitError", "rate_limited": True}
 
 
+def disconnected():
+    return {
+        "response": None,
+        "error": "APIConnectionError: Connection error",
+        "error_type": "APIConnectionError",
+    }
+
+
 def not_found():
     return {
         "response": None,
@@ -52,6 +60,40 @@ def test_429_in_64_rolls_back_every_result_then_runs_10x10_and_probes_64(tmp_pat
     assert commits[0][0] == 0
     assert calls[-1] == (100, 64, 64)
     assert sleeps == [60]
+
+
+def test_connection_overload_steps_down_64_to_10_without_committing(tmp_path):
+    calls, commits, sleeps = [], [], []
+
+    async def execute(window, concurrency):
+        calls.append(concurrency)
+        if len(calls) == 1:
+            return [(window[0][0], disconnected())]
+        return [(index, ok(index)) for index, _ in window]
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    scheduler = AtomicAdaptiveScheduler(config(tmp_path), sleep=sleep)
+    asyncio.run(
+        scheduler.run(
+            list(range(20)), execute,
+            lambda rows: commits.append([index for index, _ in rows]),
+        )
+    )
+    assert calls[:2] == [64, 10]
+    assert commits == [list(range(10)), list(range(10, 20))]
+    assert sleeps == [60]
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "worker.jsonl").read_text().splitlines()
+    ]
+    rollback = next(
+        row for row in events
+        if row.get("reason") == "transient_transport_overload"
+    )
+    assert rollback["errors"] == {"APIConnectionError": 1}
+    assert rollback["next_mode"] == "fallback"
 
 
 def test_429_at_10_resets_clean_recovery_counter(tmp_path):
