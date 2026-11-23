@@ -1,0 +1,206 @@
+"""
+Loads any supported dataset into the internal schema:
+    customer_id, tr_datetime, amount, mcc_code_desc, label
+
+All downstream code (aggregator, prompt_builder, lora_trainer) works
+exclusively with these column names — dataset differences are isolated here.
+"""
+
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+
+from interpretable_features.data.entity_ids import canonical_entity_series
+from interpretable_features.data.prompt_locale import (
+    english_category,
+    english_currency,
+    english_operation_type,
+)
+
+
+def _read_table(
+    path: str | os.PathLike,
+    *,
+    filter_column: str | None = None,
+    allowed: set | None = None,
+) -> pd.DataFrame:
+    path = Path(path)
+    if path.suffix.lower() in {".parquet", ".pq"}:
+        if filter_column and allowed is not None:
+            import pyarrow.dataset as ds
+
+            dataset = ds.dataset(path, format="parquet")
+            table = dataset.to_table(filter=ds.field(filter_column).isin(list(allowed)))
+            categorical = [
+                column
+                for column in (
+                    filter_column,
+                    "mcc_code_desc",
+                    "currency_name",
+                    "operation_type",
+                    "operation_name",
+                    "purpose_name",
+                )
+                if column and column in table.column_names
+            ]
+            return table.to_pandas(categories=categorical)
+        table = __import__("pyarrow.parquet", fromlist=["read_table"]).read_table(path)
+        categorical = [
+            column
+            for column in (
+                "customer_id",
+                "mcc_code_desc",
+                "currency_name",
+                "operation_type",
+                "operation_name",
+                "purpose_name",
+            )
+            if column in table.column_names
+        ]
+        return table.to_pandas(categories=categorical)
+    return pd.read_csv(path)
+
+
+def load_dataset(
+    config: dict,
+    split: str = "train",
+    *,
+    apply_client_filter: bool = True,
+) -> pd.DataFrame:
+    """
+    Load a split CSV and rename columns to the internal schema.
+
+    Args:
+        config: full pipeline config dict (from yaml)
+        split:  "train", "val", or "test"
+
+    Returns:
+        DataFrame with columns: customer_id, tr_datetime, amount,
+                                mcc_code_desc, label
+    """
+    path = config["dataset"]["splits"][split]
+
+    client_filter = (
+        config["dataset"].get("client_ids_by_split", {}).get(split) if apply_client_filter else None
+    )
+    if client_filter is not None:
+        if isinstance(client_filter, (str, os.PathLike)):
+            with open(Path(client_filter), encoding="utf-8") as file:
+                client_filter = json.load(file)
+        allowed = set(client_filter)
+        source_customer_id = config["dataset"]["columns"]["customer_id"]
+        df = _read_table(
+            path,
+            filter_column=source_customer_id,
+            allowed=allowed,
+        )
+        if source_customer_id not in df.columns:
+            raise ValueError(f"Cannot apply client filter: missing {source_customer_id}")
+        df = df[df[source_customer_id].isin(allowed)].copy()
+        if df.empty and allowed:
+            raise ValueError(f"Client filter for split={split} selected no rows")
+    else:
+        df = _read_table(path)
+
+    col_map = config["dataset"]["columns"]
+    rename = {
+        col_map["customer_id"]: "customer_id",
+        col_map["datetime"]: "tr_datetime",
+        col_map["amount"]: "amount",
+        col_map["category"]: "mcc_code_desc",
+        col_map["label"]: "label",
+    }
+    # Only rename columns that actually need renaming
+    rename = {src: dst for src, dst in rename.items() if src in df.columns and src != dst}
+    df = df.rename(columns=rename)
+
+    # Validate required columns are present
+    required = {"customer_id", "tr_datetime", "amount", "mcc_code_desc", "label"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"After renaming, columns {missing} are missing.\n"
+            f"Available columns: {list(df.columns)}\n"
+            f"Check column mapping in config."
+        )
+
+    if "trx_cat_ru" in df.columns and "operation_type" not in df.columns:
+        df = df.rename(columns={"trx_cat_ru": "operation_type"})
+        for column, translate in (
+            ("operation_type", english_operation_type),
+            ("currency_name", english_currency),
+            ("mcc_code_desc", english_category),
+            ("mcc_desc", english_category),
+        ):
+            if column in df:
+                translation = {value: translate(value) for value in df[column].dropna().unique()}
+                df[column] = df[column].map(translation)
+    df["customer_id"] = canonical_entity_series(df["customer_id"])
+
+    return df
+
+
+def add_features(df: pd.DataFrame, *, minimal: bool = False) -> pd.DataFrame:
+    """
+    Add derived features used by the aggregator.
+    Input DataFrame must already have the internal schema.
+
+    Features added:
+        is_positive / is_negative, amount_positive / amount_negative,
+        hour, weekday, weekday_name, day (days since 2000-01-01),
+        is_weekend, period_of_day, days_since_last_txn
+    """
+    df = df.copy()
+
+    # Amount features
+    df["is_positive"] = (df["amount"] > 0).astype(int)
+    df["is_negative"] = (df["amount"] < 0).astype(int)
+    df["amount_positive"] = df["amount"].where(df["amount"] > 0, 0)
+    df["amount_negative"] = df["amount"].where(df["amount"] < 0, 0)
+
+    # Datetime features
+    df["tr_datetime"] = pd.to_datetime(df["tr_datetime"], errors="coerce")
+    df = df.sort_values(["customer_id", "tr_datetime"], ascending=[True, True])
+    if minimal:
+        return df
+
+    df["hour"] = df["tr_datetime"].dt.hour.fillna(0).astype(int)
+    df["weekday"] = df["tr_datetime"].dt.weekday.fillna(0).astype(int)
+    df["day"] = (df["tr_datetime"] - pd.Timestamp("2000-01-01")).dt.days.fillna(0).astype(int)
+    df["is_weekend"] = df["weekday"].isin([5, 6]).astype(int)
+    df["days_since_last_txn"] = df.groupby("customer_id")["day"].transform(lambda x: x.max() - x)
+
+    weekday_map = {
+        0: "Monday",
+        1: "Tuesday",
+        2: "Wednesday",
+        3: "Thursday",
+        4: "Friday",
+        5: "Saturday",
+        6: "Sunday",
+    }
+    df["weekday_name"] = df["weekday"].map(weekday_map)
+
+    def _hour_to_period(h):
+        if 6 <= h < 12:
+            return "morning"
+        elif 12 <= h < 18:
+            return "afternoon"
+        elif 18 <= h < 24:
+            return "evening"
+        else:
+            return "night"
+
+    df["period_of_day"] = df["hour"].apply(_hour_to_period)
+
+    return df
+
+
+def load_all_splits(config: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Convenience: load and add features for all three splits."""
+    train = add_features(load_dataset(config, "train"))
+    val = add_features(load_dataset(config, "val"))
+    test = add_features(load_dataset(config, "test"))
+    return train, val, test

@@ -1,0 +1,17 @@
+You analyze an aggregated financial transaction profile for the following classification task:
+
+{TASK_DESCRIPTION}
+
+Use only the class reference computed from the training split, any factual training examples supplied in the prompt, and the target client's transaction profile. Reason freely about the transaction patterns you consider most informative. You may formulate plausible behavioral, financial-use, lifestyle, or life-stage interpretations when they are supported by the supplied evidence. Present interpretations as hypotheses rather than established personal facts.
+
+Do not invent transactions, categories, temporal patterns, or personal attributes. General stereotypes and outside assumptions are not evidence by themselves. A top-k category list is incomplete, so an omitted category must not be treated as absent.
+
+{DATASET_GUIDANCE}
+
+Focus on the most discriminative patterns instead of mechanically restating every statistic. Choose your own reasoning structure. Write a substantive, non-empty behavioral rationale in English.
+
+Allowed labels:
+{ALLOWED_LABELS}
+
+End with exactly one final line in this format:
+Final: \boxed{LABEL}

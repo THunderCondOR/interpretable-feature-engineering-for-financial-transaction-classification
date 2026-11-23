@@ -1,0 +1,62 @@
+defaults: ../common.yaml
+
+experiment:
+  run_id: datafusion_default_2023
+
+dataset:
+  name: datafusion_default_2023
+  benchmark_protocol: stratified_60_20_20_seed137
+  modality: transactions_only
+  amount_semantics: signed_direction
+  amount_unit: native_transaction_currency
+  currency_aware_amounts: true
+  columns:
+    customer_id: customer_id
+    datetime: tr_datetime
+    amount: amount
+    category: mcc_code_desc
+    label: label
+  label_names:
+    "0": no_default
+    "1": default
+  claim_forbidden_terms:
+    - no_default
+    - default
+    - defaulting
+    - non-defaulting
+  category_label: merchant categories
+  prompt_task_description: >-
+    Predict the official Data Fusion Contest 2023 binary default-risk target:
+    no_default or default.
+  prompt_dataset_guidance: >-
+    Transaction amounts are signed values in their native transaction
+    currencies. Positive and negative directions are shown separately and
+    values from different currencies are never summed. The supplied data do
+    not directly reveal delinquency, debt, salary, account balance, credit
+    history, employment, or family status. You may form cautious financial-use
+    or behavioral hypotheses from the observed transactions, but do not state
+    any of those unavailable attributes as facts.
+  label_semantics: standard
+  num_labels: 2
+  metric: roc_auc
+  primary_metric: roc_auc
+  direct_selection_metric: balanced_accuracy
+  splits:
+    train: data/datafusion_default_2023/stratified_60_20_20_seed137/events.parquet
+    val: data/datafusion_default_2023/stratified_60_20_20_seed137/events.parquet
+    test: data/datafusion_default_2023/stratified_60_20_20_seed137/events.parquet
+  client_ids_by_split:
+    train: data/datafusion_default_2023/stratified_60_20_20_seed137/train_ids.json
+    val: data/datafusion_default_2023/stratified_60_20_20_seed137/val_ids.json
+    test: data/datafusion_default_2023/stratified_60_20_20_seed137/test_ids.json
+
+pipeline:
+  prompt_context_apply_client_filter: true
+  event_features: minimal
+  min_behavioral_explanation_chars: 40
+
+prompts:
+  contract_version: evidence_bounded_v5
+
+output:
+  base_dir: outputs/datafusion_default_2023

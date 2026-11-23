@@ -1,0 +1,60 @@
+defaults: ../common.yaml
+
+experiment:
+  run_id: berka
+
+dataset:
+  name: berka
+  benchmark_protocol: unittab_70_30_5seed
+  modality: transactions_only
+  amount_semantics: typed_transaction_value
+  amount_unit: Czech koruna
+  direction_rule: "transaction direction is defined by operation_type"
+  columns:
+    customer_id: customer_id
+    datetime: tr_datetime
+    amount: amount
+    category: mcc_code_desc
+    label: label
+  label_names:
+    "0": "non-default"
+    "1": "default"
+  claim_forbidden_terms:
+    - default
+    - non-default
+    - loan status
+  category_label: "operation and payment-purpose categories"
+  prompt_task_description: >-
+    Predict whether the loan belongs to the non-default or default outcome
+    class using only the account's transaction history before loan origination.
+  prompt_dataset_guidance: >-
+    Use only the pre-loan transaction evidence. You may form cautious
+    hypotheses about cash-flow regularity, financial pressure, or account use
+    when supported by the observed history. Do not assume facts outside the
+    transactions, and never infer the outcome from loan-payment or post-loan
+    behavior because neither is provided.
+  label_semantics: standard
+  num_labels: 2
+  metric: positive_f1
+  primary_metric: positive_f1
+  direct_selection_metric: positive_f1
+  positive_label: 1
+  splits:
+    train: data/berka/unittab_70_30_5seed/events.parquet
+    val: data/berka/unittab_70_30_5seed/events.parquet
+    test: data/berka/unittab_70_30_5seed/events.parquet
+  client_ids_by_split:
+    train: data/berka/unittab_70_30_5seed/fold_{fold}/inner_train_ids.json
+    val: data/berka/unittab_70_30_5seed/fold_{fold}/inner_validation_ids.json
+    test: data/berka/unittab_70_30_5seed/fold_{fold}/outer_test_ids.json
+
+pipeline:
+  prompt_context_apply_client_filter: true
+  event_features: minimal
+  min_behavioral_explanation_chars: 40
+
+prompts:
+  contract_version: evidence_bounded_v5
+
+output:
+  base_dir: outputs/berka

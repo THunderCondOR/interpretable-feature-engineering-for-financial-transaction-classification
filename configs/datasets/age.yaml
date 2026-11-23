@@ -1,0 +1,45 @@
+defaults: ../common.yaml
+
+experiment:
+  run_id: age
+
+dataset:
+  name: age
+  amount_semantics: unsigned_transaction_value
+  amount_unit: dataset_native_units
+  direction_rule: "amount encodes transaction value; no income/outflow inference"
+  columns:
+    customer_id: customer_id
+    datetime:    tr_datetime
+    amount:      amount
+    category:    mcc_code_desc
+    label:       label
+  label_names:
+    "0": "age_group_A"
+    "1": "age_group_B"
+    "2": "age_group_C"
+    "3": "age_group_D"
+  label_order: [0, 1, 2, 3]
+  exact_age_boundaries_available: false
+  category_label: "transaction categories"
+  prompt_task_description: "Predict the anonymized age-group class assigned by the dataset."
+  prompt_dataset_guidance: >-
+    The four age-group classes are anonymized. Their exact numerical
+    boundaries and their order are not provided. You may formulate cautious
+    life-stage interpretations, such as student-like, working-age,
+    family-oriented, or retirement-like behavior, only when supported by the
+    supplied transaction evidence. Do not assign a specific age.
+  label_semantics: age_opaque
+  claim_forbidden_terms: [age_group_A, age_group_B, age_group_C, age_group_D]
+  num_labels: 4
+  metric: accuracy
+  splits:
+    train: data/age/train.csv
+    val:   data/age/val.csv
+    test:  data/age/test.csv
+  client_ids_by_split:
+    train: data/age/paper_train_ids.json
+    val: data/age/paper_val_ids.json
+
+output:
+  base_dir: outputs/age

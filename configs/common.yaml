@@ -1,0 +1,88 @@
+default_model_config: models/qwen.yaml
+
+experiment:
+  variant: guided_zero_shot
+  seed: 17
+  model_slug: qwen
+
+statistics:
+  summary_profile: robust_mean
+
+execution:
+  atomic_windows: true
+
+generation:
+  seed: 17
+
+claims_generation:
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 2048
+  seed: 17
+
+prompts:
+  base_dir: .
+  language: en
+  contract_version: evidence_bounded_v4
+  category_mapping_version: en_v2
+  system: prompts/common/explanation_generation/system_prompt.txt
+  user: prompts/common/explanation_generation/user_prompt.txt
+  claims_system: prompts/common/claims_extraction/system_prompt.txt
+  claims_user: prompts/common/claims_extraction/user_prompt.txt
+
+pipeline:
+  prompt_context_split: train
+  prompt_context_population: full_train_split
+  n_explanation_samples: 1
+  n_claims_samples: 1
+  few_shot_per_class: 0
+  embedding_model: intfloat/multilingual-e5-large
+
+clustering:
+  distance_threshold: 0.01
+  min_client_coverage: 5
+  max_assign_distance: 0.45
+  feature_encoding: binary
+
+evaluation:
+  seeds: [17, 101, 947]
+
+optuna:
+  n_trials: 30
+
+output:
+  summary_stats: summary_stats.txt
+  clients_stats: clients_stats.jsonl
+  prompts: prompts.jsonl
+  explanations: explanations.jsonl
+  claims: claims.jsonl
+  metrics: metrics.json
+
+lora:
+  defaults:
+    max_length: 1024
+    lora_rank: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    learning_rate: 0.0001
+    batch_size: 1
+    eval_batch_size: 2
+    gradient_accumulation_steps: 16
+    num_epochs: 3
+    weight_decay: 0.01
+    warmup_steps: 50
+    logging_steps: 10
+    load_in_4bit: true
+    bf16: true
+    fp16: false
+    optim: paged_adamw_32bit
+    gradient_checkpointing: true
+    save_total_limit: 2
+    seed: 17
+
+  models:
+    - name: qwen3_8b
+      model_name: Qwen/Qwen3-8B
+    - name: qwen3_32b
+      model_name: Qwen/Qwen3-32B

@@ -1,0 +1,36 @@
+defaults: ../common.yaml
+
+experiment:
+  run_id: gender
+
+dataset:
+  name: gender
+  amount_semantics: signed_cashflow
+  amount_unit: dataset_native_units
+  direction_rule: "amount > 0 is inflow; amount < 0 is outflow"
+  columns:
+    customer_id: customer_id
+    datetime:    tr_datetime
+    amount:      amount
+    category:    mcc_code_desc
+    label:       label
+  label_names:
+    "0": "female"
+    "1": "male"
+  category_label: "transaction categories"
+  prompt_task_description: "Predict the client's gender label from the supplied transaction evidence."
+  prompt_dataset_guidance: >-
+    Behavioral patterns and tentative lifestyle interpretations may be used
+    when supported by the transactions and training statistics. General
+    beliefs about women or men must not be used as independent evidence.
+  label_semantics: standard
+  claim_forbidden_terms: [female, male, woman, man, gender]
+  num_labels: 2
+  metric: roc_auc
+  splits:
+    train: data/gender/train.csv
+    val:   data/gender/val.csv
+    test:  data/gender/test.csv
+
+output:
+  base_dir: outputs/gender

@@ -1,0 +1,38 @@
+defaults: ../common.yaml
+
+experiment:
+  run_id: rosbank
+
+dataset:
+  name: rosbank
+  amount_semantics: typed_transaction_value
+  amount_unit: dataset_native_units
+  direction_rule: "direction is read from operation_type, not inferred from amount sign"
+  observation_end: "2018-04-02 23:20:35"
+  columns:
+    customer_id: customer_id
+    datetime:    tr_datetime
+    amount:      amount
+    category:    mcc_code_desc
+    label:       label
+  label_names:
+    "0": "retained_client"
+    "1": "churned_client"
+  category_label: "transaction categories"
+  prompt_task_description: "Predict whether the bank client is retained or churned."
+  prompt_dataset_guidance: >-
+    You may reason about engagement, primary- or secondary-bank use, declining
+    activity, and possible attrition when these interpretations are supported
+    by temporal and operation-type evidence. Transaction direction is defined
+    by operation type, not by the amount sign.
+  label_semantics: standard
+  claim_forbidden_terms: [retained_client, churned_client, retained, churned, churn]
+  num_labels: 2
+  metric: roc_auc
+  splits:
+    train: data/rosbank/train.csv
+    val:   data/rosbank/val.csv
+    test:  data/rosbank/test.csv
+
+output:
+  base_dir: outputs/rosbank

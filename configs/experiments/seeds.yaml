@@ -1,0 +1,7 @@
+generation_seeds: [17, 101, 947]
+clustering_seeds: [17, 101, 947]
+ml_seeds: [17, 101, 947]
+distance_thresholds: [0.008, 0.010, 0.012]
+fixed_cluster_counts: [100, 200, 400, 800]
+minimum_client_coverage: [2, 5, 10]
+feature_encodings: [binary, raw_count, normalized_count]

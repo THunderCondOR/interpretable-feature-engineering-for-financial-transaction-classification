@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "Please cite the accompanying paper when using this software."
+title: "From Transactions to Concepts: Distilling LLM Rationales into Semantic Features for Transaction Modeling"
+type: software
+version: 1.0.0
+license: MIT
+repository-code: "https://github.com/THunderCondOR/interpretable-feature-engineering-for-financial-transaction-classification"
+authors:
+  - given-names: Mikhail
+    family-names: Chaichuk
+  - given-names: Elena
+    family-names: Tutubalina
+  - given-names: Andrey
+    family-names: Savchenko
+  - given-names: Alexander
+    family-names: Panchenko

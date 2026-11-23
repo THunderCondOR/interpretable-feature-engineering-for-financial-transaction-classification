@@ -1,0 +1,7 @@
+Extract a JSON array of atomic behavioral claims from a model-generated rationale about a client's aggregated financial transactions. The claims will be used for semantic clustering.
+
+Each string must contain one self-contained behavioral claim. Preserve only information present in the rationale. Remove target labels, predicted classes, and exact counts, amounts, percentages, dates, ranges, and ranks. Retain meaningful qualitative patterns such as frequent, infrequent, increasing, declining, concentrated, or diverse when the rationale supports them.
+
+Interpretive claims are allowed when grounded in transaction evidence. Preserve their uncertainty: do not turn "may indicate", "suggests", or "is consistent with" into an established personal fact. Do not introduce new evidence. Do not infer that a behavior is absent merely because a category was omitted from a top-k list.
+
+Write every claim in English using the neutral subject "The client". Return only a valid JSON array of strings, with no heading, commentary, or code fence.

@@ -1,0 +1,216 @@
+from pathlib import Path
+
+import pandas as pd
+
+from interpretable_features.data.profiles import (
+    client_numeric_profile,
+    export_robust_statistics,
+    format_client_profile,
+    robust_statistics_payload,
+)
+
+
+def _config(name: str, semantics: str, **dataset):
+    return {
+        "dataset": {
+            "name": name,
+            "amount_semantics": semantics,
+            "category_label": "transaction categories",
+            "label_names": {"0": "zero", "1": "one"},
+            **dataset,
+        }
+    }
+
+
+def _frame(rows):
+    frame = pd.DataFrame(rows)
+    frame["tr_datetime"] = pd.to_datetime(frame["tr_datetime"])
+    return frame
+
+
+def test_gender_outflow_is_positive_and_sorted_by_absolute_magnitude():
+    frame = _frame(
+        [
+            {
+                "customer_id": 1,
+                "label": 0,
+                "tr_datetime": "2024-01-01",
+                "amount": -10,
+                "mcc_code_desc": "small",
+            },
+            {
+                "customer_id": 1,
+                "label": 0,
+                "tr_datetime": "2024-01-03",
+                "amount": -100,
+                "mcc_code_desc": "large",
+            },
+            {
+                "customer_id": 1,
+                "label": 0,
+                "tr_datetime": "2024-01-03",
+                "amount": 25,
+                "mcc_code_desc": "inflow",
+            },
+        ]
+    )
+    config = _config("gender", "signed_cashflow")
+    profile = client_numeric_profile(frame, config)
+    text = format_client_profile(frame, config)
+    assert profile["total_outflow"] == 110
+    assert profile["active_days"] == 2
+    assert profile["calendar_span_days"] == 3
+    assert text.index("large: 100.00") < text.index("small: 10.00")
+    assert "Total outflow (positive magnitude): 110.00" in text
+
+
+def test_age_uses_neutral_transaction_value_language():
+    frame = _frame(
+        [
+            {
+                "customer_id": 3,
+                "label": 1,
+                "tr_datetime": "2024-01-01",
+                "amount": 12,
+                "mcc_code_desc": "A",
+            },
+            {
+                "customer_id": 3,
+                "label": 1,
+                "tr_datetime": "2024-01-02",
+                "amount": 30,
+                "mcc_code_desc": "B",
+            },
+        ]
+    )
+    text = format_client_profile(frame, _config("age", "unsigned_transaction_value"))
+    assert "Total transaction value" in text
+    assert "income" not in text.lower()
+    assert "expense" not in text.lower()
+
+
+def test_rosbank_recency_uses_fixed_observation_end_and_operation_types():
+    frame = _frame(
+        [
+            {
+                "customer_id": 7,
+                "label": 1,
+                "tr_datetime": "2024-01-01",
+                "amount": 10,
+                "mcc_code_desc": "A",
+                "operation_type": "card payment",
+            },
+            {
+                "customer_id": 7,
+                "label": 1,
+                "tr_datetime": "2024-01-08",
+                "amount": 20,
+                "mcc_code_desc": "B",
+                "operation_type": "cash withdrawal",
+            },
+        ]
+    )
+    profile = client_numeric_profile(
+        frame, _config("rosbank", "typed_transaction_value", observation_end="2024-01-11")
+    )
+    assert profile["recency_days"] == 3
+    assert profile["card_payment_share"] == 0.5
+    assert profile["cash_withdrawal_share"] == 0.5
+
+
+def test_robust_stats_are_client_level_untrimmed_and_export_all_formats(tmp_path: Path):
+    frame = _frame(
+        [
+            {
+                "customer_id": cid,
+                "label": cid % 2,
+                "tr_datetime": "2024-01-01",
+                "amount": amount,
+                "mcc_code_desc": "A",
+            }
+            for cid, amount in enumerate([1, 2, 3, 4, 1000], start=1)
+        ]
+    )
+    payload = robust_statistics_payload(frame, _config("age", "unsigned_transaction_value"))
+    paths = export_robust_statistics(payload, tmp_path)
+    assert payload["scope"] == "training_split_only"
+    assert payload["outlier_handling"] == "untrimmed_observations"
+    assert payload["n_clients"] == 5
+    metric = payload["classes"]["1"]["metrics"]["total_transaction_value"]
+    assert metric["mean"] == (1 + 3 + 1000) / 3
+    assert metric["std"] > metric["median"]
+    assert set(("mean", "std", "p05", "q1", "median", "q3", "p95")) <= set(metric)
+    assert set(paths) == {"json", "csv", "md", "tex"}
+    assert all(path.exists() for path in paths.values())
+    prompt_summary = paths["md"].read_text(encoding="utf-8")
+    assert "mean=" in prompt_summary
+    assert "IQR=[" in prompt_summary
+    assert "std=" not in prompt_summary
+
+
+def test_category_mean_count_includes_zero_clients():
+    frame = _frame(
+        [
+            {
+                "customer_id": 1,
+                "label": 0,
+                "tr_datetime": "2024-01-01",
+                "amount": 1,
+                "mcc_code_desc": "A",
+            },
+            {
+                "customer_id": 1,
+                "label": 0,
+                "tr_datetime": "2024-01-02",
+                "amount": 1,
+                "mcc_code_desc": "A",
+            },
+            {
+                "customer_id": 2,
+                "label": 0,
+                "tr_datetime": "2024-01-01",
+                "amount": 1,
+                "mcc_code_desc": "B",
+            },
+        ]
+    )
+    payload = robust_statistics_payload(frame, _config("age", "unsigned_transaction_value"))
+    categories = {row["category"]: row for row in payload["classes"]["0"]["categories"]}
+    assert categories["A"]["mean_transaction_count_all_clients"] == 1.0
+    assert categories["A"]["client_prevalence"] == 0.5
+
+
+def test_berka_and_legacy_rosbank_render_their_own_operations(tmp_path):
+    from interpretable_features.data.profiles import format_client_profile
+    from interpretable_features.runner import load_config, load_split
+
+    for name, extra, expected in [
+        (
+            "rosbank",
+            {"trx_cat_ru": "оплата картой", "currency_name": "Рубль"},
+            "Share of card payments: 100.0%",
+        ),
+        (
+            "berka",
+            {"operation_type": "credit", "balance": 250.0},
+            "Share of credit operations: 100.0%",
+        ),
+    ]:
+        config = load_config(f"configs/datasets/{name}.yaml")
+        path = tmp_path / f"{name}.csv"
+        pd.DataFrame(
+            [
+                {
+                    "customer_id": 7,
+                    "label": 0,
+                    "amount": 75.0,
+                    "tr_datetime": "2017-01-01",
+                    "mcc_code_desc": "Groceries",
+                    **extra,
+                }
+            ]
+        ).to_csv(path, index=False)
+        config["dataset"]["splits"]["train"] = str(path)
+        config["dataset"].pop("client_ids_by_split", None)
+        frame = load_split(config, "train")
+        assert expected in format_client_profile(frame, config)

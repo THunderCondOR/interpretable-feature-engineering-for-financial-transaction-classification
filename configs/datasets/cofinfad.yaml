@@ -1,0 +1,64 @@
+defaults: ../common.yaml
+
+experiment:
+  run_id: cofinfad
+
+dataset:
+  name: cofinfad_operational_fidelity
+  benchmark_protocol: score_activity_stratified_7500_seed137
+  modality: transactions_plus_operational_profile
+  amount_semantics: typed_unsigned_transaction_value
+  amount_unit: COP
+  columns:
+    customer_id: customer_id
+    datetime: tr_datetime
+    amount: amount
+    category: mcc_code_desc
+    label: label
+  label_names:
+    "0": lower_risk
+    "1": moderately_lower_risk
+    "2": moderately_higher_risk
+    "3": higher_risk
+  claim_forbidden_terms:
+    - lower_risk
+    - moderately_lower_risk
+    - moderately_higher_risk
+    - higher_risk
+    - churn score
+    - churn probability
+  category_label: transaction types
+  prompt_task_description: >-
+    Predict the train-defined relative band of the published 30-day customer
+    churn-propensity score: lower_risk, moderately_lower_risk,
+    moderately_higher_risk, or higher_risk.
+  prompt_dataset_guidance: >-
+    Use the supplied transaction, product-use, application-engagement,
+    satisfaction, and support evidence only. Demographic attributes and the
+    published churn score are not supplied. Missing operational fields mean
+    not available, not zero. Treat behavioral interpretations as hypotheses
+    and never invent an observed cancellation, churn event, or personal trait.
+  label_semantics: standard
+  num_labels: 4
+  metric: balanced_accuracy
+  primary_metric: r2
+  direct_selection_metric: balanced_accuracy
+  splits:
+    train: data/cofinfad_operational_fidelity/score_activity_stratified_7500_seed137/events.parquet
+    val: data/cofinfad_operational_fidelity/score_activity_stratified_7500_seed137/events.parquet
+    test: data/cofinfad_operational_fidelity/score_activity_stratified_7500_seed137/events.parquet
+  client_ids_by_split:
+    train: data/cofinfad_operational_fidelity/score_activity_stratified_7500_seed137/train_ids.json
+    val: data/cofinfad_operational_fidelity/score_activity_stratified_7500_seed137/val_ids.json
+    test: data/cofinfad_operational_fidelity/score_activity_stratified_7500_seed137/test_ids.json
+
+pipeline:
+  prompt_context_apply_client_filter: true
+  event_features: minimal
+  min_behavioral_explanation_chars: 40
+
+prompts:
+  contract_version: evidence_bounded_v5
+
+output:
+  base_dir: outputs/cofinfad
